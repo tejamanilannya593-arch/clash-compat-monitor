@@ -5,7 +5,7 @@ using System.Threading;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.1.0";
+    public const string Version = "0.1.1";
 }
 
 public static class Program
@@ -103,6 +103,7 @@ public sealed class MonitorConfiguration
     public string DelayProbeUrl = "https://www.gstatic.com/generate_204";
     public string ThroughputProbeUrl = "https://speed.cloudflare.com/__down?bytes=1048576";
     public TimeSpan QualityRefreshInterval = TimeSpan.FromHours(6);
+    public TimeSpan ReloadRecoveryFreshness = TimeSpan.FromMinutes(30);
     public static MonitorConfiguration CreateDefault()
     {
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);

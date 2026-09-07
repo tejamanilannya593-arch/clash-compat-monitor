@@ -68,7 +68,8 @@ public sealed class MonitorWorker
         {
             ConflictResult conflict = new ConflictDetector().Evaluate(RuntimeInspector.Capture(mihomo));
             if (conflict.Paused) { logger.Write("paused-conflict " + conflict.Reason); return; }
-            if (mihomo.IsRuntimeIpv6Enabled())
+            bool reloadDetected = mihomo.IsRuntimeIpv6Enabled();
+            if (reloadDetected)
             {
                 var pipeClient = mihomo as MihomoPipeClient;
                 if (pipeClient == null || !pipeClient.EnsureIpv4Compatibility(config.ClashConfigPath))
@@ -86,9 +87,26 @@ public sealed class MonitorWorker
             List<QualitySample> qualityHistory = qualityStore.Load();
             IList<ServiceKind> optional = OptionalServiceActivator.FromProcessNames(Process.GetProcesses().Select(x => x.ProcessName));
             string current = mihomo.GetSelected(config.SharedGroup);
+            bool recoveredAfterReload = false;
+            string recoveryTarget = ReloadRecovery.ChooseTarget(reloadDetected, state, candidates, clock.UtcNow,
+                config.ReloadRecoveryFreshness);
+            if (!String.IsNullOrEmpty(recoveryTarget) && recoveryTarget != current)
+            {
+                if (!dryRun)
+                {
+                    mihomo.Select(config.SharedGroup, recoveryTarget);
+                    current = recoveryTarget;
+                    recoveredAfterReload = true;
+                    logger.Write("restored shared selector to recent verified " + SafeName(recoveryTarget));
+                }
+                else logger.Write("dry-run would restore shared selector to " + SafeName(recoveryTarget));
+            }
+            else if (reloadDetected && String.IsNullOrEmpty(recoveryTarget))
+                logger.Write("reload recovery skipped because no recent verified candidate is available");
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.Scan(currentCandidate, optional);
             state.Records[currentScan.Name] = Record(currentScan);
+            state.RememberPreferred(currentScan.Name, currentScan.Health, clock.UtcNow);
 
             QualitySample priorCurrent = Latest(qualityHistory, current);
             double currentResponse = QualityMeasurement.ResponseMilliseconds(currentScan, priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
@@ -169,7 +187,7 @@ public sealed class MonitorWorker
             QualityBreakdown currentScore = null;
             var best = scores.OrderByDescending(x => x.Value.Score).FirstOrDefault();
             bool switched = false;
-            string decision = "保持当前节点";
+            string decision = recoveredAfterReload ? "配置重载后恢复最近稳定节点" : "保持当前节点";
             double? reportedScore = null;
             QualityBreakdown reportedCurrent;
             if (scores.TryGetValue(current, out reportedCurrent)) reportedScore = reportedCurrent.Score;
