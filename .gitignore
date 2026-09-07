@@ -1,0 +1,19 @@
+# Build output
+bin/
+obj/
+
+# Local runtime and diagnostic data
+state/
+logs/
+*.state
+*.log
+current-status.txt
+
+# Isolated feature worktrees
+.worktrees/
+
+# IDE and OS files
+.vs/
+*.user
+Thumbs.db
+Desktop.ini
