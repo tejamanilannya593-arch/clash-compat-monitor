@@ -8,6 +8,12 @@ foreach ($relative in $required) {
     $path = Join-Path $root $relative
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release file: $relative" }
 }
+$packageScript = Get-Content -LiteralPath (Join-Path $root 'package-release.ps1') -Raw
+$readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
+if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.1.1')) { throw 'Release package version is not v0.1.1.' }
+if (!$readme.Contains('v0.1.1') -or !$readme.Contains('30') -or !$readme.Contains('BasicCompatible')) {
+    throw 'README does not describe v0.1.1 reload recovery.'
+}
 $scriptFiles = Get-ChildItem (Join-Path $root 'scripts') -Filter '*.ps1' -File
 foreach ($scriptFile in $scriptFiles) {
     $tokens = $null
