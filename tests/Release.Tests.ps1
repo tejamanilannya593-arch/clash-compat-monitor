@@ -9,8 +9,10 @@ foreach ($relative in $required) {
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release file: $relative" }
 }
 $packageScript = Get-Content -LiteralPath (Join-Path $root 'package-release.ps1') -Raw
+$installScript = Get-Content -LiteralPath (Join-Path $root 'scripts\install.ps1') -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
 if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.1.1')) { throw 'Release package version is not v0.1.1.' }
+if (!$installScript.Contains("Version='0.1.1'")) { throw 'Installer status version is not v0.1.1.' }
 if (!$readme.Contains('v0.1.1') -or !$readme.Contains('30') -or !$readme.Contains('BasicCompatible')) {
     throw 'README does not describe v0.1.1 reload recovery.'
 }
