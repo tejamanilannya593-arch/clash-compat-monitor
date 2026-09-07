@@ -363,10 +363,15 @@ internal static class Tests
         var state = new HealthState("old");
         state.Records["节点\t一"] = new NodeHealthRecord("节点\t一", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false);
         state.Records["香港"] = new NodeHealthRecord("香港", CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
+        state.RememberPreferred("节点\t一", CandidateHealth.BasicCompatible, clock.UtcNow);
         var store = new StateStore(statePath);
         store.Save(state, state.Records.Keys);
         var loaded = store.Load();
         Equal(2, loaded.Records.Count, "state roundtrip count");
+        Equal("节点\t一", loaded.PreferredNode, "preferred node roundtrip");
+        Equal(clock.UtcNow, loaded.PreferredNodeVerifiedUtc, "preferred time roundtrip");
+        loaded.RememberPreferred("失败节点", CandidateHealth.Transient, clock.UtcNow.AddMinutes(1));
+        Equal("节点\t一", loaded.PreferredNode, "failure does not replace preferred node");
         loaded.ApplySubscriptionFingerprint("new");
         Equal(CandidateHealth.Unknown, loaded.Records["节点\t一"].Health, "fingerprint invalidates probes");
         Equal(CandidateHealth.RegionBlocked, loaded.Records["香港"].Health, "fingerprint preserves local exclusion");
