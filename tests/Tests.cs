@@ -356,6 +356,11 @@ internal static class Tests
         Equal(false, controller.Decide(false, false, "current", healthy).ShouldSwitch, "success resets failure count");
         Equal(false, controller.Decide(false, false, "current", new[] { new NodeHealthRecord("unknown", CandidateHealth.Unknown, clock.UtcNow, clock.UtcNow, false) }).ShouldSwitch, "unknown never selected");
 
+        var basicController = new FailoverController(clock, TimeSpan.FromMinutes(10));
+        var basic = new[] { new NodeHealthRecord("basic", CandidateHealth.BasicCompatible, clock.UtcNow, clock.UtcNow, false) };
+        Equal(false, basicController.Decide(false, false, "current", basic).ShouldSwitch, "first basic-compatible failure stays");
+        Equal(true, basicController.Decide(false, false, "current", basic).ShouldSwitch, "basic-compatible replacement switches");
+
         Equal(clock.UtcNow.AddMinutes(5), HealthPolicy.CooldownUntil(CandidateHealth.Transient, clock.UtcNow), "transient cooldown");
         Equal(clock.UtcNow.AddMinutes(30), HealthPolicy.CooldownUntil(CandidateHealth.ServiceFailed, clock.UtcNow), "service cooldown");
 

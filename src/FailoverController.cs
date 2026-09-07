@@ -43,7 +43,9 @@ public sealed class FailoverController
         if (!totalDisconnect && clock.UtcNow - lastSwitchUtc < minimumHold) return new FailoverDecision(false, null, "minimum hold");
         if (!totalDisconnect && consecutiveFailures < 2) return new FailoverDecision(false, null, "awaiting confirmation");
         NodeHealthRecord target = (records ?? Enumerable.Empty<NodeHealthRecord>())
-            .Where(x => x.Name != current && x.Health == CandidateHealth.Compatible && x.CooldownUntilUtc <= clock.UtcNow)
+            .Where(x => x.Name != current &&
+                (x.Health == CandidateHealth.Compatible || x.Health == CandidateHealth.BasicCompatible) &&
+                x.CooldownUntilUtc <= clock.UtcNow)
             .OrderByDescending(x => x.CheckedUtc).FirstOrDefault();
         return target == null ? new FailoverDecision(false, null, "no compatible candidate") : new FailoverDecision(true, target.Name, totalDisconnect ? "total disconnect" : "confirmed failure");
     }
