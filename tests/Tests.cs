@@ -375,6 +375,23 @@ internal static class Tests
         loaded.ApplySubscriptionFingerprint("new");
         Equal(CandidateHealth.Unknown, loaded.Records["节点\t一"].Health, "fingerprint invalidates probes");
         Equal(CandidateHealth.RegionBlocked, loaded.Records["香港"].Health, "fingerprint preserves local exclusion");
+
+        var recovery = new HealthState("same");
+        recovery.Records["稳定节点"] = new NodeHealthRecord("稳定节点", CandidateHealth.BasicCompatible,
+            clock.UtcNow, clock.UtcNow, false);
+        recovery.RememberPreferred("稳定节点", CandidateHealth.BasicCompatible, clock.UtcNow);
+        var recoveryCandidates = new[] { new CandidateNode("稳定节点", 1), new CandidateNode("其他节点", 1) };
+        Equal("稳定节点", ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
+            TimeSpan.FromMinutes(30)), "recent basic node restored");
+        Equal<string>(null, ReloadRecovery.ChooseTarget(false, recovery, recoveryCandidates, clock.UtcNow,
+            TimeSpan.FromMinutes(30)), "manual selector change is not overridden");
+        Equal<string>(null, ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow.AddMinutes(31),
+            TimeSpan.FromMinutes(30)), "stale preferred node not restored");
+        Equal<string>(null, ReloadRecovery.ChooseTarget(true, recovery, new[] { new CandidateNode("其他节点", 1) }, clock.UtcNow,
+            TimeSpan.FromMinutes(30)), "removed preferred node not restored");
+        recovery.Records["稳定节点"].Health = CandidateHealth.Transient;
+        Equal<string>(null, ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
+            TimeSpan.FromMinutes(30)), "failed preferred node not restored");
     }
 
     private sealed class FakeClock : IClock
