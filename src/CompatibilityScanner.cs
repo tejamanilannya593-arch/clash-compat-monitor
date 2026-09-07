@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 public interface IServiceProbe
@@ -31,38 +32,41 @@ public sealed class CompatibilityScanner
     public CandidateScanResult Scan(CandidateNode candidate, IEnumerable<ServiceKind> optionalServices)
     {
         long totalMilliseconds = 0;
+        int probeCount = 0;
         var pending = new List<string>();
         var partial = new List<string>();
         mihomo.Select(probeGroup, candidate.Name);
         foreach (ServiceKind service in Mandatory)
         {
             ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
+            probeCount++;
             totalMilliseconds += result.ElapsedMilliseconds;
             if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-            else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds);
+            else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount);
         }
         if (optionalServices != null)
         {
             foreach (ServiceKind service in optionalServices)
             {
                 ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
+                probeCount++;
                 totalMilliseconds += result.ElapsedMilliseconds;
                 if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
                 else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-                else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds);
+                else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount);
             }
         }
-        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds);
-        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds);
-        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds);
+        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount);
+        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount);
+        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount);
     }
 
-    private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result, long totalMilliseconds)
+    private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result, long totalMilliseconds, int probeCount)
     {
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
-        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds);
+        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount);
     }
 }
 
@@ -77,7 +81,7 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             Proxy = new WebProxy(proxyUrl), UseProxy = true, UseCookies = false, AllowAutoRedirect = false
         };
         client = new HttpClient(handler);
-        client.Timeout = TimeSpan.FromSeconds(5);
+        client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd("ClashCompatibilityMonitor/1.0");
     }
 
@@ -86,13 +90,14 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
         var timer = Stopwatch.StartNew();
         try
         {
+            using (var cancellation = new CancellationTokenSource(timeout))
             using (var request = new HttpRequestMessage(HttpMethod.Get, Endpoint(service)))
-            using (HttpResponseMessage response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
+            using (HttpResponseMessage response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token).GetAwaiter().GetResult())
             {
                 byte[] bytes;
                 if (response.Content == null) bytes = new byte[0];
                 else using (Stream bodyStream = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
-                    bytes = ReadLimited(bodyStream, 4096);
+                    bytes = ReadLimitedAsync(bodyStream, 4096, cancellation.Token).GetAwaiter().GetResult();
                 string body = System.Text.Encoding.UTF8.GetString(bytes);
                 bool challengeHeader = response.Headers.Contains("Cf-Mitigated") &&
                     String.Join(",", response.Headers.GetValues("Cf-Mitigated")).IndexOf("challenge", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -100,6 +105,7 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             }
         }
         catch (TaskCanceledException) { return ProbeResult.TransientFailure("timeout", timer.ElapsedMilliseconds); }
+        catch (OperationCanceledException) { return ProbeResult.TransientFailure("timeout", timer.ElapsedMilliseconds); }
         catch (HttpRequestException) { return ProbeResult.TransientFailure("network failure", timer.ElapsedMilliseconds); }
         catch (IOException) { return ProbeResult.TransientFailure("I/O failure", timer.ElapsedMilliseconds); }
     }
@@ -143,6 +149,23 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             while (output.Length < maximumBytes)
             {
                 int read = stream.Read(buffer, 0, (int)Math.Min(buffer.Length, maximumBytes - output.Length));
+                if (read <= 0) break;
+                output.Write(buffer, 0, read);
+            }
+            return output.ToArray();
+        }
+    }
+
+    public static async Task<byte[]> ReadLimitedAsync(Stream stream, int maximumBytes, CancellationToken cancellationToken)
+    {
+        if (stream == null || maximumBytes <= 0) return new byte[0];
+        using (var output = new MemoryStream())
+        {
+            var buffer = new byte[Math.Min(1024, maximumBytes)];
+            while (output.Length < maximumBytes)
+            {
+                int count = (int)Math.Min(buffer.Length, maximumBytes - output.Length);
+                int read = await stream.ReadAsync(buffer, 0, count, cancellationToken).ConfigureAwait(false);
                 if (read <= 0) break;
                 output.Write(buffer, 0, read);
             }

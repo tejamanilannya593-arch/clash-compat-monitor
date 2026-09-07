@@ -15,12 +15,6 @@ public static class CandidateCatalog
         foreach (string name in names)
         {
             if (string.IsNullOrEmpty(name) || !StartsWithRegionalFlag(name)) continue;
-            if (name.IndexOf("中国大陆", StringComparison.Ordinal) >= 0 ||
-                name.IndexOf("香港", StringComparison.Ordinal) >= 0 ||
-                name.IndexOf("澳门", StringComparison.Ordinal) >= 0 ||
-                name.IndexOf("台湾", StringComparison.Ordinal) >= 0 ||
-                name.IndexOf("Taiwan", StringComparison.OrdinalIgnoreCase) >= 0) continue;
-
             Match match = Rate.Match(name);
             int multiplier;
             if (!match.Success || !int.TryParse(match.Groups[1].Value, out multiplier) || multiplier > 3) continue;

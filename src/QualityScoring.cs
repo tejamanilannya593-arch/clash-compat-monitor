@@ -41,6 +41,15 @@ public sealed class QualityBreakdown
     public double Score { get; set; }
 }
 
+public static class QualityMeasurement
+{
+    public static double ResponseMilliseconds(CandidateScanResult scan, double fallback)
+    {
+        return scan != null && scan.ProbeCount > 0 && scan.TotalMilliseconds > 0
+            ? (double)scan.TotalMilliseconds / scan.ProbeCount : fallback;
+    }
+}
+
 public static class QualityScorer
 {
     private static readonly Regex MultiplierPattern = new Regex(

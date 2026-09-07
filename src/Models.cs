@@ -51,17 +51,19 @@ public sealed class ProbeResult
 
 public sealed class CandidateScanResult
 {
-    public CandidateScanResult(string name, CandidateHealth health, ServiceKind? failedService, string detail, long totalMilliseconds = 0)
+    public CandidateScanResult(string name, CandidateHealth health, ServiceKind? failedService, string detail, long totalMilliseconds = 0, int probeCount = 0)
     {
         Name = name;
         Health = health;
         FailedService = failedService;
         Detail = detail;
         TotalMilliseconds = totalMilliseconds;
+        ProbeCount = probeCount;
     }
     public string Name { get; private set; }
     public CandidateHealth Health { get; private set; }
     public ServiceKind? FailedService { get; private set; }
     public string Detail { get; private set; }
     public long TotalMilliseconds { get; private set; }
+    public int ProbeCount { get; private set; }
 }
