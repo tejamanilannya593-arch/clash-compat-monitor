@@ -23,7 +23,7 @@ public sealed class InstanceActivation : IDisposable
         if (String.IsNullOrWhiteSpace(id)) throw new ArgumentException("An instance id is required.", "id");
         var activationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, id + ".Activate");
         bool owns;
-        var mutex = new Mutex(true, id + ".Mutex", out owns);
+        var mutex = new Mutex(true, id, out owns);
         var result = new InstanceActivation(mutex, activationEvent, owns);
         if (!owns) activationEvent.Set();
         return result;

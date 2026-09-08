@@ -292,6 +292,11 @@ internal static class Tests
             "保持当前节点", snapshotTime, snapshotTime.AddMinutes(1));
         Equal("selected", snapshot.ActualNode, "snapshot leaf node");
         Equal(2, snapshot.Services.Count, "snapshot retains service evidence");
+        MonitorPresentation view = MonitorPresentation.From(snapshot);
+        Equal("运行正常", view.StateText, "running label");
+        Equal("selected", view.NodeText, "presentation leaf node");
+        Equal("可用 · 75 ms", MonitorPresentation.ServiceText(true, 75, "ok"), "service latency label");
+        Equal("不可用", MonitorPresentation.ServiceText(false, 75, "blocked"), "failure hides misleading latency");
     }
 
     private sealed class FakeProbe : IServiceProbe
