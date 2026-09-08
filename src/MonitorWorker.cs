@@ -38,7 +38,7 @@ public sealed class BoundedLogger
     }
 }
 
-public sealed class MonitorWorker
+public sealed class MonitorWorker : IMonitorCycleRunner
 {
     private readonly MonitorConfiguration config;
     private readonly IMihomoClient mihomo;
@@ -64,6 +64,11 @@ public sealed class MonitorWorker
     public void RunOnce(bool dryRun)
     {
         RunOnce(dryRun, UserPreferences.Defaults());
+    }
+
+    public MonitorSnapshot Run(UserPreferences preferences)
+    {
+        return RunOnce(false, preferences);
     }
 
     public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)

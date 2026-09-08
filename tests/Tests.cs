@@ -52,6 +52,7 @@ internal static class Tests
         StabilityAndState();
         RuntimeGuards();
         UserPreferenceBehavior();
+        MonitorCoordinatorBehavior();
         CommandLineBehavior();
         StatusReporting();
         return failures == 0 ? 0 : 1;
@@ -526,6 +527,83 @@ internal static class Tests
         File.WriteAllText(path, "broken", Encoding.UTF8);
         Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
+    }
+
+    private static void MonitorCoordinatorBehavior()
+    {
+        var runner = new BlockingCycleRunner();
+        using (var coordinator = new MonitorCoordinator(runner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, runner.WaitUntilEntered(1000), "coordinator starts initial check");
+            coordinator.RequestCheck();
+            coordinator.RequestCheck();
+            runner.Release();
+            Equal(true, runner.WaitForRunCount(2, 1000), "coalesced follow-up runs");
+            Thread.Sleep(80);
+            Equal(2, runner.RunCount, "duplicate checks coalesced");
+            coordinator.SetPaused(true);
+            coordinator.RequestCheck();
+            Thread.Sleep(80);
+            Equal(2, runner.RunCount, "paused coordinator does not scan");
+        }
+
+        var stuckRunner = new BlockingCycleRunner();
+        using (var coordinator = new MonitorCoordinator(stuckRunner, TimeSpan.FromHours(1), TimeSpan.FromMilliseconds(80)))
+        {
+            coordinator.Start();
+            Equal(true, stuckRunner.WaitUntilEntered(1000), "watchdog cycle started");
+            Equal(true, SpinWait.SpinUntil(() => coordinator.Latest.State == MonitorRunState.Stuck, 1000), "watchdog publishes stuck state");
+            stuckRunner.Release();
+        }
+
+        var degradedRunner = new DegradedCycleRunner();
+        int attentionCount = 0;
+        using (var coordinator = new MonitorCoordinator(degradedRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.AttentionRequired += delegate { Interlocked.Increment(ref attentionCount); };
+            coordinator.Start();
+            Equal(true, degradedRunner.WaitForRunCount(1, 1000), "degraded cycle completed");
+            coordinator.RequestCheck();
+            Equal(true, degradedRunner.WaitForRunCount(2, 1000), "repeated degraded cycle completed");
+            Thread.Sleep(80);
+            Equal(1, attentionCount, "duplicate attention suppressed");
+        }
+    }
+
+    private sealed class BlockingCycleRunner : IMonitorCycleRunner
+    {
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        private int runCount;
+        public int RunCount { get { return Volatile.Read(ref runCount); } }
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            int count = Interlocked.Increment(ref runCount);
+            entered.Set();
+            if (count == 1) released.Wait();
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+        }
+        public bool WaitUntilEntered(int milliseconds) { return entered.Wait(milliseconds); }
+        public bool WaitForRunCount(int expected, int milliseconds)
+        {
+            return SpinWait.SpinUntil(() => RunCount >= expected, milliseconds);
+        }
+        public void Release() { released.Set(); }
+    }
+
+    private sealed class DegradedCycleRunner : IMonitorCycleRunner
+    {
+        private int runCount;
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Degraded, "same failure", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+        }
+        public bool WaitForRunCount(int expected, int milliseconds)
+        {
+            return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
+        }
     }
 
     private static void StatusReporting()
