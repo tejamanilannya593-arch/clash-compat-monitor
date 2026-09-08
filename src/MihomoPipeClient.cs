@@ -226,19 +226,11 @@ public sealed class MihomoPipeClient : IMihomoClient
         request.Append("Content-Length: ").Append(bodyBytes.Length).Append("\r\n\r\n");
         byte[] headerBytes = Encoding.ASCII.GetBytes(request.ToString());
 
-        using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None))
+        using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
         {
             pipe.Connect(3000);
-            pipe.Write(headerBytes, 0, headerBytes.Length);
-            if (bodyBytes.Length > 0) pipe.Write(bodyBytes, 0, bodyBytes.Length);
-            pipe.Flush();
-            using (var response = new MemoryStream())
-            {
-                var buffer = new byte[4096];
-                int read;
-                while ((read = pipe.Read(buffer, 0, buffer.Length)) > 0) response.Write(buffer, 0, read);
-                return PipeHttpCodec.Decode(response.ToArray());
-            }
+            BoundedPipeIo.WriteAll(pipe, headerBytes, bodyBytes, TimeSpan.FromSeconds(3));
+            return PipeHttpCodec.Decode(BoundedPipeIo.ReadAll(pipe, TimeSpan.FromSeconds(10), 1024 * 1024));
         }
     }
 }

@@ -24,6 +24,19 @@ internal static class Tests
         }
     }
 
+    private static void Throws<T>(Action action, string name) where T : Exception
+    {
+        try
+        {
+            action();
+            Equal(true, false, name);
+        }
+        catch (T)
+        {
+            Equal(true, true, name);
+        }
+    }
+
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
@@ -31,6 +44,7 @@ internal static class Tests
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         CandidateFiltering();
         PipeHttpDecoding();
+        BoundedPipeBehavior();
         MihomoPipeIntegration();
         CompatibilityScanning();
         QualityScoringAndState();
@@ -81,6 +95,42 @@ internal static class Tests
         decoded = PipeHttpCodec.Decode(Encoding.UTF8.GetBytes(fixedResponse));
         Equal(201, decoded.StatusCode, "content length status");
         Equal(body, decoded.Body, "content length utf8 body");
+    }
+
+    private static void BoundedPipeBehavior()
+    {
+        var blocked = new BlockingDisposableStream();
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        Throws<TimeoutException>(() => BoundedPipeIo.ReadAll(blocked, TimeSpan.FromMilliseconds(80), 1024), "pipe read timeout");
+        Equal(true, timer.ElapsedMilliseconds < 1000, "pipe timeout is bounded");
+        Equal(true, blocked.Disposed, "timeout disposes blocked stream");
+        Throws<InvalidDataException>(() => BoundedPipeIo.ReadAll(new MemoryStream(new byte[2048]), TimeSpan.FromSeconds(1), 1024), "pipe response cap");
+    }
+
+    private sealed class BlockingDisposableStream : Stream
+    {
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        public bool Disposed { get; private set; }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            released.Wait();
+            return 0;
+        }
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            released.Set();
+            base.Dispose(disposing);
+        }
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new NotSupportedException(); } }
+        public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
     }
 
     private static void MihomoPipeIntegration()
