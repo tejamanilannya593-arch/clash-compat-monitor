@@ -98,6 +98,7 @@ public sealed class MonitorConfiguration
     public string RootPath;
     public string StatePath;
     public string QualityStatePath;
+    public string PreferencesPath;
     public string LogPath;
     public string ClashConfigPath;
     public string DelayProbeUrl = "https://www.gstatic.com/generate_204";
@@ -113,6 +114,7 @@ public sealed class MonitorConfiguration
             RootPath = root,
             StatePath = Path.Combine(root, "state", "health.state"),
             QualityStatePath = Path.Combine(root, "state", "quality.state"),
+            PreferencesPath = Path.Combine(root, "state", "preferences.state"),
             LogPath = Path.Combine(root, "logs", "monitor.log"),
             ClashConfigPath = Path.Combine(roaming, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml")
         };

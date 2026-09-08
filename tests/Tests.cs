@@ -37,6 +37,7 @@ internal static class Tests
         ThroughputAndTraffic();
         StabilityAndState();
         RuntimeGuards();
+        UserPreferenceBehavior();
         CommandLineBehavior();
         StatusReporting();
         return failures == 0 ? 0 : 1;
@@ -441,6 +442,28 @@ internal static class Tests
             Equal(true, first != null, "first instance acquired");
             Equal(true, second == null, "second instance rejected");
         }
+    }
+
+    private static void UserPreferenceBehavior()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-prefs-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(root, "preferences.state");
+        var store = new UserPreferenceStore(path);
+        UserPreferences defaults = store.Load();
+        Equal(true, defaults.RequiredServices.Contains(ServiceKind.ChatGPT), "default includes ChatGPT");
+        Equal(true, defaults.RequiredServices.Contains(ServiceKind.Gemini), "default includes Gemini");
+        Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
+        Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
+        Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
+        defaults.FirstRunComplete = true;
+        defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub };
+        store.Save(defaults);
+        UserPreferences loaded = store.Load();
+        Equal(true, loaded.FirstRunComplete, "first run persisted");
+        Equal(2, loaded.RequiredServices.Count, "service selection persisted");
+        File.WriteAllText(path, "broken", Encoding.UTF8);
+        Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
+        Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
     }
 
     private static void StatusReporting()
