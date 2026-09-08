@@ -63,11 +63,26 @@ public sealed class MonitorWorker
 
     public void RunOnce(bool dryRun)
     {
-        if (System.Threading.Interlocked.Exchange(ref running, 1) != 0) return;
+        RunOnce(dryRun, UserPreferences.Defaults());
+    }
+
+    public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)
+    {
+        if (preferences == null) throw new ArgumentNullException("preferences");
+        if (preferences.RequiredServices == null || preferences.RequiredServices.Count == 0)
+            throw new ArgumentException("At least one required service is needed.", "preferences");
+        if (System.Threading.Interlocked.Exchange(ref running, 1) != 0)
+            return MonitorSnapshot.CreateState(MonitorRunState.Starting, "检测正在进行", clock.UtcNow,
+                clock.UtcNow.Add(config.CycleInterval));
         try
         {
             ConflictResult conflict = new ConflictDetector().Evaluate(RuntimeInspector.Capture(mihomo));
-            if (conflict.Paused) { logger.Write("paused-conflict " + conflict.Reason); return; }
+            if (conflict.Paused)
+            {
+                logger.Write("paused-conflict " + conflict.Reason);
+                return MonitorSnapshot.CreateState(MonitorRunState.Degraded, conflict.Reason, clock.UtcNow,
+                    clock.UtcNow.Add(config.CycleInterval));
+            }
             bool reloadDetected = mihomo.IsRuntimeIpv6Enabled();
             if (reloadDetected)
             {
@@ -77,7 +92,12 @@ public sealed class MonitorWorker
                 logger.Write("restored IPv4 compatibility overlay after external config reload");
             }
             IList<CandidateNode> candidates = CandidateCatalog.Filter(mihomo.GetChoices(config.SharedGroup));
-            if (candidates.Count == 0) { logger.Write("no eligible candidates"); return; }
+            if (candidates.Count == 0)
+            {
+                logger.Write("no eligible candidates");
+                return MonitorSnapshot.CreateState(MonitorRunState.Degraded, "没有可用候选节点", clock.UtcNow,
+                    clock.UtcNow.Add(config.CycleInterval));
+            }
             var store = new StateStore(config.StatePath);
             HealthState state = store.Load();
             string fingerprint = Fingerprint(candidates);
@@ -85,7 +105,6 @@ public sealed class MonitorWorker
             state.ApplySubscriptionFingerprint(fingerprint);
             var qualityStore = new QualityStateStore(config.QualityStatePath);
             List<QualitySample> qualityHistory = qualityStore.Load();
-            IList<ServiceKind> optional = OptionalServiceActivator.FromProcessNames(Process.GetProcesses().Select(x => x.ProcessName));
             string current = mihomo.GetSelected(config.SharedGroup);
             bool recoveredAfterReload = false;
             string recoveryTarget = ReloadRecovery.ChooseTarget(reloadDetected, state, candidates, clock.UtcNow,
@@ -104,7 +123,7 @@ public sealed class MonitorWorker
             else if (reloadDetected && String.IsNullOrEmpty(recoveryTarget))
                 logger.Write("reload recovery skipped because no recent verified candidate is available");
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
-            CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.Scan(currentCandidate, optional);
+            CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, preferences.RequiredServices);
             state.Records[currentScan.Name] = Record(currentScan);
             state.RememberPreferred(currentScan.Name, currentScan.Health, clock.UtcNow);
 
@@ -130,7 +149,7 @@ public sealed class MonitorWorker
                 var failureCounts = new Dictionary<string, int>(StringComparer.Ordinal);
                 foreach (CandidateNode candidate in delayed)
                 {
-                    CandidateScanResult scan = candidate.Name == current ? currentScan : scanner.Scan(candidate, optional);
+                    CandidateScanResult scan = candidate.Name == current ? currentScan : scanner.ScanSelected(candidate, preferences.RequiredServices);
                     state.Records[candidate.Name] = Record(scan);
                     if (scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
                     QualitySample previous = Latest(qualityHistory, candidate.Name);
@@ -230,16 +249,20 @@ public sealed class MonitorWorker
                 logger.Write("待验证，保留当前连接；" + currentScan.Detail);
             }
             else if (!switched && currentScan.Health != CandidateHealth.Compatible && currentScan.Health != CandidateHealth.BasicCompatible) logger.Write("current check failed " + currentScan.Health + "; awaiting safe replacement");
+            string actual = dryRun ? current : mihomo.GetSelected(config.SharedGroup);
+            CandidateScanResult actualScan = actual == currentScan.Name ? currentScan :
+                new CandidateScanResult(actual, CandidateHealth.Unknown, null, "节点发生变化，等待下一轮验证");
             if (!dryRun)
             {
-                string actual = mihomo.GetSelected(config.SharedGroup);
-                CandidateHealth status = actual == currentScan.Name ? currentScan.Health : CandidateHealth.Unknown;
-                string detail = actual == currentScan.Name ? currentScan.Detail : "节点发生变化，等待下一轮验证";
+                CandidateHealth status = actualScan.Health;
+                string detail = actualScan.Detail;
                 string text = StatusReport.Format(clock.UtcNow, actual, status, reportedScore, decision, detail);
                 StatusReport.WriteAtomic(Path.Combine(config.RootPath, "current-status.txt"), text);
             }
             store.Save(state, candidates.Select(x => x.Name));
             qualityStore.Save(qualityHistory);
+            return MonitorSnapshot.CreateRunning(actual, actualScan, reportedScore, decision, clock.UtcNow,
+                clock.UtcNow.Add(config.CycleInterval));
         }
         finally
         {

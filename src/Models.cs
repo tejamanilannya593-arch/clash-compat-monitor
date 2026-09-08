@@ -1,3 +1,6 @@
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+
 public sealed class CandidateNode
 {
     public CandidateNode(string name, int multiplier)
@@ -51,7 +54,8 @@ public sealed class ProbeResult
 
 public sealed class CandidateScanResult
 {
-    public CandidateScanResult(string name, CandidateHealth health, ServiceKind? failedService, string detail, long totalMilliseconds = 0, int probeCount = 0)
+    public CandidateScanResult(string name, CandidateHealth health, ServiceKind? failedService, string detail,
+        long totalMilliseconds = 0, int probeCount = 0, IDictionary<ServiceKind, ProbeResult> serviceResults = null)
     {
         Name = name;
         Health = health;
@@ -59,6 +63,8 @@ public sealed class CandidateScanResult
         Detail = detail;
         TotalMilliseconds = totalMilliseconds;
         ProbeCount = probeCount;
+        ServiceResults = new ReadOnlyDictionary<ServiceKind, ProbeResult>(
+            new Dictionary<ServiceKind, ProbeResult>(serviceResults ?? new Dictionary<ServiceKind, ProbeResult>()));
     }
     public string Name { get; private set; }
     public CandidateHealth Health { get; private set; }
@@ -66,4 +72,5 @@ public sealed class CandidateScanResult
     public string Detail { get; private set; }
     public long TotalMilliseconds { get; private set; }
     public int ProbeCount { get; private set; }
+    public IDictionary<ServiceKind, ProbeResult> ServiceResults { get; private set; }
 }

@@ -278,6 +278,18 @@ internal static class Tests
         Equal(5000.0, QualityMeasurement.ResponseMilliseconds(
             new CandidateScanResult("none", CandidateHealth.Transient, null, "none", 0, 0), 5000),
             "empty scan uses fallback");
+
+        probe = new FakeProbe { DefaultResult = ProbeResult.Success(75) };
+        scanner = new CompatibilityScanner(mihomo, probe, "probe");
+        CandidateScanResult selected = scanner.ScanSelected(new CandidateNode("selected", 1),
+            new[] { ServiceKind.ChatGPT, ServiceKind.GitHub });
+        Equal(2, probe.Calls.Count, "only selected services probed");
+        Equal(75L, selected.ServiceResults[ServiceKind.ChatGPT].ElapsedMilliseconds, "service latency retained");
+        DateTime snapshotTime = new DateTime(2026, 9, 8, 8, 0, 0, DateTimeKind.Utc);
+        MonitorSnapshot snapshot = MonitorSnapshot.CreateRunning("selected", selected, 82.5,
+            "保持当前节点", snapshotTime, snapshotTime.AddMinutes(1));
+        Equal("selected", snapshot.ActualNode, "snapshot leaf node");
+        Equal(2, snapshot.Services.Count, "snapshot retains service evidence");
     }
 
     private sealed class FakeProbe : IServiceProbe

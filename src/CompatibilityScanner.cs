@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
 
 public interface IServiceProbe
 {
@@ -31,42 +32,38 @@ public sealed class CompatibilityScanner
 
     public CandidateScanResult Scan(CandidateNode candidate, IEnumerable<ServiceKind> optionalServices)
     {
+        return ScanSelected(candidate, Mandatory.Concat(optionalServices ?? new ServiceKind[0]));
+    }
+
+    public CandidateScanResult ScanSelected(CandidateNode candidate, IEnumerable<ServiceKind> requiredServices)
+    {
         long totalMilliseconds = 0;
         int probeCount = 0;
         var pending = new List<string>();
         var partial = new List<string>();
+        var measurements = new Dictionary<ServiceKind, ProbeResult>();
         mihomo.Select(probeGroup, candidate.Name);
-        foreach (ServiceKind service in Mandatory)
+        foreach (ServiceKind service in (requiredServices ?? new ServiceKind[0]).Distinct())
         {
             ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
+            measurements[service] = result;
             probeCount++;
             totalMilliseconds += result.ElapsedMilliseconds;
             if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-            else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount);
+            else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount, measurements);
         }
-        if (optionalServices != null)
-        {
-            foreach (ServiceKind service in optionalServices)
-            {
-                ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
-                probeCount++;
-                totalMilliseconds += result.ElapsedMilliseconds;
-                if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
-                else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-                else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount);
-            }
-        }
-        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount);
-        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount);
-        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount);
+        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements);
+        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements);
+        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements);
     }
 
-    private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result, long totalMilliseconds, int probeCount)
+    private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result,
+        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements)
     {
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
-        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount);
+        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements);
     }
 }
 
