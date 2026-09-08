@@ -53,6 +53,7 @@ internal static class Tests
         RuntimeGuards();
         UserPreferenceBehavior();
         MonitorCoordinatorBehavior();
+        InstanceActivationBehavior();
         CommandLineBehavior();
         StatusReporting();
         return failures == 0 ? 0 : 1;
@@ -504,6 +505,21 @@ internal static class Tests
         {
             Equal(true, first != null, "first instance acquired");
             Equal(true, second == null, "second instance rejected");
+        }
+    }
+
+    private static void InstanceActivationBehavior()
+    {
+        string id = "ClashCompatibilityMonitor.Test." + Guid.NewGuid().ToString("N");
+        using (var activated = new ManualResetEventSlim(false))
+        using (var first = InstanceActivation.TryOwn(id))
+        {
+            Equal(true, first.IsOwner, "first activation owns instance");
+            first.Activated += delegate { activated.Set(); };
+            first.StartListening();
+            using (var second = InstanceActivation.TryOwn(id))
+                Equal(false, second.IsOwner, "second activation signals owner");
+            Equal(true, activated.Wait(1000), "existing instance activated");
         }
     }
 
