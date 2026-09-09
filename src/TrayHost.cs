@@ -55,7 +55,7 @@ public sealed class TrayHost : ApplicationContext
         if (details == null || details.IsDisposed)
         {
             details = new DetailsForm(preferences, SavePreferences, coordinator.RequestCheck,
-                coordinator.SetPaused, ExitThread);
+                coordinator.SetPaused, coordinator.RequestRestorePrevious, ExitThread);
             details.FormClosed += delegate { details = null; MemoryTrimmer.TrimIdleWorkingSet(); };
         }
         details.UpdateSnapshot(coordinator.Latest);
