@@ -3,14 +3,14 @@ using System.Collections.ObjectModel;
 
 public sealed class CandidateNode
 {
-    public CandidateNode(string name, int multiplier)
+    public CandidateNode(string name, double? multiplier)
     {
         Name = name;
         Multiplier = multiplier;
     }
 
     public string Name { get; private set; }
-    public int Multiplier { get; private set; }
+    public double? Multiplier { get; private set; }
 }
 
 public enum ServiceKind

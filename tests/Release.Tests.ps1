@@ -11,10 +11,14 @@ foreach ($relative in $required) {
 $packageScript = Get-Content -LiteralPath (Join-Path $root 'package-release.ps1') -Raw
 $installScript = Get-Content -LiteralPath (Join-Path $root 'scripts\install.ps1') -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
-if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.1.1')) { throw 'Release package version is not v0.1.1.' }
-if (!$installScript.Contains("Version='0.1.1'")) { throw 'Installer status version is not v0.1.1.' }
-if (!$readme.Contains('v0.1.1') -or !$readme.Contains('30') -or !$readme.Contains('BasicCompatible')) {
-    throw 'README does not describe v0.1.1 reload recovery.'
+$program = Get-Content -LiteralPath (Join-Path $root 'src\Program.cs') -Raw
+$trayHost = Get-Content -LiteralPath (Join-Path $root 'src\TrayHost.cs') -Raw
+if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.2.0')) { throw 'Release package version is not v0.2.0.' }
+if (!$installScript.Contains("Version='0.2.0'")) { throw 'Installer status version is not v0.2.0.' }
+if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
+if (!$readme.Contains('v0.2.0') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
+    !$program.Contains('InstanceActivation.TryOwn') -or !$trayHost.Contains('NotifyIcon')) {
+    throw 'README does not describe v0.2.0 tray and intent behavior.'
 }
 $scriptFiles = Get-ChildItem (Join-Path $root 'scripts') -Filter '*.ps1' -File
 foreach ($scriptFile in $scriptFiles) {

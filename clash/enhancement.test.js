@@ -5,14 +5,17 @@ const fixture = {
   ipv6: true,
   dns: { ipv6: true, 'enhanced-mode': 'fake-ip' },
   proxies: [
-    { name: 'DIRECT' },
+    { name: 'DIRECT', type: 'direct' },
     { name: '消息: 17条未读，在APP查看' },
-    { name: '🇭🇰 香港 I1 | IEPL | 3x' },
-    { name: '🇸🇬 新加坡 M2 | BHE | 3x' },
-    { name: '🇯🇵 日本 V1 | IPv6 | 3x' },
-    { name: '🇺🇸 美国 I0 | ChatGPT | 1x' },
-    { name: '🇹🇼 台湾 T1 | IPv6 | 1x' },
-    { name: '🇸🇬 菲律宾 B12 | 5x' }
+    { name: 'Tokyo-A', type: 'ss', server: 'one.example', port: 443 },
+    { name: '普通节点 无倍率', type: 'vless', server: 'two.example', port: 443 },
+    { name: '🇭🇰 香港 I1 | IEPL | 3x', type: 'trojan', server: 'three.example', port: 443 },
+    { name: '🇯🇵 日本 V1 | IPv6 | 3x', type: 'hysteria2', server: 'four.example', port: 443 },
+    { name: '🇺🇸 美国 I0 | ChatGPT | 1x', type: 'vmess', server: 'five.example', port: 443 },
+    { name: '🇹🇼 台湾 T1 | IPv6 | 1x', type: 'tuic', server: 'six.example', port: 443 },
+    { name: '高倍率仍需实测 | 5x', type: 'ss', server: 'seven.example', port: 443 },
+    { name: 'Tokyo-A', type: 'ss', server: 'duplicate.example', port: 443 },
+    { name: '不是叶节点', type: 'select' }
   ],
   'proxy-groups': [
     { name: '🔍 Google', type: 'url-test', now: '🇯🇵 日本 V1 | IPv6 | 3x', proxies: ['🇯🇵 日本 V1 | IPv6 | 3x'] },
@@ -23,8 +26,8 @@ const fixture = {
 };
 
 assert.deepStrictEqual(nodeCandidates(fixture), [
-  '🇭🇰 香港 I1 | IEPL | 3x', '🇸🇬 新加坡 M2 | BHE | 3x', '🇯🇵 日本 V1 | IPv6 | 3x',
-  '🇺🇸 美国 I0 | ChatGPT | 1x', '🇹🇼 台湾 T1 | IPv6 | 1x'
+  'Tokyo-A', '普通节点 无倍率', '🇭🇰 香港 I1 | IEPL | 3x', '🇯🇵 日本 V1 | IPv6 | 3x',
+  '🇺🇸 美国 I0 | ChatGPT | 1x', '🇹🇼 台湾 T1 | IPv6 | 1x', '高倍率仍需实测 | 5x'
 ]);
 const once = main(JSON.parse(JSON.stringify(fixture)));
 assert.strictEqual(once.ipv6, false);

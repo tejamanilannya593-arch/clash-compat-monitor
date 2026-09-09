@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.Text.RegularExpressions;
 
 public static class CandidateCatalog
 {
-    private static readonly Regex Rate = new Regex(@"\|\s*([0-5])x\s*$", RegexOptions.CultureInvariant);
+    private static readonly HashSet<string> Reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL",
+        "🌐 统一稳定节点", "🧪 兼容性探测"
+    };
 
     public static IList<CandidateNode> Filter(IEnumerable<string> names)
     {
@@ -14,20 +16,10 @@ public static class CandidateCatalog
 
         foreach (string name in names)
         {
-            if (string.IsNullOrEmpty(name) || !StartsWithRegionalFlag(name)) continue;
-            Match match = Rate.Match(name);
-            int multiplier;
-            if (!match.Success || !int.TryParse(match.Groups[1].Value, out multiplier) || multiplier > 3) continue;
+            if (String.IsNullOrWhiteSpace(name) || Reserved.Contains(name)) continue;
             if (!seen.Add(name)) continue;
-            result.Add(new CandidateNode(name, multiplier));
+            result.Add(new CandidateNode(name, QualityScorer.ParseMultiplier(name)));
         }
         return result;
-    }
-
-    private static bool StartsWithRegionalFlag(string value)
-    {
-        return value.Length >= 4 &&
-               value[0] == '\uD83C' && value[1] >= '\uDDE6' && value[1] <= '\uDDFF' &&
-               value[2] == '\uD83C' && value[3] >= '\uDDE6' && value[3] <= '\uDDFF';
     }
 }

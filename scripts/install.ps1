@@ -23,6 +23,7 @@ foreach ($marker in @('compatibility-probe', 'port: 7896')) {
 }
 $before = @(Get-FileHash -LiteralPath $protected)
 $backup = $null
+$monitorSuffix = '\ClashCompatibilityMonitor\ClashCompatibilityMonitor.exe'
 if (Test-Path -LiteralPath $target) {
     $backup = Join-Path $installRoot ('upgrade-backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
     New-Item -ItemType Directory -Path $backup | Out-Null
@@ -33,9 +34,16 @@ if (Test-Path -LiteralPath $target) {
     }
 }
 
+function Test-InstalledMonitorPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $full = [IO.Path]::GetFullPath($Path)
+    return ($full -eq [IO.Path]::GetFullPath($target)) -or
+        $full.EndsWith($monitorSuffix, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Stop-InstalledMonitor {
     Get-CimInstance Win32_Process -Filter "Name='ClashCompatibilityMonitor.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath) -eq [IO.Path]::GetFullPath($target) } |
+        Where-Object { Test-InstalledMonitorPath $_.ExecutablePath } |
         ForEach-Object {
             $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
             if ($process) { $process.Kill(); if (!$process.WaitForExit(5000)) { throw 'Monitor did not stop.' } }
@@ -58,12 +66,12 @@ try {
     $shortcut.Save()
     Start-Process -FilePath $target -WorkingDirectory $installRoot -WindowStyle Hidden
     Start-Sleep -Seconds 3
-    $running = @(Get-CimInstance Win32_Process -Filter "Name='ClashCompatibilityMonitor.exe'" | Where-Object { $_.ExecutablePath -eq $target })
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='ClashCompatibilityMonitor.exe'" | Where-Object { Test-InstalledMonitorPath $_.ExecutablePath })
     if ($running.Count -ne 1) { throw 'Expected exactly one monitor process.' }
     foreach ($record in $before) {
         if ((Get-FileHash -LiteralPath $record.Path).Hash -ne $record.Hash) { throw 'A protected Clash file changed.' }
     }
-    [pscustomobject]@{Version='0.1.1';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true} | ConvertTo-Json -Compress
+    [pscustomobject]@{Version='0.2.0';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true} | ConvertTo-Json -Compress
 } catch {
     Stop-InstalledMonitor
     if ($backup) {

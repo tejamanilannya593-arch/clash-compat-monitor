@@ -1,13 +1,17 @@
 function nodeCandidates(config) {
-  const flag = /^(?:\uD83C[\uDDE6-\uDDFF]){2}/;
-  const rate = /\|\s*([0-5])x\s*$/;
+  const nonLeafTypes = new Set([
+    'direct', 'reject', 'reject-drop', 'pass', 'compatible',
+    'select', 'selector', 'url-test', 'fallback', 'load-balance', 'relay'
+  ]);
   const seen = new Set();
-  return (config.proxies || []).map(proxy => proxy && proxy.name).filter(name => {
-    const match = typeof name === 'string' && rate.exec(name);
-    if (!match || !flag.test(name) || Number(match[1]) > 3 || seen.has(name)) return false;
-    seen.add(name);
+  return (config.proxies || []).filter(proxy => {
+    if (!proxy || typeof proxy.name !== 'string' || !proxy.name.trim()) return false;
+    if (typeof proxy.type !== 'string' || nonLeafTypes.has(proxy.type.toLowerCase())) return false;
+    if (typeof proxy.server !== 'string' || !proxy.server.trim()) return false;
+    if (seen.has(proxy.name)) return false;
+    seen.add(proxy.name);
     return true;
-  });
+  }).map(proxy => proxy.name);
 }
 
 function upsertGroup(groups, group) {

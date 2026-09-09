@@ -40,7 +40,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.1.1", MonitorIdentity.Version, "release version");
+        Equal("0.2.0", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         CandidateFiltering();
         PipeHttpDecoding();
@@ -63,24 +63,23 @@ internal static class Tests
     {
         var names = new[] {
             "DIRECT",
-            "消息: 17条未读，在APP查看",
+            "REJECT",
+            "Tokyo-A",
+            "节点 B | 0.5x",
             "🇭🇰 香港 I1 | IEPL | 3x",
             "🇸🇬 新加坡 M2 | BHE | 3x",
-            "🇯🇵 日本 V1 | IPv6 | 3x",
-            "🇺🇸 美国 I0 | ChatGPT | 1x",
-            "🇹🇼 台湾 I1 | IPv6 | 1x",
-            "🇸🇬 菲律宾 B12 | 5x",
-            "🇸🇬 香港伪装 | IEPL | 1x",
-            "🇯🇵 澳门伪装 | IEPL | 1x",
-            "🇺🇸 中国大陆伪装 | IEPL | 1x",
-            "🇸🇬 新加坡 M2 | BHE | 3x"
+            "台湾-无倍率",
+            "High cost | 5x",
+            "Tokyo-A"
         };
         var candidates = CandidateCatalog.Filter(names);
-        Equal(8, candidates.Count, "region names do not filter candidates");
-        Equal("🇭🇰 香港 I1 | IEPL | 3x", candidates[0].Name, "source ordering preserved");
+        Equal(6, candidates.Count, "provider naming does not filter candidates");
+        Equal("Tokyo-A", candidates[0].Name, "source ordering preserved");
         Equal(true, candidates.Any(x => x.Name.Contains("台湾")), "taiwan remains eligible");
-        Equal(true, candidates.Any(x => x.Name.Contains("香港")), "region label is not compatibility evidence");
-        Equal(false, candidates.Any(x => x.Name.EndsWith("5x", StringComparison.Ordinal)), "high multiplier excluded");
+        Equal(true, candidates.Any(x => x.Name == "Tokyo-A"), "plain provider name remains eligible");
+        Equal(true, candidates.Any(x => x.Name.EndsWith("5x", StringComparison.Ordinal)), "high multiplier is measured not hidden");
+        Equal<double?>(null, candidates.First(x => x.Name == "Tokyo-A").Multiplier, "missing multiplier stays unknown");
+        Equal(0.5, candidates.First(x => x.Name.Contains("0.5x")).Multiplier.Value, "decimal multiplier retained");
     }
 
     private static void PipeHttpDecoding()
@@ -632,7 +631,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.1.1"), "status shows version");
+        Equal(true, report.Contains("版本：0.2.0"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

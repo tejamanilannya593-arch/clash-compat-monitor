@@ -19,6 +19,7 @@
 - Create `src/TrayHost.cs`: native notification-area icon, menu commands, one-shot notifications, and UI-thread dispatch.
 - Create `src/DetailsForm.cs`: first-run settings and on-demand status/details UI.
 - Modify `src/MihomoPipeClient.cs`: bounded connect/write/read behavior.
+- Modify `src/CandidateCatalog.cs` and `clash/enhancement.js`: discover leaf proxies structurally without provider-specific names.
 - Modify `src/Models.cs`: retain per-service probe results in a scan result.
 - Modify `src/CompatibilityScanner.cs`: scan caller-selected required services and return measurements.
 - Modify `src/MonitorWorker.cs`: accept preferences, return a snapshot, and preserve existing stability gates.
@@ -428,10 +429,16 @@ Commit: `git add src/TrayHost.cs src/DetailsForm.cs src/MonitorSnapshot.cs src/P
 - Modify: `tests/Release.Tests.ps1`
 - Modify: `src/Program.cs`
 - Modify: `src/StatusReport.cs`
+- Modify: `src/CandidateCatalog.cs`
+- Modify: `src/Models.cs`
+- Modify: `clash/enhancement.js`
+- Test: `clash/enhancement.test.js`
 
 - [ ] **Step 1: Make release checks require the new version and behavior**
 
 Update release assertions to require `Version = "0.2.0"`, package folder `ClashCompatibilityMonitor-v0.2.0`, documentation for tray behavior, explicit service preferences, second-launch activation, and bounded Mihomo I/O.
+
+Add provider-neutral fixtures with plain English names, Chinese names, missing multipliers, decimal multipliers, high multipliers, duplicate names, built-in actions, and non-leaf selector objects. The expected candidate group contains every unique structural leaf regardless of its label or rate.
 
 - [ ] **Step 2: Run release checks and verify failure on v0.1.1**
 
