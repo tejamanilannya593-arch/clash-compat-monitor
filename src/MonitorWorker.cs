@@ -38,7 +38,7 @@ public sealed class BoundedLogger
     }
 }
 
-public sealed class MonitorWorker : IMonitorCycleRunner
+public sealed class MonitorWorker : IRestorableCycleRunner
 {
     private readonly MonitorConfiguration config;
     private readonly IMihomoClient mihomo;
@@ -49,6 +49,7 @@ public sealed class MonitorWorker : IMonitorCycleRunner
     private readonly TrafficGuard trafficGuard;
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
+    private string previousSelectedNode;
 
     public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock)
     {
@@ -69,6 +70,20 @@ public sealed class MonitorWorker : IMonitorCycleRunner
     public MonitorSnapshot Run(UserPreferences preferences)
     {
         return RunOnce(false, preferences);
+    }
+
+    public bool RestorePrevious()
+    {
+        if (String.IsNullOrWhiteSpace(previousSelectedNode)) return false;
+        string current = mihomo.GetSelected(config.SharedGroup);
+        if (String.Equals(current, previousSelectedNode, StringComparison.Ordinal)) return false;
+        if (!mihomo.GetChoices(config.SharedGroup).Contains(previousSelectedNode, StringComparer.Ordinal)) return false;
+        string target = previousSelectedNode;
+        mihomo.Select(config.SharedGroup, target);
+        previousSelectedNode = current;
+        controller.RecordSwitch();
+        logger.Write("restored previous node=" + SafeName(target));
+        return true;
     }
 
     public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)
@@ -240,6 +255,7 @@ public sealed class MonitorWorker : IMonitorCycleRunner
                 if (shouldSwitch && !dryRun && String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
                 {
                     mihomo.Select(config.SharedGroup, best.Key);
+                    previousSelectedNode = current;
                     controller.RecordSwitch();
                     switched = true;
                     reportedScore = best.Value.Score;

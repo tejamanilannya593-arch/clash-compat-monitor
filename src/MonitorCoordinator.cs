@@ -7,6 +7,11 @@ public interface IMonitorCycleRunner
     MonitorSnapshot Run(UserPreferences preferences);
 }
 
+public interface IRestorableCycleRunner : IMonitorCycleRunner
+{
+    bool RestorePrevious();
+}
+
 public sealed class MonitorCoordinator : IDisposable
 {
     private readonly IMonitorCycleRunner runner;
@@ -21,6 +26,7 @@ public sealed class MonitorCoordinator : IDisposable
     private string lastAttentionKey;
     private int checkRequested = 1;
     private int paused;
+    private int restoreRequested;
     private int stopping;
 
     public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog)
@@ -53,6 +59,12 @@ public sealed class MonitorCoordinator : IDisposable
     {
         Interlocked.Exchange(ref checkRequested, 1);
         wake.Set();
+    }
+
+    public void RequestRestorePrevious()
+    {
+        Interlocked.Exchange(ref restoreRequested, 1);
+        RequestCheck();
     }
 
     public void SetPaused(bool value)
@@ -91,6 +103,14 @@ public sealed class MonitorCoordinator : IDisposable
             }
 
             Interlocked.Exchange(ref checkRequested, 0);
+            if (Interlocked.Exchange(ref restoreRequested, 0) != 0)
+            {
+                var restorable = runner as IRestorableCycleRunner;
+                bool restored = restorable != null && restorable.RestorePrevious();
+                Publish(MonitorSnapshot.CreateState(restored ? MonitorRunState.Starting : MonitorRunState.Degraded,
+                    restored ? "已恢复上一个节点，正在验证" : "没有可恢复的上一个节点",
+                    DateTime.UtcNow, DateTime.UtcNow), !restored);
+            }
             UserPreferences current;
             lock (preferencesGate) current = Copy(preferences);
             Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => runner.Run(current),

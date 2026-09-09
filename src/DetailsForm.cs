@@ -9,6 +9,7 @@ public sealed class DetailsForm : Form
     private readonly Action<UserPreferences> savePreferences;
     private readonly Action requestCheck;
     private readonly Action<bool> setPaused;
+    private readonly Action restorePrevious;
     private readonly Action exitApplication;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
@@ -22,11 +23,12 @@ public sealed class DetailsForm : Form
     private bool paused;
 
     public DetailsForm(UserPreferences preferences, Action<UserPreferences> savePreferences,
-        Action requestCheck, Action<bool> setPaused, Action exitApplication)
+        Action requestCheck, Action<bool> setPaused, Action restorePrevious, Action exitApplication)
     {
         this.savePreferences = savePreferences;
         this.requestCheck = requestCheck;
         this.setPaused = setPaused;
+        this.restorePrevious = restorePrevious;
         this.exitApplication = exitApplication;
 
         Text = "节点守护";
@@ -138,6 +140,7 @@ public sealed class DetailsForm : Form
             pauseButton.Text = paused ? "恢复自动优化" : "暂停自动优化";
         };
         buttons.Controls.Add(pauseButton);
+        buttons.Controls.Add(ActionButton("恢复上一个节点", delegate { restorePrevious(); }));
         buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
         layout.Controls.Add(buttons);
         layout.Controls.Add(TextLabel("响应时间来自轻量 HTTP 探测，不代表网页渲染、AI 生成或游戏服务器延迟。"));

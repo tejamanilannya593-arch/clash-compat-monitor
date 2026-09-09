@@ -589,6 +589,15 @@ internal static class Tests
             Thread.Sleep(80);
             Equal(1, attentionCount, "duplicate attention suppressed");
         }
+
+        var restorableRunner = new RestorableCycleRunner();
+        using (var coordinator = new MonitorCoordinator(restorableRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, restorableRunner.WaitForRunCount(1, 1000), "restore runner initial cycle");
+            coordinator.RequestRestorePrevious();
+            Equal(true, SpinWait.SpinUntil(() => restorableRunner.RestoreCount == 1, 1000), "restore request reaches cycle runner");
+        }
     }
 
     private sealed class BlockingCycleRunner : IMonitorCycleRunner
@@ -619,6 +628,27 @@ internal static class Tests
         {
             Interlocked.Increment(ref runCount);
             return MonitorSnapshot.CreateState(MonitorRunState.Degraded, "same failure", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+        }
+        public bool WaitForRunCount(int expected, int milliseconds)
+        {
+            return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
+        }
+    }
+
+    private sealed class RestorableCycleRunner : IRestorableCycleRunner
+    {
+        private int runCount;
+        private int restoreCount;
+        public int RestoreCount { get { return Volatile.Read(ref restoreCount); } }
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+        }
+        public bool RestorePrevious()
+        {
+            Interlocked.Increment(ref restoreCount);
+            return true;
         }
         public bool WaitForRunCount(int expected, int milliseconds)
         {
