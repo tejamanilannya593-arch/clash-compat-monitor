@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $required = @(
-    'README.md', 'QUICKSTART.md', 'LICENSE', 'Install.cmd', 'Diagnose.cmd', 'package-release.ps1',
+    'README.md', 'README.en.md', 'QUICKSTART.md', 'LICENSE', 'Install.cmd', 'Diagnose.cmd', 'package-release.ps1',
     'SECURITY.md', 'CODE_OF_CONDUCT.md',
     'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1',
     '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
@@ -29,6 +29,13 @@ if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'In
 if (!$readme.Contains('v0.6.0') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
     !$program.Contains('InstanceActivation.TryOwn') -or !$trayHost.Contains('NotifyIcon')) {
     throw 'README does not describe v0.6.0 tray and intent behavior.'
+}
+$stabilityFirst = ([char[]](0x7A33,0x5B9A,0x4F18,0x5148,0x7684,0x20,0x43,0x6C,0x61,0x73,0x68,0x2F,0x4D,0x69,0x68,0x6F,0x6D,0x6F,0x20,0x57,0x69,0x6E,0x64,0x6F,0x77,0x73,0x20,0x8282,0x70B9,0x5B88,0x62A4,0x7A0B,0x5E8F)) -join ''
+$doesNotModify = ([char[]](0x4E0D,0x4FEE,0x6539,0x20,0x43,0x6C,0x61,0x73,0x68,0x20,0x914D,0x7F6E,0x6587,0x4EF6)) -join ''
+$noTelemetry = ([char[]](0x4E0D,0x4E0A,0x4F20,0x9065,0x6D4B)) -join ''
+if (!$readme.Contains($stabilityFirst) -or !$readme.Contains('releases/latest') -or
+    !$readme.Contains($doesNotModify) -or !$readme.Contains($noTelemetry) -or !$readme.Contains('README.en.md')) {
+    throw 'README does not provide the approved landing-page hero and trust links.'
 }
 $twoRecentStandbys = ([char[]](0x4E24,0x4E2A,0x8FD1,0x671F,0x5907,0x7528,0x8282,0x70B9)) -join ''
 $sameFailure = ([char[]](0x540C,0x7C7B,0x5F02,0x5E38)) -join ''

@@ -1,10 +1,38 @@
 # Clash Compatibility Monitor
 
-一个面向 Clash Verge Rev 的轻量托盘节点守护工具。v0.6.0 以稳定性和订阅兼容性为第一目标：用户只需选择一次常用服务，程序便会在不接管订阅的前提下，综合平台可用性、响应、抖动、吞吐和倍率自动选择统一节点。
+> 稳定优先的 Clash/Mihomo Windows 节点守护程序
 
-第一次使用请阅读 [QUICKSTART.md](QUICKSTART.md)。发布包提供 `Diagnose.cmd` 和 `Install.cmd`；诊断只检查本机配置标记，不读取或输出订阅内容。
+[![CI](https://github.com/tejamanilannya593-arch/clash-compat-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/tejamanilannya593-arch/clash-compat-monitor/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tejamanilannya593-arch/clash-compat-monitor)](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest)
+[![License](https://img.shields.io/github/license/tejamanilannya593-arch/clash-compat-monitor)](LICENSE)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)](QUICKSTART.md)
 
-## v0.6.0 能力
+[下载最新版](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest) · [快速开始](QUICKSTART.md) · [English](README.en.md)
+
+当当前节点可用时尽量不切换；明确故障时安全容灾；同一服务在多个节点出现同类异常时，不把网站故障错误归因给节点。
+
+它面向使用 Clash Verge Rev 或 Mihomo 的 Windows 用户：不要求机场采用固定节点命名，不修改 Clash 配置文件，不上传遥测，也不提供或销售代理节点。
+
+| 稳定优先 | 订阅兼容 | 本地可信 |
+| --- | --- | --- |
+| 一次慢响应或一次高分不会触发主动切换 | 支持 `proxies`、`proxy-providers` 和混合订阅 | 不读取浏览历史，不上传订阅、日志或节点数据 |
+| 性能候选需要 5 次、30 分钟、95% 成功率历史 | 不按香港、台湾、日本等地区名称过滤 | 只操作现有代理组选择，不接管订阅 |
+
+## 三步开始
+
+1. 从 [Releases](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest) 下载并解压完整发布包。
+2. 在 Clash Verge Rev 中启用包内的 `clash/enhancement.js`，应用配置后运行 `Diagnose.cmd`。
+3. 运行 `Install.cmd`，选择长期需要的服务，然后关闭窗口让程序在托盘后台工作。
+
+首次使用、升级和卸载细节请阅读 [QUICKSTART.md](QUICKSTART.md)。诊断只检查本机配置标记，不读取或输出订阅内容。
+
+## 它如何避免误切
+
+- 当前节点明确失败时，先快速复检同一服务，避免一次超时直接触发切换。
+- 当前节点和两个近期备用节点出现同类服务异常时，熔断该服务 10 分钟；其他服务继续检测，但这次异常不计入节点历史。
+- 当前节点仍可用时，只有持续偏慢且候选具备稳定历史、优质延迟和足够提升，才允许性能寻优。
+
+## v0.6.0 能力与策略
 
 - 当前节点的明确服务失败经快速复检确认后，会在两个近期备用节点上只复检同一服务；当前节点与两个备用节点均出现同类异常时，才判断为服务端公共异常。
 - 公共异常触发 10 分钟服务熔断：继续检测其他所选服务，但该异常不归因于节点、不写入节点失败历史，也不因此切换节点；到期后自动恢复完整检测。
