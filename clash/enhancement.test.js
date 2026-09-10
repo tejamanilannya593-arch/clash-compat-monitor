@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { main, nodeCandidates } = require('./enhancement');
+const { main, nodeCandidates, providerNames } = require('./enhancement');
 
 const fixture = {
   ipv6: true,
@@ -48,7 +48,37 @@ assert(once.rules.indexOf('DOMAIN-SUFFIX,steamcontent.com,DIRECT') < once.rules.
 assert(once.rules.includes('DOMAIN,gemini.google.com,🌐 统一稳定节点'));
 assert(once.rules.includes('DOMAIN-SUFFIX,chatgpt.com,🌐 统一稳定节点'));
 assert(once.rules.includes('DOMAIN-SUFFIX,github.com,🌐 统一稳定节点'));
+assert(once.rules.includes('DOMAIN-SUFFIX,18comic.vip,🌐 统一稳定节点'));
 assert(once.rules.includes('DOMAIN,stun.chat.bilibili.com,DIRECT'));
 const twice = main(JSON.parse(JSON.stringify(once)));
 assert.deepStrictEqual(twice, once);
+
+const providerOnly = {
+  ipv6: true,
+  dns: { ipv6: true },
+  'proxy-providers': {
+    airportA: { type: 'http', url: 'https://provider.invalid/a' },
+    localNodes: { type: 'file', path: './nodes.yaml' },
+    broken: null
+  },
+  rules: []
+};
+assert.deepStrictEqual(providerNames(providerOnly), ['airportA', 'localNodes']);
+const providerResult = main(JSON.parse(JSON.stringify(providerOnly)));
+const providerShared = providerResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点');
+const providerProbe = providerResult['proxy-groups'].find(x => x.name === '🧪 兼容性探测');
+assert.deepStrictEqual(providerShared.use, ['airportA', 'localNodes']);
+assert.deepStrictEqual(providerProbe.use, ['airportA', 'localNodes']);
+assert.strictEqual(Object.prototype.hasOwnProperty.call(providerShared, 'proxies'), false);
+
+const mixed = JSON.parse(JSON.stringify(fixture));
+mixed['proxy-providers'] = { airportA: { type: 'http', url: 'https://provider.invalid/a' } };
+const mixedResult = main(mixed);
+assert.deepStrictEqual(mixedResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').use, ['airportA']);
+assert(mixedResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').proxies.includes('Tokyo-A'));
+
+const single = { ipv6: true, dns: { ipv6: true }, proxies: [{ name: 'only-node', type: 'ss', server: 'one.invalid', port: 443 }], rules: [] };
+const singleResult = main(single);
+assert.deepStrictEqual(singleResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').proxies, ['only-node']);
+assert.deepStrictEqual(main(JSON.parse(JSON.stringify(providerResult))), providerResult);
 console.log('PASS enhancement filtering, routing, listener, and idempotency');

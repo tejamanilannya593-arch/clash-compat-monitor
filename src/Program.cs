@@ -6,7 +6,7 @@ using System.Windows.Forms;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.2.0";
+    public const string Version = "0.6.0";
 }
 
 public static class Program
@@ -55,7 +55,7 @@ public static class Program
                 using (var probe = new HttpServiceProbe(config.ProbeProxy))
                 {
                     var worker = new MonitorWorker(config, client, probe, logger, new SystemClock());
-                    using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog))
+                    using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
                     using (var tray = new TrayHost(coordinator, preferenceStore, preferences))
                     {
                         activation.Activated += tray.ShowDetailsFromAnyThread;

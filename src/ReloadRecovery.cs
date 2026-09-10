@@ -13,7 +13,11 @@ public static class ReloadRecovery
         if (!(candidates ?? Enumerable.Empty<CandidateNode>()).Any(x => x.Name == state.PreferredNode)) return null;
         NodeHealthRecord record;
         if (!state.Records.TryGetValue(state.PreferredNode, out record)) return null;
-        bool usable = record.Health == CandidateHealth.Compatible || record.Health == CandidateHealth.BasicCompatible;
+        // A config reload invalidates old health records before this decision. A recent
+        // preferred node may therefore be Unknown, but the worker always performs a
+        // fresh compatibility scan before it is selected.
+        bool usable = record.Health == CandidateHealth.Compatible || record.Health == CandidateHealth.BasicCompatible ||
+            record.Health == CandidateHealth.Unknown;
         return usable && record.CooldownUntilUtc <= nowUtc ? state.PreferredNode : null;
     }
 }

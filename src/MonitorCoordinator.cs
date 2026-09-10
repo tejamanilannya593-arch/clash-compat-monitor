@@ -12,6 +12,12 @@ public interface IRestorableCycleRunner : IMonitorCycleRunner
     bool RestorePrevious();
 }
 
+public interface IProgressCycleRunner : IMonitorCycleRunner
+{
+    event Action<MonitorSnapshot> Progress;
+    Func<bool> ShouldStop { get; set; }
+}
+
 public sealed class MonitorCoordinator : IDisposable
 {
     private readonly IMonitorCycleRunner runner;
@@ -28,8 +34,10 @@ public sealed class MonitorCoordinator : IDisposable
     private int paused;
     private int restoreRequested;
     private int stopping;
+    private int cancelCycle;
+    private readonly bool persistStatistics;
 
-    public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog)
+    public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog, bool persistStatistics = false)
     {
         if (runner == null) throw new ArgumentNullException("runner");
         if (interval <= TimeSpan.Zero) throw new ArgumentOutOfRangeException("interval");
@@ -37,7 +45,14 @@ public sealed class MonitorCoordinator : IDisposable
         this.runner = runner;
         this.interval = interval;
         this.watchdog = watchdog;
-        latest = MonitorSnapshot.CreateState(MonitorRunState.Starting, "正在启动", DateTime.UtcNow, DateTime.UtcNow);
+        this.persistStatistics = persistStatistics;
+        latest = MonitorSnapshot.CreateState(MonitorRunState.Starting, "正在启动", DateTime.MinValue, DateTime.MaxValue);
+        var progressive = runner as IProgressCycleRunner;
+        if (progressive != null)
+        {
+            progressive.ShouldStop = () => Volatile.Read(ref stopping) != 0 || Volatile.Read(ref paused) != 0 || Volatile.Read(ref cancelCycle) != 0;
+            progressive.Progress += OnProgress;
+        }
     }
 
     public event Action<MonitorSnapshot> SnapshotChanged;
@@ -70,8 +85,8 @@ public sealed class MonitorCoordinator : IDisposable
     public void SetPaused(bool value)
     {
         Interlocked.Exchange(ref paused, value ? 1 : 0);
-        if (value) Publish(MonitorSnapshot.CreateState(MonitorRunState.Paused, "自动优化已暂停",
-            DateTime.UtcNow, DateTime.MaxValue), false);
+        if (value) Interlocked.Exchange(ref cancelCycle, 1);
+        if (value) Publish(Latest.WithState(MonitorRunState.Paused, "自动优化已暂停", DateTime.MaxValue), false);
         else RequestCheck();
         wake.Set();
     }
@@ -103,43 +118,62 @@ public sealed class MonitorCoordinator : IDisposable
             }
 
             Interlocked.Exchange(ref checkRequested, 0);
-            if (Interlocked.Exchange(ref restoreRequested, 0) != 0)
-            {
-                var restorable = runner as IRestorableCycleRunner;
-                bool restored = restorable != null && restorable.RestorePrevious();
-                Publish(MonitorSnapshot.CreateState(restored ? MonitorRunState.Starting : MonitorRunState.Degraded,
-                    restored ? "已恢复上一个节点，正在验证" : "没有可恢复的上一个节点",
-                    DateTime.UtcNow, DateTime.UtcNow), !restored);
-            }
+            bool restore = Interlocked.Exchange(ref restoreRequested, 0) != 0;
+            Interlocked.Exchange(ref cancelCycle, 0);
             UserPreferences current;
             lock (preferencesGate) current = Copy(preferences);
-            Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => runner.Run(current),
+            Publish(Latest.WithState(MonitorRunState.Checking, "正在检测当前节点及所选服务", DateTime.MaxValue), false);
+            Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => {
+                if (restore)
+                {
+                    var restorable = runner as IRestorableCycleRunner;
+                    if (restorable == null || !restorable.RestorePrevious())
+                        return Latest.WithState(MonitorRunState.Degraded, "上一个节点未通过复检或不存在，保留当前连接", DateTime.UtcNow.Add(interval));
+                }
+                return runner.Run(current);
+            },
                 CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-            bool completed = WaitWithoutThrowing(cycle, watchdog);
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            bool completed = false;
+            while (Volatile.Read(ref stopping) == 0 && elapsed.Elapsed < watchdog)
+                if (WaitWithoutThrowing(cycle, TimeSpan.FromMilliseconds(50))) { completed = true; break; }
             if (!completed)
             {
-                var stuck = MonitorSnapshot.CreateState(MonitorRunState.Stuck, "检测超时，正在等待当前操作退出",
-                    DateTime.UtcNow, DateTime.UtcNow.Add(interval));
+                Interlocked.Exchange(ref cancelCycle, 1);
+                var stuck = Latest.WithState(MonitorRunState.Stuck, "检测超时，正在等待当前操作退出", DateTime.MaxValue);
                 Publish(stuck, true);
                 while (Volatile.Read(ref stopping) == 0 && !WaitWithoutThrowing(cycle, TimeSpan.FromMilliseconds(100))) { }
             }
             if (Volatile.Read(ref stopping) != 0) break;
+            if (Volatile.Read(ref paused) != 0) { if (cycle.IsFaulted) { var observed = cycle.Exception; } continue; }
 
             if (cycle.IsFaulted)
             {
                 Exception cause = cycle.Exception == null ? null : cycle.Exception.GetBaseException();
-                var degraded = MonitorSnapshot.CreateState(MonitorRunState.Degraded,
+                var degraded = Latest.WithState(MonitorRunState.Degraded,
                     cause == null ? "检测失败" : "检测失败：" + cause.Message,
-                    DateTime.UtcNow, DateTime.UtcNow.Add(interval));
+                    DateTime.UtcNow.Add(interval));
                 Publish(degraded, true);
             }
-            else if (cycle.IsCompleted)
+            else if (cycle.IsCompleted && cycle.Result != null)
             {
                 Publish(cycle.Result, cycle.Result.State == MonitorRunState.Degraded || cycle.Result.State == MonitorRunState.Stuck);
             }
-            nextRunUtc = DateTime.UtcNow.Add(interval);
+            RunStatistics.CycleCompleted(Latest.State, elapsed.Elapsed.TotalSeconds);
+            if (persistStatistics) RunStatistics.SaveLocal();
+            DateTime requested = Latest.NextCheckUtc;
+            nextRunUtc = requested > DateTime.UtcNow && requested < DateTime.UtcNow.AddMinutes(5) ? requested : DateTime.UtcNow.Add(interval);
         }
         Publish(MonitorSnapshot.CreateState(MonitorRunState.Stopped, "已退出", DateTime.UtcNow, DateTime.MaxValue), false);
+    }
+
+    private void OnProgress(MonitorSnapshot value)
+    {
+        if (Volatile.Read(ref stopping) == 0 && Volatile.Read(ref paused) == 0 && Volatile.Read(ref cancelCycle) == 0)
+        {
+            if (String.IsNullOrEmpty(value.ActualNode)) value = Latest.WithState(value.State, value.Decision, value.NextCheckUtc);
+            Publish(value, false);
+        }
     }
 
     private void Publish(MonitorSnapshot value, bool attention)
@@ -184,7 +218,8 @@ public sealed class MonitorCoordinator : IDisposable
     {
         if (Interlocked.Exchange(ref stopping, 1) != 0) return;
         wake.Set();
-        if (thread != null) thread.Join(TimeSpan.FromSeconds(2));
-        wake.Dispose();
+        var progressive = runner as IProgressCycleRunner;
+        if (progressive != null) progressive.Progress -= OnProgress;
+        if (thread == null || thread.Join(TimeSpan.FromSeconds(2))) wake.Dispose();
     }
 }

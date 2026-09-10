@@ -40,14 +40,22 @@ public static class StatusReport
         }
     }
 
-    private static string DecisionText(string decision)
+    public static string DecisionText(string decision)
     {
+        if (decision != null && decision.StartsWith("已切换：", StringComparison.Ordinal))
+            return "已切换：" + DecisionText(decision.Substring(4));
         switch (decision)
         {
             case "quality difference below threshold": return "质量提升不足 20%，保持当前节点";
             case "quality improved by at least 20 percent": return "综合质量至少提升 20%";
             case "minimum hold": return "仍在最短持有期，保持当前节点";
             case "target requires fresh verification": return "目标节点需要重新验证";
+            case "target requires proven stability": return "候选节点尚未积累 5 次、跨度 30 分钟且成功率不低于 95% 的历史";
+            case "current response already preferred": return "当前节点响应不超过 500 ms，保持当前节点";
+            case "target response exceeds preferred threshold": return "候选节点响应超过 500 ms，不进行性能切换";
+            case "current response not persistently slow": return "当前节点最近 3 次中位响应未超过 800 ms，保持当前节点";
+            case "target response history not preferred": return "候选节点最近 5 次延迟未达到优质标准";
+            case "target service response exceeds limit": return "候选节点存在超过 1000 ms 的服务响应";
             case "current healthy": return "当前节点正常";
             case "awaiting confirmation": return "等待第二次失败确认";
             case "no compatible candidate": return "没有已验证的替代节点";

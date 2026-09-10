@@ -14,6 +14,20 @@ function nodeCandidates(config) {
   }).map(proxy => proxy.name);
 }
 
+function providerNames(config) {
+  const providers = config['proxy-providers'] || {};
+  return Object.keys(providers).filter(name =>
+    name.trim() && providers[name] && typeof providers[name] === 'object'
+  );
+}
+
+function managedGroup(name, proxies, providers) {
+  const group = { name, type: 'select' };
+  if (proxies.length) group.proxies = proxies.slice();
+  if (providers.length) group.use = providers.slice();
+  return group;
+}
+
 function upsertGroup(groups, group) {
   const index = groups.findIndex(item => item.name === group.name);
   if (index >= 0) groups[index] = group;
@@ -40,20 +54,22 @@ function main(config, profileName) {
   dns.ipv6 = false;
 
   const candidates = nodeCandidates(config);
-  if (candidates.length < 2) return config;
+  const providers = providerNames(config);
+  if (!candidates.length && !providers.length) return config;
   const groups = config['proxy-groups'] || (config['proxy-groups'] = []);
   const serviceNames = ['🔍 Google', '🤖 OpenAI', '⌨️ GitHub'];
   const preferred = serviceNames.map(name => groups.find(item => item.name === name))
     .map(group => group && group.now).find(name => candidates.includes(name));
   const ordered = preferred ? [preferred].concat(candidates.filter(name => name !== preferred)) : candidates.slice();
 
-  upsertGroup(groups, { name: '🌐 统一稳定节点', type: 'select', proxies: ordered.slice() });
-  upsertGroup(groups, { name: '🧪 兼容性探测', type: 'select', proxies: ordered.slice() });
+  upsertGroup(groups, managedGroup('🌐 统一稳定节点', ordered, providers));
+  upsertGroup(groups, managedGroup('🧪 兼容性探测', ordered, providers));
   serviceNames.forEach(name => {
     const group = groups.find(item => item.name === name);
     if (!group) return;
     group.type = 'select';
     group.proxies = ['🌐 统一稳定节点'];
+    delete group.use;
     delete group.url; delete group.interval; delete group.tolerance; delete group.lazy;
   });
 
@@ -87,10 +103,11 @@ function main(config, profileName) {
     'DOMAIN-SUFFIX,discordapp.com,🌐 统一稳定节点',
     'DOMAIN-SUFFIX,spotify.com,🌐 统一稳定节点',
     'DOMAIN-SUFFIX,scdn.co,🌐 统一稳定节点',
-    'DOMAIN-SUFFIX,epicgames.com,🌐 统一稳定节点'
+    'DOMAIN-SUFFIX,epicgames.com,🌐 统一稳定节点',
+    'DOMAIN-SUFFIX,18comic.vip,🌐 统一稳定节点'
   ];
   config.rules = prependUniqueRules(config.rules, directRules.concat(sharedRules));
   return config;
 }
 
-if (typeof module !== 'undefined') module.exports = { main, nodeCandidates };
+if (typeof module !== 'undefined') module.exports = { main, nodeCandidates, providerNames };

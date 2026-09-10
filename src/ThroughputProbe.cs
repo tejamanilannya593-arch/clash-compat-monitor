@@ -86,6 +86,7 @@ public sealed class ThroughputProbe : IDisposable
         {
             int read = stream.Read(buffer, 0, (int)Math.Min(buffer.Length, maximumBytes - total));
             if (read <= 0) break;
+            RunStatistics.AddBodyBytes(read);
             total += read;
         }
         return total;
