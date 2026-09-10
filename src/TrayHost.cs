@@ -29,7 +29,7 @@ public sealed class TrayHost : ApplicationContext
         menu.Items.Add("退出", null, delegate { ExitThread(); });
 
         tray = new NotifyIcon {
-            Icon = SystemIcons.Application,
+            Icon = AppIcon.Current,
             Text = "节点守护 · 正在启动",
             ContextMenuStrip = menu,
             Visible = true

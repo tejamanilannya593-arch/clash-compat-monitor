@@ -13,6 +13,8 @@ if (!(Test-Path -LiteralPath $SourceExe -PathType Leaf)) { throw 'ClashCompatibi
 $installRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ClashCompatibilityMonitor'
 $target = Join-Path $installRoot 'ClashCompatibilityMonitor.exe'
 $clashRoot = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'io.github.clash-verge-rev.clash-verge-rev'
+$diagnosis = & (Join-Path $PSScriptRoot 'diagnose.ps1') -ClashDirectory $clashRoot -AsObject
+if ($diagnosis.Status -ne 'CONFIG_READY') { throw ($diagnosis.Status + ': ' + $diagnosis.NextStep + ' See QUICKSTART.md.') }
 $protected = @('profiles.yaml', 'clash-verge.yaml') | ForEach-Object { Join-Path $clashRoot $_ }
 foreach ($path in $protected) { if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required Clash file is missing: $path" } }
 $generatedConfig = Join-Path $clashRoot 'clash-verge.yaml'
@@ -55,7 +57,7 @@ Stop-InstalledMonitor
 try {
     Copy-Item -LiteralPath $SourceExe -Destination $target -Force
     $check = Start-Process -FilePath $target -WorkingDirectory $installRoot -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru
-    if ($check.ExitCode -ne 0) { throw 'Installed monitor self-test failed.' }
+    if ($check.ExitCode -ne 0) { throw 'Cannot connect to the Mihomo core. Start Clash Verge Rev and verify the enhancement groups are present, then retry. The previous program will be restored if available.' }
     $startup = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
     $shortcutPath = Join-Path $startup 'Clash Compatibility Monitor.lnk'
     $shell = New-Object -ComObject WScript.Shell
@@ -71,7 +73,7 @@ try {
     foreach ($record in $before) {
         if ((Get-FileHash -LiteralPath $record.Path).Hash -ne $record.Hash) { throw 'A protected Clash file changed.' }
     }
-    [pscustomobject]@{Version='0.2.0';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true} | ConvertTo-Json -Compress
+    [pscustomobject]@{Version='0.6.0';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true} | ConvertTo-Json -Compress
 } catch {
     Stop-InstalledMonitor
     if ($backup) {

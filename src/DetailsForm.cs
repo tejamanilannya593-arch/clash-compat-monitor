@@ -17,6 +17,8 @@ public sealed class DetailsForm : Form
     private readonly Label stateLabel = HeadingLabel();
     private readonly Label nodeLabel = new Label();
     private readonly Label decisionLabel = new Label();
+    private readonly Label responseLabel = new Label();
+    private readonly Label selectionLabel = new Label();
     private readonly Label nextCheckLabel = new Label();
     private readonly ListView serviceList = new ListView();
     private readonly Button pauseButton = new Button();
@@ -32,11 +34,12 @@ public sealed class DetailsForm : Form
         this.exitApplication = exitApplication;
 
         Text = "节点守护";
-        Icon = SystemIcons.Application;
+        Icon = AppIcon.Current;
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(720, 590);
-        MinimumSize = new Size(620, 500);
+        AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
+        Size = ScaleForCurrentDpi(720, 590);
+        MinimumSize = ScaleForCurrentDpi(620, 500);
         Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         BackColor = Color.FromArgb(246, 248, 251);
 
@@ -45,6 +48,15 @@ public sealed class DetailsForm : Form
         Controls.Add(statusPanel);
         Controls.Add(settingsPanel);
         ShowSettings(!preferences.FirstRunComplete);
+    }
+
+    private Size ScaleForCurrentDpi(int width, int height)
+    {
+        using (var graphics = CreateGraphics())
+        {
+            return new Size((int)Math.Round(width * graphics.DpiX / 96F),
+                (int)Math.Round(height * graphics.DpiY / 96F));
+        }
     }
 
     private void BuildSettings(UserPreferences preferences)
@@ -64,6 +76,7 @@ public sealed class DetailsForm : Form
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);
+        AddChoice(layout, "JMComic 网页", new[] { ServiceKind.JMComicWeb }, preferences);
 
         var save = new Button { Text = "保存并开始自动优化", AutoSize = true, Height = 38,
             Padding = new Padding(14, 4, 14, 4), BackColor = Color.FromArgb(45, 120, 240), ForeColor = Color.White,
@@ -99,7 +112,9 @@ public sealed class DetailsForm : Form
     {
         statusPanel.Dock = DockStyle.Fill;
         statusPanel.Padding = new Padding(28);
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 8 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 10 };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -113,9 +128,15 @@ public sealed class DetailsForm : Form
         ConfigureText(nodeLabel, 15F, FontStyle.Bold, Color.FromArgb(31, 42, 58));
         nodeLabel.Padding = new Padding(0, 9, 0, 4);
         layout.Controls.Add(nodeLabel);
+        ConfigureText(selectionLabel, 9F, FontStyle.Regular, Color.FromArgb(74, 102, 143));
+        selectionLabel.Padding = new Padding(0, 0, 0, 3);
+        layout.Controls.Add(selectionLabel);
         ConfigureText(decisionLabel, 9F, FontStyle.Regular, Color.FromArgb(88, 101, 122));
         decisionLabel.Padding = new Padding(0, 0, 0, 8);
         layout.Controls.Add(decisionLabel);
+        ConfigureText(responseLabel, 9F, FontStyle.Bold, Color.FromArgb(45, 120, 90));
+        responseLabel.Padding = new Padding(0, 0, 0, 5);
+        layout.Controls.Add(responseLabel);
         ConfigureText(nextCheckLabel, 9F, FontStyle.Regular, Color.FromArgb(88, 101, 122));
         layout.Controls.Add(nextCheckLabel);
 
@@ -142,6 +163,8 @@ public sealed class DetailsForm : Form
         buttons.Controls.Add(pauseButton);
         buttons.Controls.Add(ActionButton("恢复上一个节点", delegate { restorePrevious(); }));
         buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
+        buttons.Controls.Add(ActionButton("切换记录与推荐", delegate { using (var window = new ExperienceForm()) window.ShowDialog(this); }));
+        buttons.Controls.Add(ActionButton("运行统计", delegate { using (var window = new StatisticsForm()) window.ShowDialog(this); }));
         layout.Controls.Add(buttons);
         layout.Controls.Add(TextLabel("响应时间来自轻量 HTTP 探测，不代表网页渲染、AI 生成或游戏服务器延迟。"));
         layout.Controls.Add(ActionButton("退出节点守护", delegate { exitApplication(); }));
@@ -155,8 +178,10 @@ public sealed class DetailsForm : Form
         stateLabel.Text = view.StateText;
         nodeLabel.Text = view.NodeText;
         decisionLabel.Text = view.DecisionText;
-        nextCheckLabel.Text = snapshot.NextCheckUtc == DateTime.MaxValue ? "" :
-            "下次检查：" + snapshot.NextCheckUtc.ToLocalTime().ToString("HH:mm:ss");
+        responseLabel.Text = view.ResponseText;
+        selectionLabel.Text = String.IsNullOrWhiteSpace(snapshot.SelectionReason) ? "" : "当前节点来源：" + snapshot.SelectionReason;
+        nextCheckLabel.Text = "最近检测：" + (snapshot.CheckedUtc == DateTime.MinValue ? "尚未完成" : snapshot.CheckedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss")) +
+            (snapshot.NextCheckUtc == DateTime.MaxValue ? "" : " · 下次检查：" + snapshot.NextCheckUtc.ToLocalTime().ToString("HH:mm:ss"));
         paused = snapshot.State == MonitorRunState.Paused;
         pauseButton.Text = paused ? "恢复自动优化" : "暂停自动优化";
         serviceList.BeginUpdate();
@@ -164,7 +189,7 @@ public sealed class DetailsForm : Form
         foreach (ServiceMeasurement service in snapshot.Services)
         {
             var item = new ListViewItem(MonitorPresentation.ServiceLabel(service.Service));
-            item.SubItems.Add(MonitorPresentation.ServiceText(service.Available, service.Milliseconds, service.Detail));
+            item.SubItems.Add(MonitorPresentation.ServiceText(service));
             item.SubItems.Add(service.Detail);
             serviceList.Items.Add(item);
         }

@@ -1,0 +1,40 @@
+name: 问题报告
+description: 报告可以重复出现的安装、检测或切换问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿上传订阅链接、Clash 配置、完整日志或 experience.json。诊断与统计不会自动上传。
+  - type: input
+    id: versions
+    attributes:
+      label: 环境
+      description: Windows、Clash Verge Rev 和节点守护版本
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从什么状态开始，依次做了什么？
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: diagnosis
+    attributes:
+      label: Diagnose.cmd 输出
+      description: 可选。确认其中没有私人信息后粘贴。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私检查
+      options:
+        - label: 我没有上传订阅链接、Clash 配置、完整日志或 experience.json
+          required: true
