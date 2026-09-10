@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题与讨论
+    url: https://github.com/tejamanilannya593-arch/clash-compat-monitor/discussions
+    about: 安装咨询、一般问答和经验分享请使用 Discussions。
+  - name: 私密安全报告
+    url: https://github.com/tejamanilannya593-arch/clash-compat-monitor/security/advisories/new
+    about: 安全问题请私下报告，不要创建公开 Issue。

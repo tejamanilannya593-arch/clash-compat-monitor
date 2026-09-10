@@ -1,0 +1,30 @@
+name: 功能建议
+description: 提议能够服务多数 Clash/Mihomo 用户的改进
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 请先描述实际使用痛点，而不是只写期望实现方式。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议行为
+      description: 说明期望的检测、界面或切换行为。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已尝试的替代办法
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 项目边界
+      options:
+        - label: 该建议不要求项目提供节点、读取浏览历史或上传订阅数据
+          required: true

@@ -2,7 +2,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $required = @(
     'README.md', 'QUICKSTART.md', 'LICENSE', 'Install.cmd', 'Diagnose.cmd', 'package-release.ps1',
-    'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1'
+    'SECURITY.md', 'CODE_OF_CONDUCT.md',
+    'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1',
+    '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
+    '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml'
 )
 foreach ($relative in $required) {
     $path = Join-Path $root $relative
@@ -15,6 +18,8 @@ $program = Get-Content -LiteralPath (Join-Path $root 'src\Program.cs') -Raw
 $trayHost = Get-Content -LiteralPath (Join-Path $root 'src\TrayHost.cs') -Raw
 $detailsForm = Get-Content -LiteralPath (Join-Path $root 'src\DetailsForm.cs') -Raw
 $buildScript = Get-Content -LiteralPath (Join-Path $root 'build.ps1') -Raw
+$security = if (Test-Path -LiteralPath (Join-Path $root 'SECURITY.md')) { Get-Content -LiteralPath (Join-Path $root 'SECURITY.md') -Raw -Encoding UTF8 } else { '' }
+$conduct = if (Test-Path -LiteralPath (Join-Path $root 'CODE_OF_CONDUCT.md')) { Get-Content -LiteralPath (Join-Path $root 'CODE_OF_CONDUCT.md') -Raw -Encoding UTF8 } else { '' }
 $manifestPath = Join-Path $root 'assets\ClashCompatibilityMonitor.manifest'
 $iconPath = Join-Path $root 'assets\ClashCompatibilityMonitor.ico'
 if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.0')) { throw 'Release package version is not v0.6.0.' }
@@ -35,6 +40,9 @@ if (!$readme.Contains($twoRecentStandbys) -or !$readme.Contains($sameFailure) -o
 }
 if (!$readme.Contains('JMComic') -or !$readme.Contains('18comic.vip')) {
     throw 'README does not describe the opt-in JMComic web probe.'
+}
+if (!$security.Contains('Security Advisory') -or !$conduct.Contains('Contributor Covenant')) {
+    throw 'Repository security or conduct policy is incomplete.'
 }
 $singleNodeSubscription = ([char[]](0x5355,0x8282,0x70B9,0x8BA2,0x9605)) -join ''
 $subscriptionOrder = ([char[]](0x8BA2,0x9605,0x987A,0x5E8F)) -join ''

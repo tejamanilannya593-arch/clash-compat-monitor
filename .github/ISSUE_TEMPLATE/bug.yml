@@ -13,6 +13,17 @@ body:
       description: Windows、Clash Verge Rev 和节点守护版本
     validations:
       required: true
+  - type: dropdown
+    id: subscription
+    attributes:
+      label: 订阅结构
+      options:
+        - 顶层 proxies
+        - proxy-providers
+        - 两者混合
+        - 不确定
+    validations:
+      required: true
   - type: textarea
     id: steps
     attributes:

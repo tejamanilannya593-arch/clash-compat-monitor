@@ -8,6 +8,12 @@
 - [ ] `node clash/enhancement.test.js`
 - [ ] `tests/Release.Tests.ps1`
 - [ ] 不包含订阅、节点、控制器密钥或机器专属路径
+- [ ] 新增或修改的用户行为已有对应测试或验证说明
+
+## 兼容性与隐私
+
+- [ ] 说明对 `proxies`、`proxy-providers` 和混合订阅的影响
+- [ ] 不新增遥测，不上传订阅、节点、日志或浏览记录
 
 ## 自动切换影响
 
