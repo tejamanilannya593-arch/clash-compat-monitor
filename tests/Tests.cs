@@ -201,6 +201,12 @@ internal static class Tests
         Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, new ExperienceData(), "scope",
             new[] { ServiceKind.Google, ServiceKind.GitHub }, now),
             "non-AI configuration does not require account proof");
+        Equal(false, ServiceEvidencePolicy.CanRestoreAfterReload(strict, new ExperienceData(), "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "reload recovery cannot proactively select unverified AI target");
+        Equal(true, ServiceEvidencePolicy.CanRestoreAfterReload(strict, data, "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "reload recovery accepts account-verified AI target");
 
         string path = Path.Combine(Path.GetTempPath(), "account-proof-" + Guid.NewGuid().ToString("N"), "experience.json");
         var store = new ExperienceStore(path);
@@ -216,6 +222,25 @@ internal static class Tests
         Equal(false, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
             ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
             "explicit failure revokes account proof");
+
+        string workerRoot = Path.Combine(Path.GetTempPath(), "account-worker-" + Guid.NewGuid().ToString("N"));
+        var workerData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        var workerStore = new ExperienceStore(Path.Combine(workerRoot, "state", "experience.json"));
+        workerStore.Save(workerData, now);
+        var workerConfig = new MonitorConfiguration { RootPath = workerRoot, SharedGroup = "shared", ProbeGroup = "probe" };
+        var workerMihomo = new VerificationMihomo("node", new[] { "node" });
+        var worker = new MonitorWorker(workerConfig, workerMihomo,
+            new FakeProbe { DefaultResult = ProbeResult.Success(100) },
+            new BoundedLogger(Path.Combine(workerRoot, "logs", "monitor.log"), 1024 * 1024),
+            new FakeClock { UtcNow = now },
+            new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
+        Equal(false, worker.RecordAccountVerification("node", "stale-exit",
+            new[] { ServiceKind.ChatGPT }, now), "worker rejects account proof after exit changed");
+        Equal(true, worker.RecordAccountVerification("node", "fresh-exit",
+            new[] { ServiceKind.ChatGPT }, now), "worker accepts proof after fresh login-chain and exit check");
+        Equal(true, AccountVerificationMemory.IsValid(workerStore.Load(), "scope", "node", "fresh-exit",
+            ServiceKind.ChatGPT, now, AccountVerificationMemory.CurrentRuleVersion),
+            "worker persists freshly revalidated account proof");
     }
 
     private static void AssuranceBehavior()
@@ -241,6 +266,10 @@ internal static class Tests
         Equal(true, policy.NeedsRollback(bad), "failure switch second failure requests rollback verification");
         policy.Begin("a", "b", 100, false, true);
         Equal(true, policy.NeedsRollback(bad), "unproven emergency target first explicit failure requests rollback verification");
+        policy.Begin("a", "b", 100, false, true, now);
+        Equal(true, policy.CanUserFeedbackRollback("b", now.AddMinutes(1)), "recent active switch permits feedback rollback");
+        Equal(false, policy.CanUserFeedbackRollback("manual", now.AddMinutes(1)), "manual node cannot use stale rollback origin");
+        Equal(false, policy.CanUserFeedbackRollback("b", now.AddMinutes(11)), "expired switch transaction cannot use rollback origin");
         policy.Begin("a", "b", 100, true);
         var slow = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 200, 1);
         Equal(false, policy.NeedsRollback(slow), "one slow response does not roll back");
@@ -290,10 +319,12 @@ internal static class Tests
         var remaining = ServiceIncidentPolicy.ServicesToProbe(new[] { ServiceKind.ChatGPT, service }, incidents, now.AddMinutes(1));
         Equal("ChatGPT", String.Join(",", remaining), "active incident is omitted while other services continue");
         var healthyOthers = new CandidateScanResult("current", CandidateHealth.Compatible, null, "ok", 40, 1,
-            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Success(40) } });
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Success(40) } }, "exit-fp", "JP");
         CandidateScanResult suppressed = ServiceIncidentPolicy.AttachSuppressed(healthyOthers, new[] { service });
         Equal(CandidateHealth.Unknown, suppressed.Health, "suppressed endpoint does not mark node healthy or failed");
         Equal(ProbeFailureKind.Unverified, suppressed.ServiceResults[service].FailureKind, "suppressed endpoint is explicit in evidence");
+        Equal("exit-fp", suppressed.ExitFingerprint, "service suppression preserves exit fingerprint");
+        Equal("JP", suppressed.ExitCountryCode, "service suppression preserves exit country");
         CandidateScanResult suppressedOwnFailure = ServiceIncidentPolicy.AttachSuppressed(current, new[] { service });
         Equal(CandidateHealth.Unknown, suppressedOwnFailure.Health, "suppressed endpoint clears its node failure attribution");
         var unrelatedFailure = IncidentScan("current", ServiceKind.ChatGPT, ProbeFailureKind.Transient);
@@ -345,6 +376,17 @@ internal static class Tests
             { Scope = legacyContinuity.ActiveScope, Node = x }));
         Equal("legacy|chatgpt,gemini", legacyContinuity.ResolveScope("new", new[] { "a", "b", "c", "d" }, "chatgpt,gemini"),
             "legacy experience infers subscription continuity during upgrade");
+        var jmMigration = new ExperienceData {
+            ActiveScope = "old|ChatGPT,JMComicWeb,GitHub",
+            ActiveServicesKey = "ChatGPT,JMComicWeb,GitHub",
+            ActiveCandidateNames = new List<string> { "a", "b" },
+            Assurance = new ConnectionAssurance { Scope = "old|ChatGPT,JMComicWeb,GitHub" }
+        };
+        jmMigration.Nodes.Add(new NodeExperience { Scope = jmMigration.ActiveScope, Node = "a" });
+        string migratedScope = jmMigration.ResolveScope("new", new[] { "a", "b" }, "ChatGPT,GitHub");
+        Equal("new|ChatGPT,GitHub", migratedScope, "JMComic removal rekeys but preserves remaining service history");
+        Equal(migratedScope, jmMigration.Nodes[0].Scope, "JMComic migration keeps node history reachable");
+        Equal(migratedScope, jmMigration.Assurance.Scope, "JMComic migration keeps assurance scope aligned");
         var memory = new ExperienceData();
         var scan = new CandidateScanResult("stable", CandidateHealth.Compatible, null, "ok", 100, 1);
         var partialMemory = new ExperienceData();
@@ -600,6 +642,7 @@ internal static class Tests
         Equal(false, probe.Calls.Contains(ServiceKind.Epic), "inactive optional skipped");
         Equal(4096, HttpServiceProbe.LimitBody(new byte[6000]).Length, "response body cap");
         Equal(4096, HttpServiceProbe.ReadLimited(new MemoryStream(new byte[6000]), 4096).Length, "stream body cap");
+        Equal(120L, HttpServiceProbe.ResponseLatency(120, 900), "service latency uses response headers not body transfer");
         var bodyTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
         bool bodyCanceled = false;
         var bodyTimer = System.Diagnostics.Stopwatch.StartNew();
@@ -622,7 +665,8 @@ internal static class Tests
             "empty scan uses fallback");
 
         probe = new FakeProbe { DefaultResult = ProbeResult.Success(75) };
-        scanner = new CompatibilityScanner(mihomo, probe, "probe");
+        scanner = new CompatibilityScanner(mihomo, probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("selected-fp", "JP", "ok")));
         CandidateScanResult selected = scanner.ScanSelected(new CandidateNode("selected", 1),
             new[] { ServiceKind.ChatGPT, ServiceKind.GitHub });
         Equal(2, probe.Calls.Count, "only selected services probed");
@@ -633,7 +677,19 @@ internal static class Tests
         Equal("selected", snapshot.ActualNode, "snapshot leaf node");
         Equal(2, snapshot.Services.Count, "snapshot retains service evidence");
         MonitorPresentation view = MonitorPresentation.From(snapshot);
-        Equal("运行正常", view.StateText, "running label");
+        Equal("部分服务待验证", view.StateText, "login-ready AI scan waits for account verification");
+        Equal("登录链路正常 · 75 ms · 账号待实测",
+            MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
+            "AI service distinguishes login chain from account proof");
+        var accountData = new ExperienceData();
+        AccountVerificationMemory.Mark(accountData, "scope", "selected", "selected-fp",
+            ServiceKind.ChatGPT, true, snapshotTime, AccountVerificationMemory.CurrentRuleVersion);
+        snapshot = snapshot.WithAccountVerification(accountData, "scope", snapshotTime);
+        view = MonitorPresentation.From(snapshot);
+        Equal("运行正常", view.StateText, "account-verified AI scan is running normally");
+        Equal("账号实测通过 · 75 ms · 有效至 10-08",
+            MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
+            "AI service shows account verification evidence");
         Equal("selected", view.NodeText, "presentation leaf node");
         Equal("综合响应：75 ms · 优秀", view.ResponseText, "presentation shows latency quality band");
         Equal("综合响应：待测", MonitorPresentation.From(MonitorSnapshot.CreateState(MonitorRunState.Starting, "", snapshotTime, snapshotTime)).ResponseText, "presentation handles missing latency");
@@ -701,6 +757,20 @@ internal static class Tests
         public string[] GetChoices(string groupName) { return new string[0]; }
         public string GetSelected(string groupName) { return LastSelected; }
         public void Select(string groupName, string proxyName) { LastSelected = proxyName; }
+        public int GetDelay(string proxyName, string url, int timeoutMilliseconds) { return 50; }
+        public bool IsRuntimeIpv6Enabled() { return false; }
+        public bool IsAvailable() { return true; }
+    }
+
+    private sealed class VerificationMihomo : IMihomoClient
+    {
+        private readonly string[] choices;
+        private string sharedSelected;
+        public VerificationMihomo(string selected, string[] choices)
+        { sharedSelected = selected; this.choices = choices; }
+        public string[] GetChoices(string groupName) { return groupName == "shared" ? choices : choices; }
+        public string GetSelected(string groupName) { return groupName == "shared" ? sharedSelected : ""; }
+        public void Select(string groupName, string proxyName) { if (groupName == "shared") sharedSelected = proxyName; }
         public int GetDelay(string proxyName, string url, int timeoutMilliseconds) { return 50; }
         public bool IsRuntimeIpv6Enabled() { return false; }
         public bool IsAvailable() { return true; }
@@ -1056,6 +1126,25 @@ internal static class Tests
                 "negative account feedback reaches runner once");
             Equal(true, accountRunner.WaitForRunCount(3, 1000), "negative feedback requests follow-up scan");
         }
+
+        var sessionRunner = new AccountVerificationCycleRunner();
+        using (var coordinator = new MonitorCoordinator(sessionRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, sessionRunner.WaitForRunCount(1, 1000), "verification session initial cycle");
+            AccountVerificationSession session = coordinator.BeginAccountVerification();
+            Equal("session-node", session.Node, "verification session freezes current node");
+            Equal("session-fingerprint", session.ExitFingerprint, "verification session freezes current exit");
+            int before = sessionRunner.RunCount;
+            Thread.Sleep(80);
+            Equal(before, sessionRunner.RunCount, "verification session pauses automatic cycles");
+            coordinator.CompleteAccountVerification(session,
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, null, DateTime.UtcNow);
+            Equal(true, SpinWait.SpinUntil(() => sessionRunner.VerificationCount == 1, 1000),
+                "verification session records captured evidence once");
+            Equal("session-node", sessionRunner.LastNode, "verification result cannot drift to a newer snapshot node");
+            Equal("session-fingerprint", sessionRunner.LastFingerprint, "verification result cannot drift to a newer exit");
+        }
     }
 
     private static void AccountVerificationUiBehavior()
@@ -1140,15 +1229,21 @@ internal static class Tests
         private int failureCount;
         public int VerificationCount { get { return Volatile.Read(ref verificationCount); } }
         public int FailureCount { get { return Volatile.Read(ref failureCount); } }
+        public int RunCount { get { return Volatile.Read(ref runCount); } }
+        public string LastNode { get; private set; }
         public string LastFingerprint { get; private set; }
         public MonitorSnapshot Run(UserPreferences preferences)
         {
             Interlocked.Increment(ref runCount);
-            return MonitorSnapshot.CreateState(MonitorRunState.Running, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+            return MonitorSnapshot.CreateRunning("session-node",
+                new CandidateScanResult("session-node", CandidateHealth.Compatible, null, "ok", 100, 1,
+                    new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(100) } },
+                    "session-fingerprint", "JP"), null, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
         }
         public bool RecordAccountVerification(string node, string exitFingerprint,
             IEnumerable<ServiceKind> services, DateTime verifiedUtc)
         {
+            LastNode = node;
             LastFingerprint = exitFingerprint;
             Interlocked.Increment(ref verificationCount);
             return true;
@@ -1173,6 +1268,9 @@ internal static class Tests
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
         Equal(false, report.Contains("secret"), "status omits credentials");
+        Equal(true, StatusReport.Format(now, "日本 J1", CandidateHealth.Compatible, 88,
+            "保持当前节点", "ok").Contains("检测状态：登录链路及后台服务探测通过"),
+            "status does not mislabel anonymous login-chain evidence as account proof");
 
         string translated = StatusReport.Format(now, "新加坡 S1", CandidateHealth.BasicCompatible, 74.8,
             "quality difference below threshold", "AI 登录待确认");

@@ -69,7 +69,7 @@ public static class ServiceIncidentPolicy
             definiteNodeFailure ? scan.Health : CandidateHealth.Unknown,
             definiteNodeFailure ? scan.FailedService : null,
             definiteNodeFailure ? scan.Detail : "服务端点暂时熔断，已继续检测其他服务",
-            scan.TotalMilliseconds, scan.ProbeCount, results);
+            scan.TotalMilliseconds, scan.ProbeCount, results, scan.ExitFingerprint, scan.ExitCountryCode);
     }
 
     public static ProbeFailureKind FailureKind(CandidateScanResult scan, ServiceKind service)

@@ -31,7 +31,7 @@ public static class StatusReport
     {
         switch (health)
         {
-            case CandidateHealth.Compatible: return "完整检测通过";
+            case CandidateHealth.Compatible: return "登录链路及后台服务探测通过";
             case CandidateHealth.BasicCompatible: return "基础可用";
             case CandidateHealth.RegionBlocked: return "地区受限";
             case CandidateHealth.ServiceFailed: return "服务失败";

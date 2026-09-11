@@ -60,7 +60,8 @@ public sealed class TrayHost : ApplicationContext
         {
             details = new DetailsForm(preferences, SavePreferences, coordinator.RequestCheck,
                 coordinator.SetPaused, coordinator.RequestRestorePrevious,
-                coordinator.RequestAccountVerification, coordinator.ReportServiceFailure, ExitThread);
+                coordinator.BeginAccountVerification, coordinator.CompleteAccountVerification,
+                coordinator.CancelAccountVerification, coordinator.ReportServiceFailure, ExitThread);
             details.FormClosed += delegate { details = null; MemoryTrimmer.TrimIdleWorkingSet(); };
         }
         details.UpdateSnapshot(coordinator.Latest);
@@ -71,24 +72,27 @@ public sealed class TrayHost : ApplicationContext
 
     private void ShowAccountVerification()
     {
-        MonitorSnapshot snapshot = coordinator.Latest;
-        if (snapshot == null || String.IsNullOrWhiteSpace(snapshot.ActualNode) ||
-            String.IsNullOrWhiteSpace(snapshot.ExitFingerprint))
+        AccountVerificationSession session = coordinator.BeginAccountVerification();
+        if (session == null || String.IsNullOrWhiteSpace(session.Node) ||
+            String.IsNullOrWhiteSpace(session.ExitFingerprint))
         {
+            coordinator.CancelAccountVerification(session);
             tray.ShowBalloonTip(4000, "节点守护", "请先完成一次当前节点检测，以确认实际出口。", ToolTipIcon.Info);
             coordinator.RequestCheck();
             return;
         }
-        using (var form = new AccountVerificationForm(snapshot.ActualNode))
+        try
         {
-            if (form.ShowDialog() != DialogResult.OK) return;
-            var services = AccountVerificationForm.Services(form.VerifiedSelection).ToList();
-            if (services.Count > 0)
-                coordinator.RequestAccountVerification(snapshot.ActualNode, snapshot.ExitFingerprint,
-                    services, DateTime.UtcNow);
-            if (form.FailedService.HasValue)
-                coordinator.ReportServiceFailure(snapshot.ActualNode, form.FailedService.Value, DateTime.UtcNow);
+            using (var form = new AccountVerificationForm(session.Node))
+            {
+                if (form.ShowDialog() != DialogResult.OK) return;
+                coordinator.CompleteAccountVerification(session,
+                    AccountVerificationForm.Services(form.VerifiedSelection).ToList(),
+                    form.FailedService, DateTime.UtcNow);
+                session = null;
+            }
         }
+        finally { if (session != null) coordinator.CancelAccountVerification(session); }
     }
 
     private void ReportCurrentFailure(ServiceKind service)

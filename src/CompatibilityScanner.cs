@@ -141,6 +141,7 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             using (var request = new HttpRequestMessage(HttpMethod.Get, endpoint))
             using (HttpResponseMessage response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token).GetAwaiter().GetResult())
             {
+                long headersElapsed = timer.ElapsedMilliseconds;
                 byte[] bytes;
                 if (response.Content == null) bytes = new byte[0];
                 else using (Stream bodyStream = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
@@ -148,17 +149,23 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                 string body = System.Text.Encoding.UTF8.GetString(bytes);
                 bool challengeHeader = response.Headers.Contains("Cf-Mitigated") &&
                     String.Join(",", response.Headers.GetValues("Cf-Mitigated")).IndexOf("challenge", StringComparison.OrdinalIgnoreCase) >= 0;
+                long responseLatency = ResponseLatency(headersElapsed, timer.ElapsedMilliseconds);
                 if (applicationEndpoint)
-                    return EvaluateApplicationResponse(service, (int)response.StatusCode, body, response.Headers.Location, timer.ElapsedMilliseconds, challengeHeader);
+                    return EvaluateApplicationResponse(service, (int)response.StatusCode, body, response.Headers.Location, responseLatency, challengeHeader);
                 if (authenticationEndpoint)
-                    return EvaluateAuthenticationResponse(service, (int)response.StatusCode, body, timer.ElapsedMilliseconds, challengeHeader);
-                return EvaluateResponse(service, (int)response.StatusCode, body, response.Headers.Location, timer.ElapsedMilliseconds, challengeHeader);
+                    return EvaluateAuthenticationResponse(service, (int)response.StatusCode, body, responseLatency, challengeHeader);
+                return EvaluateResponse(service, (int)response.StatusCode, body, response.Headers.Location, responseLatency, challengeHeader);
             }
         }
         catch (TaskCanceledException) { return ProbeResult.TransientFailure("timeout", timer.ElapsedMilliseconds); }
         catch (OperationCanceledException) { return ProbeResult.TransientFailure("timeout", timer.ElapsedMilliseconds); }
         catch (HttpRequestException) { return ProbeResult.TransientFailure("network failure", timer.ElapsedMilliseconds); }
         catch (IOException) { return ProbeResult.TransientFailure("I/O failure", timer.ElapsedMilliseconds); }
+    }
+
+    public static long ResponseLatency(long headersElapsedMilliseconds, long completedElapsedMilliseconds)
+    {
+        return headersElapsedMilliseconds >= 0 ? headersElapsedMilliseconds : Math.Max(0, completedElapsedMilliseconds);
     }
 
     public static ProbeResult EvaluateResponse(ServiceKind service, int status, string body, Uri location, long elapsed, bool challengeHeader = false)

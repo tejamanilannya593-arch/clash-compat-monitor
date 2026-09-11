@@ -80,16 +80,34 @@ public sealed class ExperienceData
         int overlap = previous.Intersect(current, StringComparer.Ordinal).Count();
         int smaller = Math.Min(previous.Count, current.Count);
         bool compatibleUpdate = smaller >= 2 && overlap >= 2 && (double)overlap / smaller >= 0.60;
-        bool preserve = !String.IsNullOrEmpty(ActiveScope) && sameServices && (exact || compatibleUpdate);
+        bool legacyServiceRemoval = !sameServices && (exact || compatibleUpdate) &&
+            String.Equals(RemoveLegacyJmComic(previousServices), normalizedServices, StringComparison.Ordinal);
+        bool preserve = !String.IsNullOrEmpty(ActiveScope) && (sameServices || legacyServiceRemoval) &&
+            (exact || compatibleUpdate);
 
-        if (!preserve)
+        if (legacyServiceRemoval && preserve)
+        {
+            string oldScope = ActiveScope;
             ActiveScope = (fingerprint ?? "") + "|" + normalizedServices;
-        ScopeContinuityReason = preserve ? (exact ? "same-candidates" : "compatible-update") :
+            foreach (NodeExperience item in Nodes.Where(x => x != null && x.Scope == oldScope)) item.Scope = ActiveScope;
+            foreach (AccountVerificationRecord item in (AccountVerifications ?? new List<AccountVerificationRecord>())
+                .Where(x => x != null && x.Scope == oldScope)) item.Scope = ActiveScope;
+            if (Assurance != null && Assurance.Scope == oldScope) Assurance.Scope = ActiveScope;
+        }
+        else if (!preserve)
+            ActiveScope = (fingerprint ?? "") + "|" + normalizedServices;
+        ScopeContinuityReason = legacyServiceRemoval && preserve ? "legacy-service-migration" : preserve ? (exact ? "same-candidates" : "compatible-update") :
             (previous.Count == 0 || String.IsNullOrEmpty(previousServices) ? "initial" :
             (sameServices ? "different-subscription" : "services-changed"));
         ActiveCandidateNames = current;
         ActiveServicesKey = normalizedServices;
         return ActiveScope;
+    }
+
+    private static string RemoveLegacyJmComic(string servicesKey)
+    {
+        return String.Join(",", (servicesKey ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(x => !String.Equals(x.Trim(), "JMComicWeb", StringComparison.Ordinal)).Select(x => x.Trim()));
     }
 
     public void Observe(string scope, CandidateScanResult scan, QualitySample quality, DateTime now)

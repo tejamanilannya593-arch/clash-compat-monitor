@@ -26,6 +26,19 @@ public interface IAccountVerificationRunner : IMonitorCycleRunner
     void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc);
 }
 
+public sealed class AccountVerificationSession
+{
+    internal AccountVerificationSession(MonitorSnapshot snapshot, bool resumeWhenFinished)
+    {
+        Snapshot = snapshot;
+        ResumeWhenFinished = resumeWhenFinished;
+    }
+    internal MonitorSnapshot Snapshot { get; private set; }
+    internal bool ResumeWhenFinished { get; private set; }
+    public string Node { get { return Snapshot == null ? "" : Snapshot.ActualNode; } }
+    public string ExitFingerprint { get { return Snapshot == null ? "" : Snapshot.ExitFingerprint; } }
+}
+
 public sealed class MonitorCoordinator : IDisposable
 {
     private readonly IMonitorCycleRunner runner;
@@ -97,7 +110,10 @@ public sealed class MonitorCoordinator : IDisposable
     {
         var selected = new List<ServiceKind>(services ?? new ServiceKind[0]);
         lock (accountCommandGate)
-            accountCommands.Add(value => value.RecordAccountVerification(node, exitFingerprint, selected, verifiedUtc));
+            accountCommands.Add(value => {
+                if (!value.RecordAccountVerification(node, exitFingerprint, selected, verifiedUtc))
+                    throw new InvalidOperationException("节点、出口或登录链路已经变化，请重新验证");
+            });
         RequestCheck();
     }
 
@@ -106,6 +122,44 @@ public sealed class MonitorCoordinator : IDisposable
         lock (accountCommandGate)
             accountCommands.Add(value => value.ReportServiceFailure(node, service, reportedUtc));
         RequestCheck();
+    }
+
+    public AccountVerificationSession BeginAccountVerification()
+    {
+        bool wasPaused = Volatile.Read(ref paused) != 0;
+        SetPaused(true);
+        return new AccountVerificationSession(Latest, !wasPaused);
+    }
+
+    public void CompleteAccountVerification(AccountVerificationSession session,
+        IEnumerable<ServiceKind> verifiedServices, ServiceKind? failedService, DateTime reportedUtc)
+    {
+        if (session == null) throw new ArgumentNullException("session");
+        var selected = new List<ServiceKind>(verifiedServices ?? new ServiceKind[0]);
+        lock (accountCommandGate)
+        {
+            if (selected.Count > 0)
+                accountCommands.Add(value => {
+                    if (!value.RecordAccountVerification(session.Node, session.ExitFingerprint, selected, reportedUtc))
+                        throw new InvalidOperationException("节点、出口或登录链路已经变化，请重新验证");
+                });
+            if (failedService.HasValue)
+                accountCommands.Add(value => value.ReportServiceFailure(session.Node,
+                    failedService.Value, reportedUtc));
+        }
+        FinishAccountVerification(session);
+    }
+
+    public void CancelAccountVerification(AccountVerificationSession session)
+    {
+        if (session == null) return;
+        FinishAccountVerification(session);
+    }
+
+    private void FinishAccountVerification(AccountVerificationSession session)
+    {
+        if (session.ResumeWhenFinished) SetPaused(false);
+        else wake.Set();
     }
 
     public void SetPaused(bool value)
@@ -132,6 +186,12 @@ public sealed class MonitorCoordinator : IDisposable
         {
             if (Volatile.Read(ref paused) != 0)
             {
+                try { RunAccountCommands(); }
+                catch (Exception ex)
+                {
+                    Publish(Latest.WithState(MonitorRunState.Degraded,
+                        "账号验证记录失败：" + ex.Message, DateTime.MaxValue), true);
+                }
                 wake.WaitOne(TimeSpan.FromSeconds(30));
                 continue;
             }

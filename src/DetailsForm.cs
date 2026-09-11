@@ -10,7 +10,9 @@ public sealed class DetailsForm : Form
     private readonly Action requestCheck;
     private readonly Action<bool> setPaused;
     private readonly Action restorePrevious;
-    private readonly Action<string, string, IEnumerable<ServiceKind>, DateTime> recordAccountVerification;
+    private readonly Func<AccountVerificationSession> beginAccountVerification;
+    private readonly Action<AccountVerificationSession, IEnumerable<ServiceKind>, ServiceKind?, DateTime> completeAccountVerification;
+    private readonly Action<AccountVerificationSession> cancelAccountVerification;
     private readonly Action<string, ServiceKind, DateTime> reportServiceFailure;
     private readonly Action exitApplication;
     private readonly Panel settingsPanel = new Panel();
@@ -29,14 +31,18 @@ public sealed class DetailsForm : Form
 
     public DetailsForm(UserPreferences preferences, Action<UserPreferences> savePreferences,
         Action requestCheck, Action<bool> setPaused, Action restorePrevious,
-        Action<string, string, IEnumerable<ServiceKind>, DateTime> recordAccountVerification,
+        Func<AccountVerificationSession> beginAccountVerification,
+        Action<AccountVerificationSession, IEnumerable<ServiceKind>, ServiceKind?, DateTime> completeAccountVerification,
+        Action<AccountVerificationSession> cancelAccountVerification,
         Action<string, ServiceKind, DateTime> reportServiceFailure, Action exitApplication)
     {
         this.savePreferences = savePreferences;
         this.requestCheck = requestCheck;
         this.setPaused = setPaused;
         this.restorePrevious = restorePrevious;
-        this.recordAccountVerification = recordAccountVerification;
+        this.beginAccountVerification = beginAccountVerification;
+        this.completeAccountVerification = completeAccountVerification;
+        this.cancelAccountVerification = cancelAccountVerification;
         this.reportServiceFailure = reportServiceFailure;
         this.exitApplication = exitApplication;
 
@@ -214,16 +220,26 @@ public sealed class DetailsForm : Form
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        using (var form = new AccountVerificationForm(latestSnapshot.ActualNode))
+        AccountVerificationSession session = beginAccountVerification();
+        if (session == null || String.IsNullOrWhiteSpace(session.Node) || String.IsNullOrWhiteSpace(session.ExitFingerprint))
         {
-            if (form.ShowDialog(this) != DialogResult.OK) return;
-            var verified = AccountVerificationForm.Services(form.VerifiedSelection).ToList();
-            if (verified.Count > 0)
-                recordAccountVerification(latestSnapshot.ActualNode, latestSnapshot.ExitFingerprint,
-                    verified, DateTime.UtcNow);
-            if (form.FailedService.HasValue)
-                reportServiceFailure(latestSnapshot.ActualNode, form.FailedService.Value, DateTime.UtcNow);
+            cancelAccountVerification(session);
+            MessageBox.Show(this, "当前节点或实际出口已经变化，请重新检测后再验证。", "节点守护",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
         }
+        try
+        {
+            using (var form = new AccountVerificationForm(session.Node))
+            {
+                if (form.ShowDialog(this) != DialogResult.OK) return;
+                completeAccountVerification(session,
+                    AccountVerificationForm.Services(form.VerifiedSelection).ToList(),
+                    form.FailedService, DateTime.UtcNow);
+                session = null;
+            }
+        }
+        finally { if (session != null) cancelAccountVerification(session); }
     }
 
     private void ReportCurrentFailure(ServiceKind service)

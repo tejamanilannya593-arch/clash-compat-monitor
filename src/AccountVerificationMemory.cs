@@ -45,11 +45,17 @@ public static class AccountVerificationMemory
     public static bool IsValid(ExperienceData data, string scope, string node, string exitFingerprint,
         ServiceKind service, DateTime now, int ruleVersion)
     {
-        if (data == null || data.AccountVerifications == null || String.IsNullOrEmpty(exitFingerprint)) return false;
-        return data.AccountVerifications.Any(x => x != null && x.Passed && x.RevokedUtc == DateTime.MinValue &&
+        return FindValid(data, scope, node, exitFingerprint, service, now, ruleVersion) != null;
+    }
+
+    public static AccountVerificationRecord FindValid(ExperienceData data, string scope, string node,
+        string exitFingerprint, ServiceKind service, DateTime now, int ruleVersion)
+    {
+        if (data == null || data.AccountVerifications == null || String.IsNullOrEmpty(exitFingerprint)) return null;
+        return data.AccountVerifications.Where(x => x != null && x.Passed && x.RevokedUtc == DateTime.MinValue &&
             x.Scope == (scope ?? "") && x.Node == (node ?? "") && x.ExitFingerprint == exitFingerprint &&
             x.Service == service && x.EvidenceRuleVersion == ruleVersion && x.VerifiedUtc <= now &&
-            x.VerifiedUtc > now.Subtract(Validity));
+            x.VerifiedUtc > now.Subtract(Validity)).OrderByDescending(x => x.VerifiedUtc).FirstOrDefault();
     }
 
     public static void Revoke(ExperienceData data, string scope, string node, ServiceKind service,

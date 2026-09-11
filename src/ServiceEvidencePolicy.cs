@@ -27,4 +27,10 @@ public static class ServiceEvidencePolicy
         }
         return true;
     }
+
+    public static bool CanRestoreAfterReload(CandidateScanResult scan, ExperienceData data, string scope,
+        IEnumerable<ServiceKind> requiredServices, DateTime now)
+    {
+        return CanQualitySwitch(scan, data, scope, requiredServices, now);
+    }
 }

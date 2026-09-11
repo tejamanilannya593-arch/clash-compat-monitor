@@ -42,6 +42,7 @@ public sealed class AccountVerificationForm : Form
         actions.Controls.Add(Button("取消", delegate { DialogResult = DialogResult.Cancel; Close(); }));
         layout.Controls.Add(actions);
         Controls.Add(layout);
+        Shown += delegate { OpenOfficialPages(); };
     }
 
     public static AccountVerificationSelection SelectedServices(bool chatGpt, bool gemini)

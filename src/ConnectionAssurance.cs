@@ -17,6 +17,7 @@ public sealed class ConnectionAssurance
     public double PreviousResponse { get; set; }
     public bool QualitySwitch { get; set; }
     public bool ProvisionalSwitch { get; set; }
+    public DateTime StartedUtc { get; set; }
     public int VerificationCount { get; set; }
     public int FailedChecks { get; set; }
     public int SlowerChecks { get; set; }
@@ -29,7 +30,7 @@ public sealed class ConnectionAssurance
     public void SetScope(string scope)
     {
         if (Scope == scope) return;
-        Scope = scope; Standbys.Clear(); Target = null; Previous = null; StableCycles = 0; RefreshUtc = DateTime.MinValue;
+        Scope = scope; Standbys.Clear(); Target = null; Previous = null; StartedUtc = DateTime.MinValue; StableCycles = 0; RefreshUtc = DateTime.MinValue;
     }
     public void Remember(CandidateScanResult scan, string current, DateTime now)
     {
@@ -42,8 +43,14 @@ public sealed class ConnectionAssurance
         var names = new HashSet<string>(eligible, StringComparer.Ordinal);
         return Standbys.Where(x => names.Contains(x.Name) && x.Name != current && x.VerifiedUtc <= now && x.VerifiedUtc >= now.AddMinutes(-10)).Select(x => x.Name).ToArray();
     }
-    public void Begin(string previous, string target, double response, bool quality, bool provisional = false)
-    { Previous = previous; Target = target; PreviousResponse = response; QualitySwitch = quality; ProvisionalSwitch = provisional; VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0; }
+    public void Begin(string previous, string target, double response, bool quality, bool provisional = false,
+        DateTime? startedUtc = null)
+    { Previous = previous; Target = target; PreviousResponse = response; QualitySwitch = quality; ProvisionalSwitch = provisional; StartedUtc = startedUtc ?? DateTime.UtcNow; VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0; }
+    public bool CanUserFeedbackRollback(string current, DateTime now)
+    {
+        return !String.IsNullOrWhiteSpace(Previous) && String.Equals(Target, current, StringComparison.Ordinal) &&
+            StartedUtc != DateTime.MinValue && StartedUtc <= now && StartedUtc >= now.AddMinutes(-10);
+    }
     public bool NeedsRollback(CandidateScanResult scan)
     {
         VerificationCount++;
