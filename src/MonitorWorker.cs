@@ -115,37 +115,6 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         return true;
     }
 
-    public bool RecordAccountVerification(string node, string exitFingerprint,
-        IEnumerable<ServiceKind> services, DateTime verifiedUtc)
-    {
-        List<ServiceKind> selectedServices = (services ?? new ServiceKind[0]).Distinct()
-            .Where(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini).ToList();
-        if (String.IsNullOrWhiteSpace(node) || String.IsNullOrWhiteSpace(exitFingerprint) ||
-            !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal) ||
-            String.IsNullOrWhiteSpace(experience.ActiveScope) || selectedServices.Count == 0) return false;
-        System.Threading.Interlocked.Exchange(ref accountCommandRunning, 1);
-        Stopwatch previousTimer = cycleTimer;
-        cycleTimer = Stopwatch.StartNew();
-        try
-        {
-            CandidateScanResult fresh = scanner.ScanSelected(new CandidateNode(node, null), selectedServices);
-            if (!ServiceEvidencePolicy.CanEmergencySwitch(fresh) ||
-                !String.Equals(fresh.ExitFingerprint, exitFingerprint, StringComparison.Ordinal) ||
-                !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal)) return false;
-            foreach (ServiceKind service in selectedServices)
-                AccountVerificationMemory.Mark(experience, experience.ActiveScope, node, fresh.ExitFingerprint,
-                    service, true, verifiedUtc, AccountVerificationMemory.CurrentRuleVersion);
-            experienceStore.Save(experience, verifiedUtc);
-            logger.Write("account verification recorded node=" + SafeName(node) + " services=" + selectedServices.Count);
-            return true;
-        }
-        finally
-        {
-            cycleTimer = previousTimer;
-            System.Threading.Volatile.Write(ref accountCommandRunning, 0);
-        }
-    }
-
     public bool RecordBrowserConversationProof(string node, string exitFingerprint,
         ServiceKind service, DateTime verifiedUtc, int protocolVersion)
     {

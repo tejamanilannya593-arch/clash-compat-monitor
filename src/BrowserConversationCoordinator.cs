@@ -113,7 +113,11 @@ public sealed class BrowserConversationCoordinator
 
     public void SetConsent(bool value)
     {
-        lock (gate) consent = value;
+        lock (gate)
+        {
+            consent = value;
+            if (!value && session != null && !session.UserInitiated) session = null;
+        }
     }
 
     public void ObserveCompanion(string browser, DateTime now)
@@ -238,6 +242,15 @@ public sealed class BrowserConversationCoordinator
             completed.Add(active.TaskId);
             session = null;
             return true;
+        }
+    }
+
+    public void CancelAll()
+    {
+        lock (gate)
+        {
+            if (session != null && session.ActiveTask != null) completed.Add(session.ActiveTask.TaskId);
+            session = null;
         }
     }
 

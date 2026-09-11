@@ -22,24 +22,9 @@ public interface IProgressCycleRunner : IMonitorCycleRunner
 
 public interface IAccountVerificationRunner : IMonitorCycleRunner
 {
-    bool RecordAccountVerification(string node, string exitFingerprint,
-        IEnumerable<ServiceKind> services, DateTime verifiedUtc);
     bool RecordBrowserConversationProof(string node, string exitFingerprint,
         ServiceKind service, DateTime verifiedUtc, int protocolVersion);
     void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc);
-}
-
-public sealed class AccountVerificationSession
-{
-    internal AccountVerificationSession(MonitorSnapshot snapshot, bool resumeWhenFinished)
-    {
-        Snapshot = snapshot;
-        ResumeWhenFinished = resumeWhenFinished;
-    }
-    internal MonitorSnapshot Snapshot { get; private set; }
-    internal bool ResumeWhenFinished { get; private set; }
-    public string Node { get { return Snapshot == null ? "" : Snapshot.ActualNode; } }
-    public string ExitFingerprint { get { return Snapshot == null ? "" : Snapshot.ExitFingerprint; } }
 }
 
 public sealed class MonitorCoordinator : IDisposable
@@ -69,6 +54,8 @@ public sealed class MonitorCoordinator : IDisposable
     private readonly bool persistStatistics;
     private BrowserVerificationStatus browserStatus = BrowserVerificationStatus.None;
     private string browserStatusDetail = "";
+    private string browserName = "";
+    private string browserExtensionVersion = "";
 
     public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog,
         bool persistStatistics = false, IClock clock = null, IChallengeSource challengeSource = null,
@@ -104,6 +91,22 @@ public sealed class MonitorCoordinator : IDisposable
         get { lock (snapshotGate) return latest; }
     }
 
+    public bool IsBrowserCompanionOnline
+    {
+        get { return browserCoordinator.IsCompanionOnline(clock.UtcNow); }
+    }
+
+    public string BrowserCompanionDescription
+    {
+        get
+        {
+            lock (browserStatusGate)
+                return String.IsNullOrWhiteSpace(browserName) ? "未连接" :
+                    browserName + " 浏览器伴侣 " + browserExtensionVersion +
+                    (IsBrowserCompanionOnline ? " 已连接" : " 已离线");
+        }
+    }
+
     public void Start()
     {
         if (thread != null) return;
@@ -120,18 +123,6 @@ public sealed class MonitorCoordinator : IDisposable
     public void RequestRestorePrevious()
     {
         Interlocked.Exchange(ref restoreRequested, 1);
-        RequestCheck();
-    }
-
-    public void RequestAccountVerification(string node, string exitFingerprint,
-        IEnumerable<ServiceKind> services, DateTime verifiedUtc)
-    {
-        var selected = new List<ServiceKind>(services ?? new ServiceKind[0]);
-        lock (accountCommandGate)
-            accountCommands.Add(value => {
-                if (!value.RecordAccountVerification(node, exitFingerprint, selected, verifiedUtc))
-                    throw new InvalidOperationException("节点、出口或登录链路已经变化，请重新验证");
-            });
         RequestCheck();
     }
 
@@ -165,7 +156,13 @@ public sealed class MonitorCoordinator : IDisposable
         if (String.Equals(request.Type, "hello", StringComparison.Ordinal))
         {
             browserCoordinator.ObserveCompanion(request.Browser, now);
-            PublishBrowserStatus(BrowserVerificationStatus.Ready, request.Browser + " 浏览器扩展已连接");
+            lock (browserStatusGate)
+            {
+                browserName = request.Browser;
+                browserExtensionVersion = request.ExtensionVersion;
+            }
+            PublishBrowserStatus(BrowserVerificationStatus.Ready,
+                request.Browser + " 浏览器伴侣 " + request.ExtensionVersion + " 已连接");
             TryStartAutomaticBrowserVerification(Latest);
             return BrowserResponse("ready", request.RequestId, null);
         }
@@ -223,44 +220,6 @@ public sealed class MonitorCoordinator : IDisposable
         return BrowserResponse("ack", request.RequestId, null);
     }
 
-    public AccountVerificationSession BeginAccountVerification()
-    {
-        bool wasPaused = Volatile.Read(ref paused) != 0;
-        SetPaused(true);
-        return new AccountVerificationSession(Latest, !wasPaused);
-    }
-
-    public void CompleteAccountVerification(AccountVerificationSession session,
-        IEnumerable<ServiceKind> verifiedServices, ServiceKind? failedService, DateTime reportedUtc)
-    {
-        if (session == null) throw new ArgumentNullException("session");
-        var selected = new List<ServiceKind>(verifiedServices ?? new ServiceKind[0]);
-        lock (accountCommandGate)
-        {
-            if (selected.Count > 0)
-                accountCommands.Add(value => {
-                    if (!value.RecordAccountVerification(session.Node, session.ExitFingerprint, selected, reportedUtc))
-                        throw new InvalidOperationException("节点、出口或登录链路已经变化，请重新验证");
-                });
-            if (failedService.HasValue)
-                accountCommands.Add(value => value.ReportServiceFailure(session.Node,
-                    failedService.Value, reportedUtc));
-        }
-        FinishAccountVerification(session);
-    }
-
-    public void CancelAccountVerification(AccountVerificationSession session)
-    {
-        if (session == null) return;
-        FinishAccountVerification(session);
-    }
-
-    private void FinishAccountVerification(AccountVerificationSession session)
-    {
-        if (session.ResumeWhenFinished) SetPaused(false);
-        else wake.Set();
-    }
-
     public void SetPaused(bool value)
     {
         Interlocked.Exchange(ref paused, value ? 1 : 0);
@@ -279,6 +238,14 @@ public sealed class MonitorCoordinator : IDisposable
         RequestCheck();
     }
 
+    public void RevokeBrowserVerificationConsent()
+    {
+        browserCoordinator.SetConsent(false);
+        browserCoordinator.CancelAll();
+        PublishBrowserStatus(BrowserVerificationStatus.Cancelled, "已撤销浏览器自动实测授权");
+        browserWake.Set();
+    }
+
     private void Loop()
     {
         DateTime nextRunUtc = DateTime.UtcNow;
@@ -290,7 +257,7 @@ public sealed class MonitorCoordinator : IDisposable
                 catch (Exception ex)
                 {
                     Publish(Latest.WithState(MonitorRunState.Degraded,
-                        "账号验证记录失败：" + ex.Message, DateTime.MaxValue), true);
+                        "浏览器验证记录失败：" + ex.Message, DateTime.MaxValue), true);
                 }
                 wake.WaitOne(TimeSpan.FromSeconds(30));
                 continue;

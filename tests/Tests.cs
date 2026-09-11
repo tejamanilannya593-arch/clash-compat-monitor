@@ -52,7 +52,7 @@ internal static class Tests
         StabilityAndState();
         RuntimeGuards();
         UserPreferenceBehavior();
-        AccountVerificationUiBehavior();
+        BrowserVerificationUiBehavior();
         MonitorCoordinatorBehavior();
         BrowserCoordinatorIntegrationBehavior();
         InstanceActivationBehavior();
@@ -255,13 +255,6 @@ internal static class Tests
             new BoundedLogger(Path.Combine(workerRoot, "logs", "monitor.log"), 1024 * 1024),
             new FakeClock { UtcNow = now },
             new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
-        Equal(false, worker.RecordAccountVerification("node", "stale-exit",
-            new[] { ServiceKind.ChatGPT }, now), "worker rejects account proof after exit changed");
-        Equal(true, worker.RecordAccountVerification("node", "fresh-exit",
-            new[] { ServiceKind.ChatGPT }, now), "worker accepts proof after fresh login-chain and exit check");
-        Equal(true, AccountVerificationMemory.IsValid(workerStore.Load(), "scope", "node", "fresh-exit",
-            ServiceKind.ChatGPT, now, AccountVerificationMemory.CurrentRuleVersion),
-            "worker persists freshly revalidated account proof");
         Equal(false, worker.RecordBrowserConversationProof("node", "stale-exit", ServiceKind.Gemini,
             now, BrowserConversationProof.CurrentProtocolVersion),
             "worker rejects browser proof after exit changed");
@@ -1416,54 +1409,24 @@ internal static class Tests
             Equal(true, SpinWait.SpinUntil(() => coordinator.Latest.State == MonitorRunState.Running, 1000), "coordinator recovers after restore exception");
         }
 
-        var accountRunner = new AccountVerificationCycleRunner();
-        using (var coordinator = new MonitorCoordinator(accountRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
-        {
-            coordinator.Start();
-            Equal(true, accountRunner.WaitForRunCount(1, 1000), "account runner initial cycle");
-            coordinator.RequestAccountVerification("node", "fingerprint",
-                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, new DateTime(2026, 9, 11, 0, 0, 0, DateTimeKind.Utc));
-            Equal(true, SpinWait.SpinUntil(() => accountRunner.VerificationCount == 1, 1000),
-                "account verification command reaches runner once");
-            Equal(true, accountRunner.WaitForRunCount(2, 1000), "account verification requests follow-up scan");
-            Equal("fingerprint", accountRunner.LastFingerprint, "account command preserves exit fingerprint");
-            coordinator.ReportServiceFailure("node", ServiceKind.ChatGPT,
-                new DateTime(2026, 9, 11, 0, 1, 0, DateTimeKind.Utc));
-            Equal(true, SpinWait.SpinUntil(() => accountRunner.FailureCount == 1, 1000),
-                "negative account feedback reaches runner once");
-            Equal(true, accountRunner.WaitForRunCount(3, 1000), "negative feedback requests follow-up scan");
-        }
-
-        var sessionRunner = new AccountVerificationCycleRunner();
-        using (var coordinator = new MonitorCoordinator(sessionRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
-        {
-            coordinator.Start();
-            Equal(true, sessionRunner.WaitForRunCount(1, 1000), "verification session initial cycle");
-            AccountVerificationSession session = coordinator.BeginAccountVerification();
-            Equal("session-node", session.Node, "verification session freezes current node");
-            Equal("session-fingerprint", session.ExitFingerprint, "verification session freezes current exit");
-            int before = sessionRunner.RunCount;
-            Thread.Sleep(80);
-            Equal(before, sessionRunner.RunCount, "verification session pauses automatic cycles");
-            coordinator.CompleteAccountVerification(session,
-                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, null, DateTime.UtcNow);
-            Equal(true, SpinWait.SpinUntil(() => sessionRunner.VerificationCount == 1, 1000),
-                "verification session records captured evidence once");
-            Equal("session-node", sessionRunner.LastNode, "verification result cannot drift to a newer snapshot node");
-            Equal("session-fingerprint", sessionRunner.LastFingerprint, "verification result cannot drift to a newer exit");
-        }
     }
 
-    private static void AccountVerificationUiBehavior()
+    private static void BrowserVerificationUiBehavior()
     {
-        Equal(AccountVerificationSelection.ChatGPT | AccountVerificationSelection.Gemini,
-            AccountVerificationForm.SelectedServices(true, true), "verification selects both AI services");
-        Equal(AccountVerificationSelection.ChatGPT,
-            AccountVerificationForm.SelectedServices(true, false), "verification selects ChatGPT only");
-        Equal(AccountVerificationSelection.Gemini,
-            AccountVerificationForm.SelectedServices(false, true), "verification selects Gemini only");
-        Equal(AccountVerificationSelection.None,
-            AccountVerificationForm.SelectedServices(false, false), "verification cancel selects no service");
+        Equal("自动实测当前节点", BrowserVerificationForm.ActionText(true, true),
+            "online companion action");
+        Equal("请先安装或打开浏览器伴侣", BrowserVerificationForm.ActionText(false, true),
+            "offline companion action");
+        Equal("请先完成当前节点检测", BrowserVerificationForm.ActionText(true, false),
+            "missing current evidence action");
+        Equal(false, BrowserVerificationForm.CanStart(false, true, true),
+            "persistent browser verification requires consent");
+        Equal(true, BrowserVerificationForm.CanStart(true, true, true),
+            "consented online current node can start");
+        Equal(true, BrowserVerificationForm.CanStartOnce(true, true),
+            "one-time browser verification does not persist consent");
+        Equal(false, BrowserVerificationForm.CanStartOnce(false, true),
+            "one-time browser verification still needs companion");
     }
 
     private static void BrowserCoordinatorIntegrationBehavior()
@@ -1644,50 +1607,6 @@ internal static class Tests
         }
     }
 
-    private sealed class AccountVerificationCycleRunner : IAccountVerificationRunner
-    {
-        private int runCount;
-        private int verificationCount;
-        private int failureCount;
-        public int VerificationCount { get { return Volatile.Read(ref verificationCount); } }
-        public int FailureCount { get { return Volatile.Read(ref failureCount); } }
-        public int RunCount { get { return Volatile.Read(ref runCount); } }
-        public string LastNode { get; private set; }
-        public string LastFingerprint { get; private set; }
-        public MonitorSnapshot Run(UserPreferences preferences)
-        {
-            Interlocked.Increment(ref runCount);
-            return MonitorSnapshot.CreateRunning("session-node",
-                new CandidateScanResult("session-node", CandidateHealth.Compatible, null, "ok", 100, 1,
-                    new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(100) } },
-                    "session-fingerprint", "JP"), null, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
-        }
-        public bool RecordAccountVerification(string node, string exitFingerprint,
-            IEnumerable<ServiceKind> services, DateTime verifiedUtc)
-        {
-            LastNode = node;
-            LastFingerprint = exitFingerprint;
-            Interlocked.Increment(ref verificationCount);
-            return true;
-        }
-        public bool RecordBrowserConversationProof(string node, string exitFingerprint,
-            ServiceKind service, DateTime verifiedUtc, int protocolVersion)
-        {
-            LastNode = node;
-            LastFingerprint = exitFingerprint;
-            Interlocked.Increment(ref verificationCount);
-            return true;
-        }
-        public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
-        {
-            Interlocked.Increment(ref failureCount);
-        }
-        public bool WaitForRunCount(int expected, int milliseconds)
-        {
-            return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
-        }
-    }
-
     private sealed class BrowserVerificationCycleRunner : IAccountVerificationRunner
     {
         private readonly DateTime now;
@@ -1718,9 +1637,6 @@ internal static class Tests
                     }, Node == "browser-node" ? "browser-exit" : "changed-exit", "JP"),
                 null, "完成", now, now.AddMinutes(1));
         }
-
-        public bool RecordAccountVerification(string node, string exitFingerprint,
-            IEnumerable<ServiceKind> services, DateTime verifiedUtc) { return true; }
 
         public bool RecordBrowserConversationProof(string node, string exitFingerprint,
             ServiceKind service, DateTime verifiedUtc, int protocolVersion)
