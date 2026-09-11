@@ -5,6 +5,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 internal static class Tests
 {
@@ -26,6 +27,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
+        Equal("0.1.0", MonitorIdentity.Version, "release version");
         CandidateFiltering();
         PipeHttpDecoding();
         MihomoPipeIntegration();
@@ -35,6 +37,7 @@ internal static class Tests
         StabilityAndState();
         RuntimeGuards();
         CommandLineBehavior();
+        StatusReporting();
         return failures == 0 ? 0 : 1;
     }
 
@@ -55,9 +58,10 @@ internal static class Tests
             "🇸🇬 新加坡 M2 | BHE | 3x"
         };
         var candidates = CandidateCatalog.Filter(names);
-        Equal(3, candidates.Count, "candidate count");
-        Equal("🇸🇬 新加坡 M2 | BHE | 3x", candidates[0].Name, "first candidate");
-        Equal(false, candidates.Any(x => x.Name.Contains("香港") || x.Name.Contains("澳门") || x.Name.Contains("中国大陆") || x.Name.Contains("台湾")), "automatic exclusions enforced");
+        Equal(8, candidates.Count, "region names do not filter candidates");
+        Equal("🇭🇰 香港 I1 | IEPL | 3x", candidates[0].Name, "source ordering preserved");
+        Equal(true, candidates.Any(x => x.Name.Contains("台湾")), "taiwan remains eligible");
+        Equal(true, candidates.Any(x => x.Name.Contains("香港")), "region label is not compatibility evidence");
         Equal(false, candidates.Any(x => x.Name.EndsWith("5x", StringComparison.Ordinal)), "high multiplier excluded");
     }
 
@@ -202,6 +206,14 @@ internal static class Tests
         Equal(false, probe.Calls.Contains(ServiceKind.Epic), "inactive optional skipped");
         Equal(4096, HttpServiceProbe.LimitBody(new byte[6000]).Length, "response body cap");
         Equal(4096, HttpServiceProbe.ReadLimited(new MemoryStream(new byte[6000]), 4096).Length, "stream body cap");
+        var bodyTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        bool bodyCanceled = false;
+        var bodyTimer = System.Diagnostics.Stopwatch.StartNew();
+        try { HttpServiceProbe.ReadLimitedAsync(new CancellationAwareStream(), 4096, bodyTimeout.Token).GetAwaiter().GetResult(); }
+        catch (OperationCanceledException) { bodyCanceled = true; }
+        finally { bodyTimeout.Dispose(); }
+        Equal(true, bodyCanceled, "body read obeys timeout");
+        Equal(true, bodyTimer.ElapsedMilliseconds < 1000, "body timeout is bounded");
         Equal(true, HttpServiceProbe.IsChallengeResponse("challenge-platform"), "chatgpt challenge recognized");
         Equal(false, HttpServiceProbe.IsChallengeResponse("unsupported country"), "region block is not challenge");
         Equal("node", mihomo.LastSelected, "isolated selector changed");
@@ -209,6 +221,11 @@ internal static class Tests
         probe = new FakeProbe { DefaultResult = ProbeResult.Success(125) };
         result = new CompatibilityScanner(mihomo, probe, "probe").Scan(new CandidateNode("timed", 1), new ServiceKind[0]);
         Equal(875L, result.TotalMilliseconds, "scan total elapsed");
+        Equal(7, result.ProbeCount, "mandatory probe count retained");
+        Equal(125.0, QualityMeasurement.ResponseMilliseconds(result, 5000), "response uses service average");
+        Equal(5000.0, QualityMeasurement.ResponseMilliseconds(
+            new CandidateScanResult("none", CandidateHealth.Transient, null, "none", 0, 0), 5000),
+            "empty scan uses fallback");
     }
 
     private sealed class FakeProbe : IServiceProbe
@@ -222,6 +239,26 @@ internal static class Tests
             ProbeResult result;
             return Results.TryGetValue(service, out result) ? result : DefaultResult;
         }
+    }
+
+    private sealed class CancellationAwareStream : Stream
+    {
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            var completion = new TaskCompletionSource<int>();
+            cancellationToken.Register(() => completion.TrySetCanceled());
+            return completion.Task;
+        }
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new NotSupportedException(); } }
+        public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
     }
 
     private sealed class FakeMihomo : IMihomoClient
@@ -376,5 +413,22 @@ internal static class Tests
             Equal(true, first != null, "first instance acquired");
             Equal(true, second == null, "second instance rejected");
         }
+    }
+
+    private static void StatusReporting()
+    {
+        DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
+        string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
+            "保持当前节点", "AI 登录待确认");
+        Equal(true, report.Contains("版本：0.1.0"), "status shows version");
+        Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
+        Equal(true, report.Contains("综合分：82.3"), "status shows score");
+        Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
+        Equal(false, report.Contains("secret"), "status omits credentials");
+
+        string translated = StatusReport.Format(now, "新加坡 S1", CandidateHealth.BasicCompatible, 74.8,
+            "quality difference below threshold", "AI 登录待确认");
+        Equal(true, translated.Contains("决定：质量提升不足 20%，保持当前节点"), "status translates controller decision");
+        Equal(false, translated.Contains("quality difference below threshold"), "status omits raw English decision");
     }
 }

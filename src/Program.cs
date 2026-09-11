@@ -5,6 +5,7 @@ using System.Threading;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
+    public const string Version = "0.1.0";
 }
 
 public static class Program

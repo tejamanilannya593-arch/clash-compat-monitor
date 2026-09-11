@@ -11,6 +11,7 @@ const fixture = {
     { name: '🇸🇬 新加坡 M2 | BHE | 3x' },
     { name: '🇯🇵 日本 V1 | IPv6 | 3x' },
     { name: '🇺🇸 美国 I0 | ChatGPT | 1x' },
+    { name: '🇹🇼 台湾 T1 | IPv6 | 1x' },
     { name: '🇸🇬 菲律宾 B12 | 5x' }
   ],
   'proxy-groups': [
@@ -22,7 +23,8 @@ const fixture = {
 };
 
 assert.deepStrictEqual(nodeCandidates(fixture), [
-  '🇸🇬 新加坡 M2 | BHE | 3x', '🇯🇵 日本 V1 | IPv6 | 3x', '🇺🇸 美国 I0 | ChatGPT | 1x'
+  '🇭🇰 香港 I1 | IEPL | 3x', '🇸🇬 新加坡 M2 | BHE | 3x', '🇯🇵 日本 V1 | IPv6 | 3x',
+  '🇺🇸 美国 I0 | ChatGPT | 1x', '🇹🇼 台湾 T1 | IPv6 | 1x'
 ]);
 const once = main(JSON.parse(JSON.stringify(fixture)));
 assert.strictEqual(once.ipv6, false);

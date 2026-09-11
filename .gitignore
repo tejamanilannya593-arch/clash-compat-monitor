@@ -1,6 +1,7 @@
 # Build output
 bin/
 obj/
+dist/
 
 # Local runtime and diagnostic data
 state/

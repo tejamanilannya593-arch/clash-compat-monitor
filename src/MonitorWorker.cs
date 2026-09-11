@@ -91,7 +91,7 @@ public sealed class MonitorWorker
             state.Records[currentScan.Name] = Record(currentScan);
 
             QualitySample priorCurrent = Latest(qualityHistory, current);
-            double currentResponse = currentScan.TotalMilliseconds > 0 ? currentScan.TotalMilliseconds / 7.0 : (priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
+            double currentResponse = QualityMeasurement.ResponseMilliseconds(currentScan, priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
             if (currentScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(currentScan.Name, clock.UtcNow, currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible,
                 currentResponse, Jitter(qualityHistory, currentScan.Name, currentResponse), priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
                 currentCandidate == null ? (double?)null : currentCandidate.Multiplier));
@@ -117,7 +117,7 @@ public sealed class MonitorWorker
                     if (scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
                     QualitySample previous = Latest(qualityHistory, candidate.Name);
                     int delay = delays[candidate.Name];
-                    double response = delay == Int32.MaxValue ? (scan.TotalMilliseconds > 0 ? scan.TotalMilliseconds / 7.0 : 5000) : delay;
+                    double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
                     if (scan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible,
                         MedianResponse(qualityHistory, candidate.Name, response), Jitter(qualityHistory, candidate.Name, response),
                         previous == null ? 0 : previous.ThroughputBytesPerSecond, candidate.Multiplier));
@@ -169,6 +169,10 @@ public sealed class MonitorWorker
             QualityBreakdown currentScore = null;
             var best = scores.OrderByDescending(x => x.Value.Score).FirstOrDefault();
             bool switched = false;
+            string decision = "保持当前节点";
+            double? reportedScore = null;
+            QualityBreakdown reportedCurrent;
+            if (scores.TryGetValue(current, out reportedCurrent)) reportedScore = reportedCurrent.Score;
             if (currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible || currentScan.Health == CandidateHealth.Unknown)
                 controller.Decide(true, false, current, null);
             if (currentScan.Health != CandidateHealth.Unknown && !String.IsNullOrEmpty(best.Key) && best.Key != current)
@@ -190,26 +194,31 @@ public sealed class MonitorWorker
                     shouldSwitch = failureDecision.ShouldSwitch && freshlyVerified.Contains(best.Key);
                     reason = failureDecision.Reason;
                 }
+                decision = reason;
                 if (shouldSwitch && !dryRun && String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
                 {
                     mihomo.Select(config.SharedGroup, best.Key);
                     controller.RecordSwitch();
                     switched = true;
+                    reportedScore = best.Value.Score;
+                    decision = "已切换：" + reason;
                     logger.Write("switched node=" + SafeName(best.Key) + " score=" + best.Value.Score.ToString("F1") + " reason=" + reason);
                 }
             }
             if (dryRun) logger.Write("dry-run quality evaluation completed; shared selector unchanged");
-            else if (!switched && currentScan.Health == CandidateHealth.Unknown) logger.Write("待验证，保留当前连接；" + currentScan.Detail);
+            else if (!switched && currentScan.Health == CandidateHealth.Unknown)
+            {
+                decision = "证据不足，保留当前节点";
+                logger.Write("待验证，保留当前连接；" + currentScan.Detail);
+            }
             else if (!switched && currentScan.Health != CandidateHealth.Compatible && currentScan.Health != CandidateHealth.BasicCompatible) logger.Write("current check failed " + currentScan.Health + "; awaiting safe replacement");
             if (!dryRun)
             {
                 string actual = mihomo.GetSelected(config.SharedGroup);
-                string status = actual == currentScan.Name ? currentScan.Health.ToString() : "Unknown";
+                CandidateHealth status = actual == currentScan.Name ? currentScan.Health : CandidateHealth.Unknown;
                 string detail = actual == currentScan.Name ? currentScan.Detail : "节点发生变化，等待下一轮验证";
-                string text = "检测时间（UTC）：" + clock.UtcNow.ToString("o") + Environment.NewLine +
-                    "实际节点：" + actual + Environment.NewLine + "检测状态：" + status + Environment.NewLine +
-                    "说明：" + detail + Environment.NewLine + "BasicCompatible 表示基础可用；Unknown 表示待验证。两者都不代表账号级功能已完整验证。";
-                File.WriteAllText(Path.Combine(config.RootPath, "current-status.txt"), text, new UTF8Encoding(false));
+                string text = StatusReport.Format(clock.UtcNow, actual, status, reportedScore, decision, detail);
+                StatusReport.WriteAtomic(Path.Combine(config.RootPath, "current-status.txt"), text);
             }
             store.Save(state, candidates.Select(x => x.Name));
             qualityStore.Save(qualityHistory);

@@ -1,11 +1,10 @@
 function nodeCandidates(config) {
   const flag = /^(?:\uD83C[\uDDE6-\uDDFF]){2}/;
   const rate = /\|\s*([0-5])x\s*$/;
-  const unsupported = /(中国大陆|香港|澳门)/;
   const seen = new Set();
   return (config.proxies || []).map(proxy => proxy && proxy.name).filter(name => {
     const match = typeof name === 'string' && rate.exec(name);
-    if (!match || !flag.test(name) || Number(match[1]) > 3 || unsupported.test(name) || seen.has(name)) return false;
+    if (!match || !flag.test(name) || Number(match[1]) > 3 || seen.has(name)) return false;
     seen.add(name);
     return true;
   });
