@@ -47,6 +47,9 @@ if (!$packageScript.Contains($checksumAssignment) -or
     !$packageScript.Contains('Encoding ASCII')) {
     throw 'Release package does not generate the required SHA-256 sidecar format.'
 }
+if (!$packageScript.Contains('docs\images') -or !$packageScript.Contains('service-incident-flow.png')) {
+    throw 'Release package does not include the README flow image.'
+}
 if (!$installScript.Contains("Version='0.6.0'")) { throw 'Installer status version is not v0.6.0.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }
