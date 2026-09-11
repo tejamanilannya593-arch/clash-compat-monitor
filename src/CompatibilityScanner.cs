@@ -117,9 +117,6 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
 
     public static ProbeResult EvaluateResponse(ServiceKind service, int status, string body, Uri location, long elapsed, bool challengeHeader = false)
     {
-                if (service == ServiceKind.JMComicWeb && !String.IsNullOrEmpty(body) &&
-                    body.IndexOf("Restricted Access!", StringComparison.OrdinalIgnoreCase) >= 0)
-                    return ProbeResult.RegionFailure("explicit JMComic access restriction", elapsed);
                 if (IsRegionBlocked(body)) return ProbeResult.RegionFailure("explicit unsupported-region response", elapsed);
                 switch (service)
                 {
@@ -135,11 +132,6 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                         return ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                     case ServiceKind.Discord:
                         return status == 200 && body.IndexOf("url", StringComparison.OrdinalIgnoreCase) >= 0 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("gateway unavailable", elapsed);
-                    case ServiceKind.JMComicWeb:
-                        if (status >= 200 && status < 400) return ProbeResult.Success(elapsed);
-                        if (status == 403 && (challengeHeader || IsChallengeResponse(body)))
-                            return ProbeResult.Partial("Cloudflare 验证页可达，未验证网页内容", elapsed);
-                        return ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                     default:
                         return status >= 200 && status < 400 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                 }
@@ -200,7 +192,6 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             case ServiceKind.SteamApi: return new Uri("https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/");
             case ServiceKind.Discord: return new Uri("https://discord.com/api/v10/gateway");
             case ServiceKind.Spotify: return new Uri("https://open.spotify.com/");
-            case ServiceKind.JMComicWeb: return new Uri("https://18comic.vip/");
             default: return new Uri("https://store.epicgames.com/");
         }
     }

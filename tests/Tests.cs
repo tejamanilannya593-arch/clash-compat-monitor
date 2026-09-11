@@ -126,7 +126,7 @@ internal static class Tests
     private static void ServiceIncidentBehavior()
     {
         DateTime now = new DateTime(2026, 9, 10, 0, 0, 0, DateTimeKind.Utc);
-        ServiceKind service = ServiceKind.JMComicWeb;
+        ServiceKind service = ServiceKind.Discord;
         var current = IncidentScan("current", service, ProbeFailureKind.Service);
         var sameA = IncidentScan("a", service, ProbeFailureKind.Service);
         var sameB = IncidentScan("b", service, ProbeFailureKind.Service);
@@ -420,13 +420,6 @@ internal static class Tests
         Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.ChatGPT, 403, "cf-chl", null, 1).FailureKind, "403 challenge is basic reachability");
         Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.ChatGPT, 403, "", null, 1, true).FailureKind, "challenge header is basic reachability");
         Equal(ProbeFailureKind.Region, HttpServiceProbe.EvaluateResponse(ServiceKind.ChatGPT, 403, "unsupported_country_region_territory", null, 1).FailureKind, "structured region error recognized");
-        Equal("https://18comic.vip/", HttpServiceProbe.Endpoint(ServiceKind.JMComicWeb).AbsoluteUri, "jmcomic web endpoint is fixed mirror");
-        Equal(ProbeFailureKind.None, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 200, "<html>JMComic</html>", null, 123).FailureKind, "jmcomic homepage success measured");
-        Equal(ProbeFailureKind.None, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 302, "", new Uri("https://another.example/"), 123).FailureKind, "jmcomic redirect is reachable");
-        Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 403, "Just a moment... cf-chl", null, 123).FailureKind, "jmcomic challenge is basic reachability");
-        Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 403, "", null, 123, true).FailureKind, "jmcomic challenge header is basic reachability");
-        Equal(ProbeFailureKind.Region, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 403, "Restricted Access!", null, 123).FailureKind, "jmcomic explicit restriction is region failure");
-        Equal("JMComic 网页", MonitorPresentation.ServiceLabel(ServiceKind.JMComicWeb), "jmcomic service label");
         Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.Gemini, 302, "", new Uri("https://accounts.google.com/ServiceLogin"), 1).FailureKind, "gemini login is basic reachability");
         Equal(ProbeFailureKind.Service, HttpServiceProbe.EvaluateResponse(ServiceKind.Gemini, 302, "", new Uri("https://accounts.google.com.evil.example/"), 1).FailureKind, "login host exact match");
         Equal("https://chatgpt.com/", HttpServiceProbe.Endpoint(ServiceKind.ChatGPT).AbsoluteUri, "application endpoint not trace");
@@ -788,6 +781,7 @@ internal static class Tests
 
     private static void UserPreferenceBehavior()
     {
+        Equal(false, Enum.GetNames(typeof(ServiceKind)).Contains("JMComicWeb"), "jmcomic service removed");
         string root = Path.Combine(Path.GetTempPath(), "monitor-prefs-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(root, "preferences.state");
         var store = new UserPreferenceStore(path);
@@ -797,17 +791,28 @@ internal static class Tests
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
-        Equal(false, defaults.RequiredServices.Contains(ServiceKind.JMComicWeb), "jmcomic is opt-in");
         defaults.FirstRunComplete = true;
-        defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub, ServiceKind.JMComicWeb };
+        defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub };
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
-        Equal(3, loaded.RequiredServices.Count, "service selection persisted");
-        Equal(true, loaded.RequiredServices.Contains(ServiceKind.JMComicWeb), "jmcomic selection persisted");
+        Equal(2, loaded.RequiredServices.Count, "service selection persisted");
         File.WriteAllText(path, "broken", Encoding.UTF8);
         Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
+
+        string migrationRoot = Path.Combine(Path.GetTempPath(), "monitor-prefs-migration-" + Guid.NewGuid().ToString("N"));
+        string migrationPath = Path.Combine(migrationRoot, "preferences.state");
+        Directory.CreateDirectory(migrationRoot);
+        File.WriteAllText(migrationPath,
+            "version=1\r\nfirstRun=True\r\nautomatic=True\r\nservices=ChatGPT,JMComicWeb,GitHub\r\n", Encoding.UTF8);
+        var migrationStore = new UserPreferenceStore(migrationPath);
+        UserPreferences migrated = migrationStore.Load();
+        Equal("ChatGPT,GitHub", String.Join(",", migrated.RequiredServices), "legacy jmcomic preference ignored");
+        Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
+            "legacy jmcomic preference is migration not corruption");
+        migrationStore.Save(migrated);
+        Equal(false, File.ReadAllText(migrationPath).Contains("JMComic"), "saving removes legacy jmcomic value");
     }
 
     private static void MonitorCoordinatorBehavior()

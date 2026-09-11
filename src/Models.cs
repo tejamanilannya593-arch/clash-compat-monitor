@@ -24,8 +24,7 @@ public enum ServiceKind
     SteamApi,
     Discord,
     Spotify,
-    Epic,
-    JMComicWeb
+    Epic
 }
 
 public enum ProbeFailureKind { None, Region, Service, Transient, Unverified, Partial }

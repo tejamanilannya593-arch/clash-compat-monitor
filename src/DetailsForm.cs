@@ -76,8 +76,6 @@ public sealed class DetailsForm : Form
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);
-        AddChoice(layout, "JMComic 网页", new[] { ServiceKind.JMComicWeb }, preferences);
-
         var save = new Button { Text = "保存并开始自动优化", AutoSize = true, Height = 38,
             Padding = new Padding(14, 4, 14, 4), BackColor = Color.FromArgb(45, 120, 240), ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 16, 0, 0) };

@@ -156,7 +156,6 @@ public sealed class MonitorPresentation
             case ServiceKind.SteamApi: return "Steam API";
             case ServiceKind.Discord: return "Discord";
             case ServiceKind.Spotify: return "Spotify";
-            case ServiceKind.JMComicWeb: return "JMComic 网页";
             default: return "Epic";
         }
     }
