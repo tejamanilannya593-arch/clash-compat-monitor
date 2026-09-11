@@ -5,7 +5,8 @@ $required = @(
     'SECURITY.md', 'CODE_OF_CONDUCT.md',
     'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1',
     '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
-    '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml'
+    '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml',
+    'assets\social-preview.png', 'docs\images\service-incident-flow.png'
 )
 foreach ($relative in $required) {
     $path = Join-Path $root $relative
@@ -22,6 +23,21 @@ $security = if (Test-Path -LiteralPath (Join-Path $root 'SECURITY.md')) { Get-Co
 $conduct = if (Test-Path -LiteralPath (Join-Path $root 'CODE_OF_CONDUCT.md')) { Get-Content -LiteralPath (Join-Path $root 'CODE_OF_CONDUCT.md') -Raw -Encoding UTF8 } else { '' }
 $manifestPath = Join-Path $root 'assets\ClashCompatibilityMonitor.manifest'
 $iconPath = Join-Path $root 'assets\ClashCompatibilityMonitor.ico'
+$socialPreviewPath = Join-Path $root 'assets\social-preview.png'
+$flowImagePath = Join-Path $root 'docs\images\service-incident-flow.png'
+Add-Type -AssemblyName System.Drawing
+if ((Get-Item -LiteralPath $socialPreviewPath).Length -ge 1MB) {
+    throw 'Social preview must be smaller than 1 MiB.'
+}
+$socialPreview = [System.Drawing.Image]::FromFile($socialPreviewPath)
+try {
+    if ($socialPreview.Width -ne 1280 -or $socialPreview.Height -ne 640) {
+        throw 'Social preview dimensions must be exactly 1280x640.'
+    }
+} finally { $socialPreview.Dispose() }
+if (!$readme.Contains('docs/images/service-incident-flow.png')) {
+    throw 'README does not link the service incident flow image.'
+}
 if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.0')) { throw 'Release package version is not v0.6.0.' }
 if (!$installScript.Contains("Version='0.6.0'")) { throw 'Installer status version is not v0.6.0.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
