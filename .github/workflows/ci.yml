@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run C# tests
+        shell: powershell
+        run: .\build.ps1
+      - name: Test Clash enhancement
+        shell: powershell
+        run: node .\clash\enhancement.test.js
+      - name: Check release inputs
+        shell: powershell
+        run: .\tests\Release.Tests.ps1

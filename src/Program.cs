@@ -1,11 +1,12 @@
 using System;
 using System.IO;
 using System.Threading;
+using System.Windows.Forms;
 
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.1.0";
+    public const string Version = "0.6.0";
 }
 
 public static class Program
@@ -18,31 +19,51 @@ public static class Program
         var logger = new BoundedLogger(config.LogPath, 1024 * 1024);
         try
         {
-            var client = MihomoPipeClient.FromConfig(config.ClashConfigPath);
             if (options.SelfTest)
             {
+                var client = MihomoPipeClient.FromConfig(config.ClashConfigPath);
                 if (!File.Exists(config.ClashConfigPath) || !client.IsAvailable()) throw new InvalidOperationException("Mihomo configuration or pipe is unavailable.");
                 logger.Write("self-test passed");
                 Environment.ExitCode = 0;
                 return;
             }
-            using (var lease = SingleInstanceLease.TryAcquire(@"Local\ClashCompatibilityMonitor"))
+
+            if (options.Once)
             {
-                if (lease == null) { Environment.ExitCode = 2; return; }
-                DateTime startupDeadline = DateTime.UtcNow.AddSeconds(90);
-                while (!client.IsAvailable() && DateTime.UtcNow < startupDeadline) Thread.Sleep(2000);
-                if (!client.IsAvailable()) throw new InvalidOperationException("Mihomo pipe did not become available during startup.");
-                if (client.IsRuntimeIpv6Enabled() && !client.EnsureIpv4Compatibility(config.ClashConfigPath))
-                    throw new InvalidOperationException("Mihomo rejected the in-memory IPv4 compatibility configuration.");
+                var headlessClient = MihomoPipeClient.FromConfig(config.ClashConfigPath);
+                using (var lease = SingleInstanceLease.TryAcquire(@"Local\ClashCompatibilityMonitor"))
+                {
+                    if (lease == null) { Environment.ExitCode = 2; return; }
+                    if (!headlessClient.IsAvailable()) throw new InvalidOperationException("Mihomo pipe is unavailable.");
+                    using (var probe = new HttpServiceProbe(config.ProbeProxy))
+                    {
+                        var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock());
+                        worker.RunOnce(options.DryRun, new UserPreferenceStore(config.PreferencesPath).Load());
+                    }
+                }
+                return;
+            }
+
+            using (var activation = InstanceActivation.TryOwn(@"Local\ClashCompatibilityMonitor"))
+            {
+                if (!activation.IsOwner) { Environment.ExitCode = 0; return; }
+                var client = MihomoPipeClient.FromConfig(config.ClashConfigPath);
+                var preferenceStore = new UserPreferenceStore(config.PreferencesPath);
+                UserPreferences preferences = preferenceStore.Load();
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
                 using (var probe = new HttpServiceProbe(config.ProbeProxy))
                 {
                     var worker = new MonitorWorker(config, client, probe, logger, new SystemClock());
-                    if (options.Once) worker.RunOnce(options.DryRun);
-                    else while (true)
+                    using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
+                    using (var tray = new TrayHost(coordinator, preferenceStore, preferences))
                     {
-                        try { worker.RunOnce(false); }
-                        catch (Exception cycleError) { logger.Write("cycle-error " + cycleError.GetType().Name + ": " + cycleError.Message); }
-                        Thread.Sleep(config.CycleInterval);
+                        activation.Activated += tray.ShowDetailsFromAnyThread;
+                        activation.StartListening();
+                        coordinator.UpdatePreferences(preferences);
+                        coordinator.Start();
+                        tray.ShowInitialIfNeeded();
+                        Application.Run(tray);
                     }
                 }
             }
@@ -98,11 +119,14 @@ public sealed class MonitorConfiguration
     public string RootPath;
     public string StatePath;
     public string QualityStatePath;
+    public string PreferencesPath;
     public string LogPath;
     public string ClashConfigPath;
     public string DelayProbeUrl = "https://www.gstatic.com/generate_204";
     public string ThroughputProbeUrl = "https://speed.cloudflare.com/__down?bytes=1048576";
     public TimeSpan QualityRefreshInterval = TimeSpan.FromHours(6);
+    public TimeSpan ReloadRecoveryFreshness = TimeSpan.FromMinutes(30);
+    public TimeSpan CycleWatchdog = TimeSpan.FromMinutes(8);
     public static MonitorConfiguration CreateDefault()
     {
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -112,6 +136,7 @@ public sealed class MonitorConfiguration
             RootPath = root,
             StatePath = Path.Combine(root, "state", "health.state"),
             QualityStatePath = Path.Combine(root, "state", "quality.state"),
+            PreferencesPath = Path.Combine(root, "state", "preferences.state"),
             LogPath = Path.Combine(root, "logs", "monitor.log"),
             ClashConfigPath = Path.Combine(roaming, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml")
         };

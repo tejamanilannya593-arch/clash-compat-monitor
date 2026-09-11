@@ -1,18 +1,21 @@
 const assert = require('assert');
-const { main, nodeCandidates } = require('./enhancement');
+const { main, nodeCandidates, providerNames } = require('./enhancement');
 
 const fixture = {
   ipv6: true,
   dns: { ipv6: true, 'enhanced-mode': 'fake-ip' },
   proxies: [
-    { name: 'DIRECT' },
+    { name: 'DIRECT', type: 'direct' },
     { name: '消息: 17条未读，在APP查看' },
-    { name: '🇭🇰 香港 I1 | IEPL | 3x' },
-    { name: '🇸🇬 新加坡 M2 | BHE | 3x' },
-    { name: '🇯🇵 日本 V1 | IPv6 | 3x' },
-    { name: '🇺🇸 美国 I0 | ChatGPT | 1x' },
-    { name: '🇹🇼 台湾 T1 | IPv6 | 1x' },
-    { name: '🇸🇬 菲律宾 B12 | 5x' }
+    { name: 'Tokyo-A', type: 'ss', server: 'one.example', port: 443 },
+    { name: '普通节点 无倍率', type: 'vless', server: 'two.example', port: 443 },
+    { name: '🇭🇰 香港 I1 | IEPL | 3x', type: 'trojan', server: 'three.example', port: 443 },
+    { name: '🇯🇵 日本 V1 | IPv6 | 3x', type: 'hysteria2', server: 'four.example', port: 443 },
+    { name: '🇺🇸 美国 I0 | ChatGPT | 1x', type: 'vmess', server: 'five.example', port: 443 },
+    { name: '🇹🇼 台湾 T1 | IPv6 | 1x', type: 'tuic', server: 'six.example', port: 443 },
+    { name: '高倍率仍需实测 | 5x', type: 'ss', server: 'seven.example', port: 443 },
+    { name: 'Tokyo-A', type: 'ss', server: 'duplicate.example', port: 443 },
+    { name: '不是叶节点', type: 'select' }
   ],
   'proxy-groups': [
     { name: '🔍 Google', type: 'url-test', now: '🇯🇵 日本 V1 | IPv6 | 3x', proxies: ['🇯🇵 日本 V1 | IPv6 | 3x'] },
@@ -23,8 +26,8 @@ const fixture = {
 };
 
 assert.deepStrictEqual(nodeCandidates(fixture), [
-  '🇭🇰 香港 I1 | IEPL | 3x', '🇸🇬 新加坡 M2 | BHE | 3x', '🇯🇵 日本 V1 | IPv6 | 3x',
-  '🇺🇸 美国 I0 | ChatGPT | 1x', '🇹🇼 台湾 T1 | IPv6 | 1x'
+  'Tokyo-A', '普通节点 无倍率', '🇭🇰 香港 I1 | IEPL | 3x', '🇯🇵 日本 V1 | IPv6 | 3x',
+  '🇺🇸 美国 I0 | ChatGPT | 1x', '🇹🇼 台湾 T1 | IPv6 | 1x', '高倍率仍需实测 | 5x'
 ]);
 const once = main(JSON.parse(JSON.stringify(fixture)));
 assert.strictEqual(once.ipv6, false);
@@ -45,7 +48,37 @@ assert(once.rules.indexOf('DOMAIN-SUFFIX,steamcontent.com,DIRECT') < once.rules.
 assert(once.rules.includes('DOMAIN,gemini.google.com,🌐 统一稳定节点'));
 assert(once.rules.includes('DOMAIN-SUFFIX,chatgpt.com,🌐 统一稳定节点'));
 assert(once.rules.includes('DOMAIN-SUFFIX,github.com,🌐 统一稳定节点'));
+assert(once.rules.includes('DOMAIN-SUFFIX,18comic.vip,🌐 统一稳定节点'));
 assert(once.rules.includes('DOMAIN,stun.chat.bilibili.com,DIRECT'));
 const twice = main(JSON.parse(JSON.stringify(once)));
 assert.deepStrictEqual(twice, once);
+
+const providerOnly = {
+  ipv6: true,
+  dns: { ipv6: true },
+  'proxy-providers': {
+    airportA: { type: 'http', url: 'https://provider.invalid/a' },
+    localNodes: { type: 'file', path: './nodes.yaml' },
+    broken: null
+  },
+  rules: []
+};
+assert.deepStrictEqual(providerNames(providerOnly), ['airportA', 'localNodes']);
+const providerResult = main(JSON.parse(JSON.stringify(providerOnly)));
+const providerShared = providerResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点');
+const providerProbe = providerResult['proxy-groups'].find(x => x.name === '🧪 兼容性探测');
+assert.deepStrictEqual(providerShared.use, ['airportA', 'localNodes']);
+assert.deepStrictEqual(providerProbe.use, ['airportA', 'localNodes']);
+assert.strictEqual(Object.prototype.hasOwnProperty.call(providerShared, 'proxies'), false);
+
+const mixed = JSON.parse(JSON.stringify(fixture));
+mixed['proxy-providers'] = { airportA: { type: 'http', url: 'https://provider.invalid/a' } };
+const mixedResult = main(mixed);
+assert.deepStrictEqual(mixedResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').use, ['airportA']);
+assert(mixedResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').proxies.includes('Tokyo-A'));
+
+const single = { ipv6: true, dns: { ipv6: true }, proxies: [{ name: 'only-node', type: 'ss', server: 'one.invalid', port: 443 }], rules: [] };
+const singleResult = main(single);
+assert.deepStrictEqual(singleResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').proxies, ['only-node']);
+assert.deepStrictEqual(main(JSON.parse(JSON.stringify(providerResult))), providerResult);
 console.log('PASS enhancement filtering, routing, listener, and idempotency');

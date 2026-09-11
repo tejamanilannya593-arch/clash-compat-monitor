@@ -27,10 +27,21 @@ public sealed class HealthState
     public HealthState(string subscriptionFingerprint)
     {
         SubscriptionFingerprint = subscriptionFingerprint ?? "";
+        PreferredNode = "";
+        PreferredNodeVerifiedUtc = DateTime.MinValue;
         Records = new Dictionary<string, NodeHealthRecord>(StringComparer.Ordinal);
     }
     public string SubscriptionFingerprint { get; private set; }
+    public string PreferredNode { get; internal set; }
+    public DateTime PreferredNodeVerifiedUtc { get; internal set; }
     public Dictionary<string, NodeHealthRecord> Records { get; private set; }
+
+    public void RememberPreferred(string name, CandidateHealth health, DateTime verifiedUtc)
+    {
+        if (health != CandidateHealth.Compatible && health != CandidateHealth.BasicCompatible) return;
+        PreferredNode = name ?? "";
+        PreferredNodeVerifiedUtc = verifiedUtc.ToUniversalTime();
+    }
 
     public void ApplySubscriptionFingerprint(string fingerprint)
     {
@@ -58,6 +69,12 @@ public sealed class StateStore
             {
                 if (string.IsNullOrWhiteSpace(lines[i])) continue;
                 string[] fields = lines[i].Split('\t');
+                if (fields.Length == 3 && fields[0] == "P")
+                {
+                    state.PreferredNode = Encoding.UTF8.GetString(Convert.FromBase64String(fields[1]));
+                    state.PreferredNodeVerifiedUtc = new DateTime(long.Parse(fields[2], CultureInfo.InvariantCulture), DateTimeKind.Utc);
+                    continue;
+                }
                 if (fields.Length != 6 || fields[0] != "N") throw new InvalidDataException();
                 string name = Encoding.UTF8.GetString(Convert.FromBase64String(fields[1]));
                 CandidateHealth health = (CandidateHealth)Enum.Parse(typeof(CandidateHealth), fields[2], false);
@@ -85,6 +102,9 @@ public sealed class StateStore
         using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
         {
             writer.WriteLine("CCM1\t" + state.SubscriptionFingerprint);
+            if (!String.IsNullOrEmpty(state.PreferredNode) && allowed.Contains(state.PreferredNode) && state.PreferredNodeVerifiedUtc != DateTime.MinValue)
+                writer.WriteLine("P\t" + Convert.ToBase64String(Encoding.UTF8.GetBytes(state.PreferredNode)) + "\t" +
+                    state.PreferredNodeVerifiedUtc.Ticks.ToString(CultureInfo.InvariantCulture));
             foreach (NodeHealthRecord record in state.Records.Values.Where(x => allowed.Contains(x.Name)))
             {
                 string line = "N\t" + Convert.ToBase64String(Encoding.UTF8.GetBytes(record.Name)) + "\t" + record.Health + "\t" +

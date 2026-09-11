@@ -1,0 +1,66 @@
+name: 兼容性反馈
+description: 报告不同 Clash/Mihomo 客户端或订阅结构的兼容情况
+title: "[Compatibility] "
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿上传订阅链接、节点名称清单、Clash 配置、控制器密钥、完整日志或 experience.json。
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: 客户端与版本
+      placeholder: Clash Verge Rev 2.x / 其他 Mihomo 客户端
+    validations:
+      required: true
+  - type: input
+    id: monitor
+    attributes:
+      label: Monitor 版本
+      placeholder: 0.6.0
+    validations:
+      required: true
+  - type: dropdown
+    id: subscription
+    attributes:
+      label: 订阅结构
+      options:
+        - 顶层 proxies
+        - proxy-providers
+        - 两者混合
+        - 不确定
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: 结果
+      options:
+        - 正常工作
+        - 无法生成代理组
+        - 无法识别节点
+        - 检测或切换异常
+        - 安装或升级异常
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: 复现过程与脱敏结果
+      description: 描述操作步骤；可附 Diagnose.cmd 的脱敏输出。
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已移除订阅链接、节点名称、密钥、完整配置和完整日志
+          required: true

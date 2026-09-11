@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
 
 public interface IServiceProbe
 {
@@ -21,6 +22,7 @@ public sealed class CompatibilityScanner
     private readonly IMihomoClient mihomo;
     private readonly IServiceProbe probe;
     private readonly string probeGroup;
+    public Func<bool> ShouldStop { get; set; }
 
     public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup)
     {
@@ -31,42 +33,45 @@ public sealed class CompatibilityScanner
 
     public CandidateScanResult Scan(CandidateNode candidate, IEnumerable<ServiceKind> optionalServices)
     {
+        return ScanSelected(candidate, Mandatory.Concat(optionalServices ?? new ServiceKind[0]));
+    }
+
+    public CandidateScanResult ScanSelected(CandidateNode candidate, IEnumerable<ServiceKind> requiredServices)
+    {
+        if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
         long totalMilliseconds = 0;
         int probeCount = 0;
         var pending = new List<string>();
         var partial = new List<string>();
+        var measurements = new Dictionary<ServiceKind, ProbeResult>();
         mihomo.Select(probeGroup, candidate.Name);
-        foreach (ServiceKind service in Mandatory)
+        foreach (ServiceKind service in (requiredServices ?? new ServiceKind[0]).Distinct())
         {
+            if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
+            measurements[service] = result;
             probeCount++;
             totalMilliseconds += result.ElapsedMilliseconds;
             if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-            else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount);
-        }
-        if (optionalServices != null)
-        {
-            foreach (ServiceKind service in optionalServices)
+            else if (!result.Passed)
             {
-                ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
-                probeCount++;
-                totalMilliseconds += result.ElapsedMilliseconds;
-                if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
-                else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-                else if (!result.Passed) return Failure(candidate.Name, service, result, totalMilliseconds, probeCount);
+                foreach (ServiceKind untested in (requiredServices ?? new ServiceKind[0]).Distinct())
+                    if (!measurements.ContainsKey(untested)) measurements[untested] = ProbeResult.Unverified("前序服务检测失败，本轮尚未检测");
+                return Failure(candidate.Name, service, result, totalMilliseconds, probeCount, measurements);
             }
         }
-        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount);
-        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount);
-        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount);
+        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements);
+        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements);
+        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements);
     }
 
-    private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result, long totalMilliseconds, int probeCount)
+    private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result,
+        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements)
     {
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
-        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount);
+        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements);
     }
 }
 
@@ -112,6 +117,9 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
 
     public static ProbeResult EvaluateResponse(ServiceKind service, int status, string body, Uri location, long elapsed, bool challengeHeader = false)
     {
+                if (service == ServiceKind.JMComicWeb && !String.IsNullOrEmpty(body) &&
+                    body.IndexOf("Restricted Access!", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return ProbeResult.RegionFailure("explicit JMComic access restriction", elapsed);
                 if (IsRegionBlocked(body)) return ProbeResult.RegionFailure("explicit unsupported-region response", elapsed);
                 switch (service)
                 {
@@ -127,6 +135,11 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                         return ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                     case ServiceKind.Discord:
                         return status == 200 && body.IndexOf("url", StringComparison.OrdinalIgnoreCase) >= 0 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("gateway unavailable", elapsed);
+                    case ServiceKind.JMComicWeb:
+                        if (status >= 200 && status < 400) return ProbeResult.Success(elapsed);
+                        if (status == 403 && (challengeHeader || IsChallengeResponse(body)))
+                            return ProbeResult.Partial("Cloudflare 验证页可达，未验证网页内容", elapsed);
+                        return ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                     default:
                         return status >= 200 && status < 400 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                 }
@@ -167,6 +180,7 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                 int count = (int)Math.Min(buffer.Length, maximumBytes - output.Length);
                 int read = await stream.ReadAsync(buffer, 0, count, cancellationToken).ConfigureAwait(false);
                 if (read <= 0) break;
+                RunStatistics.AddBodyBytes(read);
                 output.Write(buffer, 0, read);
             }
             return output.ToArray();
@@ -186,6 +200,7 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             case ServiceKind.SteamApi: return new Uri("https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/");
             case ServiceKind.Discord: return new Uri("https://discord.com/api/v10/gateway");
             case ServiceKind.Spotify: return new Uri("https://open.spotify.com/");
+            case ServiceKind.JMComicWeb: return new Uri("https://18comic.vip/");
             default: return new Uri("https://store.epicgames.com/");
         }
     }

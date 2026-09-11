@@ -43,17 +43,28 @@ public sealed class FailoverController
         if (!totalDisconnect && clock.UtcNow - lastSwitchUtc < minimumHold) return new FailoverDecision(false, null, "minimum hold");
         if (!totalDisconnect && consecutiveFailures < 2) return new FailoverDecision(false, null, "awaiting confirmation");
         NodeHealthRecord target = (records ?? Enumerable.Empty<NodeHealthRecord>())
-            .Where(x => x.Name != current && x.Health == CandidateHealth.Compatible && x.CooldownUntilUtc <= clock.UtcNow)
+            .Where(x => x.Name != current &&
+                (x.Health == CandidateHealth.Compatible || x.Health == CandidateHealth.BasicCompatible) &&
+                x.CooldownUntilUtc <= clock.UtcNow)
             .OrderByDescending(x => x.CheckedUtc).FirstOrDefault();
         return target == null ? new FailoverDecision(false, null, "no compatible candidate") : new FailoverDecision(true, target.Name, totalDisconnect ? "total disconnect" : "confirmed failure");
     }
 
-    public FailoverDecision DecideQuality(double currentScore, double targetScore, bool currentDisconnected, bool targetFreshlyVerified)
+    public FailoverDecision DecideQuality(double currentScore, double targetScore, bool currentDisconnected, bool targetFreshlyVerified,
+        bool targetProvenStable, IEnumerable<double> currentResponses, IEnumerable<double> targetResponses,
+        CandidateScanResult targetScan)
     {
         if (!targetFreshlyVerified) return new FailoverDecision(false, null, "target requires fresh verification");
-        if (!currentDisconnected && clock.UtcNow - lastSwitchUtc < minimumHold)
-            return new FailoverDecision(false, null, "minimum hold");
         if (currentDisconnected) return new FailoverDecision(true, null, "current disconnected");
+        if (!QualityPolicy.CurrentNeedsOptimization(currentResponses))
+            return new FailoverDecision(false, null, "current response not persistently slow");
+        if (!targetProvenStable) return new FailoverDecision(false, null, "target requires proven stability");
+        if (!QualityPolicy.CandidateLatencyIsPreferred(targetResponses))
+            return new FailoverDecision(false, null, "target response history not preferred");
+        if (!QualityPolicy.ServicesWithinLimit(targetScan))
+            return new FailoverDecision(false, null, "target service response exceeds limit");
+        if (clock.UtcNow - lastSwitchUtc < minimumHold)
+            return new FailoverDecision(false, null, "minimum hold");
         bool materiallyBetter = targetScore >= currentScore * 1.20;
         return new FailoverDecision(materiallyBetter, null, materiallyBetter ? "quality improved by at least 20 percent" : "quality difference below threshold");
     }
@@ -62,6 +73,70 @@ public sealed class FailoverController
     {
         lastSwitchUtc = clock.UtcNow;
         consecutiveFailures = 0;
+    }
+}
+
+public static class QualityPolicy
+{
+    public const double PreferredResponseMilliseconds = 500.0;
+    public const double OptimizationResponseMilliseconds = 800.0;
+    public const double MaximumServiceResponseMilliseconds = 1000.0;
+    public const double MaximumJitterMilliseconds = 150.0;
+
+    public static string LatencyBand(double milliseconds)
+    {
+        if (Double.IsNaN(milliseconds) || Double.IsInfinity(milliseconds) || milliseconds < 0) return "待测";
+        if (milliseconds <= PreferredResponseMilliseconds) return "优质";
+        if (milliseconds <= OptimizationResponseMilliseconds) return "可用";
+        if (milliseconds <= 1500.0) return "偏慢";
+        return "质量较差";
+    }
+
+    public static bool CurrentNeedsOptimization(IEnumerable<double> responses)
+    {
+        List<double> recent = Valid(responses).TakeLastCompat(3).OrderBy(x => x).ToList();
+        return recent.Count == 3 && Median(recent) > OptimizationResponseMilliseconds;
+    }
+
+    public static bool CandidateLatencyIsPreferred(IEnumerable<double> responses)
+    {
+        List<double> recent = Valid(responses).TakeLastCompat(5).OrderBy(x => x).ToList();
+        if (recent.Count < 5) return false;
+        double median = Median(recent);
+        double percentile95 = recent[(int)Math.Ceiling(recent.Count * 0.95) - 1];
+        List<double> deviations = recent.Select(x => Math.Abs(x - median)).OrderBy(x => x).ToList();
+        return median <= PreferredResponseMilliseconds && percentile95 <= OptimizationResponseMilliseconds &&
+            Median(deviations) <= MaximumJitterMilliseconds;
+    }
+
+    public static bool ServicesWithinLimit(CandidateScanResult scan)
+    {
+        return scan != null && !scan.ServiceResults.Values.Any(x => x.ElapsedMilliseconds > MaximumServiceResponseMilliseconds);
+    }
+
+    private static IEnumerable<double> Valid(IEnumerable<double> responses)
+    {
+        return (responses ?? Enumerable.Empty<double>()).Where(x => !Double.IsNaN(x) && !Double.IsInfinity(x) && x > 0);
+    }
+
+    private static double Median(IList<double> sorted)
+    {
+        return sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] :
+            (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2.0;
+    }
+}
+
+internal static class EnumerableCompatibility
+{
+    public static IEnumerable<T> TakeLastCompat<T>(this IEnumerable<T> values, int count)
+    {
+        Queue<T> queue = new Queue<T>();
+        foreach (T value in values)
+        {
+            if (queue.Count == count) queue.Dequeue();
+            queue.Enqueue(value);
+        }
+        return queue;
     }
 }
 
