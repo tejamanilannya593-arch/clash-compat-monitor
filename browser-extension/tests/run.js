@@ -1,8 +1,14 @@
 "use strict";
 
 const assert = require("assert");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { runChatGptAdapter, CHATGPT_PROFILE } = require("../chatgpt-adapter");
 const { runGeminiAdapter, GEMINI_PROFILE } = require("../gemini-adapter");
+const { BrowserVerificationWorker, NATIVE_HOST } = require("../service-worker");
+const { createChatGptContentHandler } = require("../content-chatgpt");
+const { createGeminiContentHandler } = require("../content-gemini");
 
 let failures = 0;
 
@@ -85,6 +91,81 @@ function assertSafeShape(result) {
     ["challengeMatched", "elapsedMilliseconds", "messageSent", "outcome"]);
 }
 
+class FakeChromeEvent {
+  constructor() { this.listeners = []; }
+  addListener(listener) { this.listeners.push(listener); }
+  removeListener(listener) { this.listeners = this.listeners.filter(value => value !== listener); }
+  emit(...args) { return this.listeners.map(listener => listener(...args)); }
+}
+
+function fakeChrome() {
+  const port = { posted: [], onMessage: new FakeChromeEvent(), onDisconnect: new FakeChromeEvent() };
+  port.postMessage = message => port.posted.push(message);
+  const tabs = new Map();
+  const created = [];
+  const removed = [];
+  const sent = [];
+  const timers = [];
+  let nextTabId = 10;
+  const runtimeMessages = new FakeChromeEvent();
+  const chrome = {
+    runtime: {
+      id: "micoadiomajggfdfbnhjbpkbccjoldlg",
+      onMessage: runtimeMessages,
+      connectNative(name) { chrome.connectedHost = name; return port; }
+    },
+    tabs: {
+      onUpdated: new FakeChromeEvent(),
+      onRemoved: new FakeChromeEvent(),
+      async create(properties) {
+        const tab = { id: nextTabId++, status: "loading", url: properties.url };
+        tabs.set(tab.id, tab);
+        created.push({ id: tab.id, ...properties });
+        return tab;
+      },
+      async get(id) { return tabs.get(id); },
+      async sendMessage(id, message) {
+        sent.push({ id, message });
+        if (chrome.sendMessageError) throw new Error("no content script");
+      },
+      async remove(id) { removed.push(id); tabs.delete(id); }
+    }
+  };
+  return {
+    chrome, port, created, removed, sent, runtimeMessages, timers,
+    setTimeout(callback, delay) { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout() { },
+    complete(id) {
+      const tab = tabs.get(id);
+      if (tab) tab.status = "complete";
+      chrome.tabs.onUpdated.emit(id, { status: "complete" }, tab);
+    },
+    removeByUser(id) {
+      tabs.delete(id);
+      chrome.tabs.onRemoved.emit(id, { isWindowClosing: false });
+    }
+  };
+}
+
+function nativeRun(service, suffix) {
+  return {
+    Type: "run",
+    ProtocolVersion: 1,
+    RequestId: `run-${suffix}`,
+    TaskId: `${suffix}`.padStart(32, "0"),
+    Service: service,
+    Challenge: `CCM-${suffix}`,
+    Url: service === "ChatGPT" ? "https://chatgpt.com/" : "https://gemini.google.com/app",
+    Prompt: `Reply with only CCM-${suffix}`,
+    ExpiresUtc: "2026-09-11T03:05:00.0000000Z"
+  };
+}
+
+async function flush() {
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+}
+
 (async () => {
   await test("new exact ChatGPT challenge reply passes", async () => {
     const fixture = fakePage(CHATGPT_PROFILE, { newReplies: ["  CCM-A7F2  "] });
@@ -165,6 +246,159 @@ function assertSafeShape(result) {
     const result = await runChatGptAdapter(fixture.page, task(), fastOptions());
     assert.strictEqual(result.outcome, "AutomationUnsupported");
     assert.strictEqual(result.messageSent, false);
+  });
+
+  await test("manifest has only required API and host permissions", async () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
+    assert.strictEqual(manifest.manifest_version, 3);
+    assert.deepStrictEqual(manifest.permissions, ["nativeMessaging"]);
+    assert.deepStrictEqual([...manifest.host_permissions].sort(), [
+      "https://chatgpt.com/*", "https://gemini.google.com/*"
+    ]);
+    assert.strictEqual(manifest.key.length > 300, true);
+    const digest = crypto.createHash("sha256").update(Buffer.from(manifest.key, "base64")).digest();
+    const alphabet = "abcdefghijklmnop";
+    const extensionId = [...digest.subarray(0, 16)]
+      .map(value => alphabet[value >> 4] + alphabet[value & 15]).join("");
+    assert.strictEqual(extensionId, "micoadiomajggfdfbnhjbpkbccjoldlg");
+    const serialized = JSON.stringify(manifest);
+    for (const forbidden of ["cookies", "history", "<all_urls>", "unsafe-eval", "http://"])
+      assert.strictEqual(serialized.includes(forbidden), false, forbidden);
+  });
+
+  await test("worker serializes polls and binds result to its exact tab", async () => {
+    const fake = fakeChrome();
+    const worker = new BrowserVerificationWorker(fake.chrome, {
+      browser: "Chrome", extensionVersion: "0.6.2",
+      setTimeout: fake.setTimeout, clearTimeout: fake.clearTimeout
+    });
+    worker.start();
+    assert.strictEqual(fake.chrome.connectedHost, NATIVE_HOST);
+    assert.strictEqual(fake.port.posted[0].Type, "hello");
+    fake.port.onMessage.emit({ Type: "ready", ProtocolVersion: 1, RequestId: fake.port.posted[0].RequestId });
+    const firstPollCount = fake.port.posted.filter(value => value.Type === "poll").length;
+    worker.requestPoll();
+    worker.requestPoll();
+    assert.strictEqual(fake.port.posted.filter(value => value.Type === "poll").length, firstPollCount);
+
+    const run = nativeRun("ChatGPT", "abc123");
+    run.RequestId = fake.port.posted.filter(value => value.Type === "poll").pop().RequestId;
+    fake.port.onMessage.emit(run);
+    await flush();
+    assert.deepStrictEqual(fake.created[0], { id: 10, url: "https://chatgpt.com/", active: false });
+    fake.complete(10);
+    await flush();
+    assert.strictEqual(fake.sent[0].id, 10);
+    assert.strictEqual(fake.sent[0].message.task.taskId, run.TaskId);
+
+    fake.runtimeMessages.emit({
+      type: "ccm-result", taskId: run.TaskId, service: "ChatGPT", challenge: run.Challenge,
+      result: { outcome: "Passed", messageSent: true, elapsedMilliseconds: 20, challengeMatched: true }
+    }, { id: fake.chrome.runtime.id, tab: { id: 999 } });
+    await flush();
+    assert.strictEqual(fake.port.posted.some(value => value.Type === "result"), false);
+
+    fake.runtimeMessages.emit({
+      type: "ccm-result", taskId: run.TaskId, service: "ChatGPT", challenge: run.Challenge,
+      result: { outcome: "Passed", messageSent: true, elapsedMilliseconds: 20, challengeMatched: true }
+    }, { id: fake.chrome.runtime.id, tab: { id: 10 } });
+    await flush();
+    const forwarded = fake.port.posted.find(value => value.Type === "result");
+    assert.strictEqual(forwarded.TaskId, run.TaskId);
+    assert.strictEqual(forwarded.Outcome, "Passed");
+    assert(fake.removed.includes(10));
+  });
+
+  await test("user tab closure is cancelled and every terminal tab is removed", async () => {
+    const fake = fakeChrome();
+    const worker = new BrowserVerificationWorker(fake.chrome, {
+      browser: "Edge", extensionVersion: "0.6.2",
+      setTimeout: fake.setTimeout, clearTimeout: fake.clearTimeout
+    });
+    worker.start();
+    fake.port.onMessage.emit({ Type: "ready", ProtocolVersion: 1, RequestId: fake.port.posted[0].RequestId });
+    const run = nativeRun("Gemini", "def456");
+    run.RequestId = fake.port.posted.filter(value => value.Type === "poll").pop().RequestId;
+    fake.port.onMessage.emit(run);
+    await flush();
+    fake.removeByUser(10);
+    await flush();
+    const cancellation = fake.port.posted.find(value => value.Type === "result");
+    assert.strictEqual(cancellation.Outcome, "Cancelled");
+    assert(fake.removed.includes(10));
+  });
+
+  await test("unsupported content DOM still closes the created tab", async () => {
+    const fake = fakeChrome();
+    const worker = new BrowserVerificationWorker(fake.chrome, {
+      browser: "Chrome", extensionVersion: "0.6.2",
+      setTimeout: fake.setTimeout, clearTimeout: fake.clearTimeout
+    });
+    worker.start();
+    fake.port.onMessage.emit({ Type: "ready", ProtocolVersion: 1, RequestId: fake.port.posted[0].RequestId });
+    const run = nativeRun("ChatGPT", "aaa111");
+    run.RequestId = fake.port.posted.filter(value => value.Type === "poll").pop().RequestId;
+    fake.port.onMessage.emit(run);
+    await flush();
+    fake.chrome.sendMessageError = true;
+    fake.complete(10);
+    await flush();
+    const unsupported = fake.port.posted.find(value => value.Type === "result");
+    assert.strictEqual(unsupported.Outcome, "AutomationUnsupported");
+    assert(fake.removed.includes(10));
+  });
+
+  await test("disconnect retries 5 15 then 60 seconds and never opens a stale task", async () => {
+    const fake = fakeChrome();
+    const worker = new BrowserVerificationWorker(fake.chrome, {
+      browser: "Chrome", extensionVersion: "0.6.2",
+      setTimeout: fake.setTimeout, clearTimeout: fake.clearTimeout
+    });
+    worker.start();
+    fake.port.onDisconnect.emit();
+    fake.port.onMessage.emit(nativeRun("ChatGPT", "bbb222"));
+    await flush();
+    assert.strictEqual(fake.created.length, 0);
+    assert.strictEqual(fake.timers[0].delay, 5000);
+    fake.timers[0].callback();
+    fake.port.onDisconnect.emit();
+    assert.strictEqual(fake.timers[1].delay, 15000);
+    fake.timers[1].callback();
+    fake.port.onDisconnect.emit();
+    assert.strictEqual(fake.timers[2].delay, 60000);
+    fake.timers[2].callback();
+    fake.port.onDisconnect.emit();
+    assert.strictEqual(fake.timers[3].delay, 60000);
+  });
+
+  await test("content handlers stay dormant until sender task and origin pass", async () => {
+    let chatRuns = 0;
+    let geminiRuns = 0;
+    const sent = [];
+    const runtime = { id: "extension-id", sendMessage: async message => sent.push(message) };
+    const chatHandler = createChatGptContentHandler({
+      runtime, page: {}, location: { origin: "https://chatgpt.com" },
+      adapter: async () => { chatRuns += 1; return { outcome: "Passed", messageSent: true, elapsedMilliseconds: 1, challengeMatched: true }; }
+    });
+    const chatTask = {
+      type: "ccm-run",
+      task: { taskId: "0".repeat(32), service: "ChatGPT", challenge: "CCM-A7F2", prompt: "Reply CCM-A7F2" }
+    };
+    chatHandler(chatTask, { id: "wrong-extension" });
+    chatHandler({ ...chatTask, task: { ...chatTask.task, service: "Gemini" } }, { id: runtime.id });
+    assert.strictEqual(chatRuns, 0);
+    chatHandler(chatTask, { id: runtime.id });
+    await flush();
+    assert.strictEqual(chatRuns, 1);
+    assert.strictEqual(sent[0].taskId, chatTask.task.taskId);
+
+    const geminiHandler = createGeminiContentHandler({
+      runtime, page: {}, location: { origin: "https://lookalike.invalid" },
+      adapter: async () => { geminiRuns += 1; return {}; }
+    });
+    geminiHandler({ ...chatTask, task: { ...chatTask.task, service: "Gemini" } }, { id: runtime.id });
+    await flush();
+    assert.strictEqual(geminiRuns, 0);
   });
 
   process.exitCode = failures === 0 ? 0 : 1;
