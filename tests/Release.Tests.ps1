@@ -39,6 +39,14 @@ if (!$readme.Contains('docs/images/service-incident-flow.png')) {
     throw 'README does not link the service incident flow image.'
 }
 if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.0')) { throw 'Release package version is not v0.6.0.' }
+$checksumAssignment = '$checksumFile = $zip + ''.sha256'''
+$checksumFormat = '$archiveHash + ''  '' + (Split-Path -Leaf $zip)'
+if (!$packageScript.Contains($checksumAssignment) -or
+    !$packageScript.Contains('ChecksumFile=$checksumFile') -or
+    !$packageScript.Contains($checksumFormat) -or
+    !$packageScript.Contains('Encoding ASCII')) {
+    throw 'Release package does not generate the required SHA-256 sidecar format.'
+}
 if (!$installScript.Contains("Version='0.6.0'")) { throw 'Installer status version is not v0.6.0.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }

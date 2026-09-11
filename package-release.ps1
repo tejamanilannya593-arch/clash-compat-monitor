@@ -20,4 +20,7 @@ Copy-Item -LiteralPath (Join-Path $root 'clash\enhancement.js') -Destination (Jo
 $zip = $release + '.zip'
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -LiteralPath $release -DestinationPath $zip
-[pscustomobject]@{Release=$release;Archive=$zip;Sha256=(Get-FileHash $zip).Hash} | ConvertTo-Json -Compress
+$archiveHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+$checksumFile = $zip + '.sha256'
+Set-Content -LiteralPath $checksumFile -Value ($archiveHash + '  ' + (Split-Path -Leaf $zip)) -Encoding ASCII
+[pscustomobject]@{Release=$release;Archive=$zip;ChecksumFile=$checksumFile;Sha256=$archiveHash} | ConvertTo-Json -Compress
