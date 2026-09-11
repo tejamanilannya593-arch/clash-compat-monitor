@@ -8,7 +8,7 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and run C# tests
         shell: powershell
         run: .\build.ps1
