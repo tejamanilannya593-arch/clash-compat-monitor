@@ -12,11 +12,12 @@ $resolvedRoot = [IO.Path]::GetFullPath($distRoot).TrimEnd('\') + '\'
 $resolvedRelease = [IO.Path]::GetFullPath($release)
 if (!$resolvedRelease.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe release path.' }
 if (Test-Path -LiteralPath $release) { Remove-Item -LiteralPath $release -Recurse -Force }
-New-Item -ItemType Directory -Force -Path (Join-Path $release 'scripts'),(Join-Path $release 'clash') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $release 'scripts'),(Join-Path $release 'clash'),(Join-Path $release 'docs\images') | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'bin\ClashCompatibilityMonitor.exe') -Destination $release
 Copy-Item -LiteralPath (Join-Path $root 'README.md'),(Join-Path $root 'README.en.md'),(Join-Path $root 'QUICKSTART.md'),(Join-Path $root 'LICENSE'),(Join-Path $root 'Install.cmd'),(Join-Path $root 'Diagnose.cmd') -Destination $release
 Copy-Item -LiteralPath (Join-Path $root 'scripts\install.ps1'),(Join-Path $root 'scripts\upgrade.ps1'),(Join-Path $root 'scripts\uninstall.ps1'),(Join-Path $root 'scripts\diagnose.ps1') -Destination (Join-Path $release 'scripts')
 Copy-Item -LiteralPath (Join-Path $root 'clash\enhancement.js') -Destination (Join-Path $release 'clash')
+Copy-Item -LiteralPath (Join-Path $root 'docs\images\service-incident-flow.png') -Destination (Join-Path $release 'docs\images')
 $zip = $release + '.zip'
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -LiteralPath $release -DestinationPath $zip
