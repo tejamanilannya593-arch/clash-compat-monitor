@@ -61,6 +61,7 @@ public static class StatusReport
             case "target response history not preferred": return "候选节点最近 5 次延迟未达到中位数不超过 800 ms、单次不超过 1500 ms 的标准";
             case "target service response exceeds limit": return "候选节点存在超过 1500 ms 的服务响应";
             case "current healthy": return "当前节点正常";
+            case "current usable; conservative mode holds": return "当前节点可用，保守模式不进行性能寻优";
             case "awaiting confirmation": return "等待第二次失败确认";
             case "no compatible candidate": return "没有已验证的替代节点";
             case "confirmed failure": return "当前节点连续检测失败";

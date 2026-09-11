@@ -21,9 +21,16 @@ public sealed class FailoverDecision
 
 public static class SwitchModePolicy
 {
+    public const string ConservativeHoldReason = "current usable; conservative mode holds";
+
     public static bool AllowsAutomaticSwitch(bool currentCompatible, bool performanceOptimization)
     {
         return !currentCompatible || performanceOptimization;
+    }
+
+    public static bool ShouldEvaluateQuality(bool currentCompatible, bool performanceOptimization)
+    {
+        return currentCompatible && performanceOptimization;
     }
 }
 

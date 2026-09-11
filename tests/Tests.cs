@@ -246,12 +246,14 @@ internal static class Tests
 
         string workerRoot = Path.Combine(Path.GetTempPath(), "account-worker-" + Guid.NewGuid().ToString("N"));
         var workerData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        workerData.Assurance.Begin("old-node", "node", 100, true, false, now);
         var workerStore = new ExperienceStore(Path.Combine(workerRoot, "state", "experience.json"));
         workerStore.Save(workerData, now);
         var workerConfig = new MonitorConfiguration { RootPath = workerRoot, SharedGroup = "shared", ProbeGroup = "probe" };
-        var workerMihomo = new VerificationMihomo("node", new[] { "node" });
+        var workerMihomo = new VerificationMihomo("node", new[] { "node", "old-node" });
+        var workerProbe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
         var worker = new MonitorWorker(workerConfig, workerMihomo,
-            new FakeProbe { DefaultResult = ProbeResult.Success(100) },
+            workerProbe,
             new BoundedLogger(Path.Combine(workerRoot, "logs", "monitor.log"), 1024 * 1024),
             new FakeClock { UtcNow = now },
             new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
@@ -268,6 +270,13 @@ internal static class Tests
             "node", "fresh-exit", ServiceKind.Gemini, now,
             BrowserConversationProof.CurrentProtocolVersion),
             "worker persists freshly revalidated browser conversation proof");
+        int beforeRollbackRecheck = workerProbe.Calls.Count;
+        worker.ReportBrowserConversationFailure("node", ServiceKind.Gemini,
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
+        Equal(true, workerProbe.Calls.Count > beforeRollbackRecheck,
+            "browser failure performs fresh old-node service recheck");
+        Equal("old-node", workerMihomo.GetSelected("shared"),
+            "browser failure rechecks old node before safe rollback");
     }
 
     private static void BrowserConversationCoordinatorBehavior()
@@ -558,6 +567,36 @@ internal static class Tests
         Equal(true, policy.CanUserFeedbackRollback("b", now.AddMinutes(1)), "recent active switch permits feedback rollback");
         Equal(false, policy.CanUserFeedbackRollback("manual", now.AddMinutes(1)), "manual node cannot use stale rollback origin");
         Equal(false, policy.CanUserFeedbackRollback("b", now.AddMinutes(11)), "expired switch transaction cannot use rollback origin");
+        Equal(true, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2)),
+            "sent conversation error rechecks old node");
+        Equal(true, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.GenerationTimeout, true, now.AddMinutes(2)),
+            "sent generation timeout rechecks old node");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.Passed, true, now.AddMinutes(2)),
+            "successful browser verification never rolls back");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.SignInRequired, false, now.AddMinutes(2)),
+            "sign in state is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.AutomationUnsupported, false, now.AddMinutes(2)),
+            "unsupported automation is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ChallengeRequired, false, now.AddMinutes(2)),
+            "browser challenge is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.Cancelled, false, now.AddMinutes(2)),
+            "cancelled browser verification is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ConversationError, false, now.AddMinutes(2)),
+            "unsent conversation error cannot trigger rollback");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("manual",
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2)),
+            "manual selection cannot use stale browser rollback origin");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(11)),
+            "stale switch cannot use browser rollback origin");
         policy.Begin("a", "b", 100, true);
         var slow = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 200, 1);
         Equal(false, policy.NeedsRollback(slow), "one slow response does not roll back");
@@ -1136,6 +1175,10 @@ internal static class Tests
         Equal(true, SwitchModePolicy.AllowsAutomaticSwitch(false, false), "fault failover remains enabled in conservative mode");
         Equal(false, SwitchModePolicy.AllowsAutomaticSwitch(true, false), "healthy current holds in conservative mode");
         Equal(true, SwitchModePolicy.AllowsAutomaticSwitch(true, true), "advanced mode may optimize healthy current");
+        Equal(false, SwitchModePolicy.ShouldEvaluateQuality(true, false),
+            "conservative mode skips quality comparison for usable current");
+        Equal("current usable; conservative mode holds", SwitchModePolicy.ConservativeHoldReason,
+            "conservative mode has stable decision reason");
         Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred HTTP response threshold");
         Equal("优秀", QualityPolicy.LatencyBand(500), "excellent latency band boundary");
         Equal("良好", QualityPolicy.LatencyBand(800), "good latency band boundary");
@@ -1652,6 +1695,12 @@ internal static class Tests
             Interlocked.Increment(ref failureCount);
         }
 
+        public void ReportBrowserConversationFailure(string node, ServiceKind service,
+            BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc)
+        {
+            Interlocked.Increment(ref failureCount);
+        }
+
         public bool WaitForRunCount(int expected, int milliseconds)
         {
             return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
@@ -1671,6 +1720,9 @@ internal static class Tests
         Equal(true, StatusReport.Format(now, "日本 J1", CandidateHealth.Compatible, 88,
             "保持当前节点", "ok").Contains("检测状态：登录链路及后台服务探测通过"),
             "status does not mislabel anonymous login-chain evidence as account proof");
+        Equal("当前节点可用，保守模式不进行性能寻优",
+            StatusReport.DecisionText(SwitchModePolicy.ConservativeHoldReason),
+            "status explains conservative hold reason");
 
         string translated = StatusReport.Format(now, "新加坡 S1", CandidateHealth.BasicCompatible, 74.8,
             "quality difference below threshold", "AI 登录待确认");

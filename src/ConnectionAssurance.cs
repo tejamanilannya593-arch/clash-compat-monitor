@@ -51,6 +51,14 @@ public sealed class ConnectionAssurance
         return !String.IsNullOrWhiteSpace(Previous) && String.Equals(Target, current, StringComparison.Ordinal) &&
             StartedUtc != DateTime.MinValue && StartedUtc <= now && StartedUtc >= now.AddMinutes(-10);
     }
+    public bool ShouldRecheckPreviousAfterBrowserResult(string current,
+        BrowserVerificationOutcome outcome, bool messageSent, DateTime now)
+    {
+        return messageSent &&
+            (outcome == BrowserVerificationOutcome.ConversationError ||
+             outcome == BrowserVerificationOutcome.GenerationTimeout) &&
+            CanUserFeedbackRollback(current, now);
+    }
     public bool NeedsRollback(CandidateScanResult scan)
     {
         VerificationCount++;

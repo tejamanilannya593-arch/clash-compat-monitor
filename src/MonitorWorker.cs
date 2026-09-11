@@ -185,6 +185,49 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         experienceStore.Save(experience, reportedUtc);
     }
 
+    public void ReportBrowserConversationFailure(string node, ServiceKind service,
+        BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc)
+    {
+        if (service != ServiceKind.ChatGPT && service != ServiceKind.Gemini) return;
+        AccountVerificationMemory.Revoke(experience, experience.ActiveScope, node, service,
+            reportedUtc, "browser conversation failure");
+        logger.Write("browser conversation failure node=" + SafeName(node) + " service=" + service +
+            " outcome=" + outcome + " message_sent=" + messageSent.ToString().ToLowerInvariant());
+        ConnectionAssurance assurance = experience.Assurance;
+        string current = mihomo.GetSelected(config.SharedGroup);
+        if (String.Equals(current, node, StringComparison.Ordinal) && assurance != null &&
+            assurance.ShouldRecheckPreviousAfterBrowserResult(current, outcome, messageSent, reportedUtc) &&
+            assurance.Previous != current &&
+            mihomo.GetChoices(config.SharedGroup).Contains(assurance.Previous, StringComparer.Ordinal))
+        {
+            string previous = assurance.Previous;
+            System.Threading.Interlocked.Exchange(ref accountCommandRunning, 1);
+            Stopwatch previousTimer = cycleTimer;
+            cycleTimer = Stopwatch.StartNew();
+            try
+            {
+                CandidateScanResult verified = scanner.ScanSelected(new CandidateNode(previous, null),
+                    lastPreferences.RequiredServices);
+                if (ServiceEvidencePolicy.CanEmergencySwitch(verified) &&
+                    mihomo.GetSelected(config.SharedGroup) == current)
+                {
+                    SelectRecorded(current, previous, "浏览器真实对话失败，旧节点复检通过，自动回退");
+                    previousSelectedNode = current;
+                    assurance.Target = null;
+                    assurance.HoldUntilUtc = reportedUtc.AddMinutes(30);
+                    controller.RecordSwitch();
+                    logger.Write("browser proof rollback node=" + SafeName(previous));
+                }
+            }
+            finally
+            {
+                cycleTimer = previousTimer;
+                System.Threading.Volatile.Write(ref accountCommandRunning, 0);
+            }
+        }
+        experienceStore.Save(experience, reportedUtc);
+    }
+
     public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)
     {
         if (preferences == null) throw new ArgumentNullException("preferences");
@@ -361,7 +404,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 {
                     bool rollback = assurance.NeedsRollback(currentScan);
                     assuranceDecision = "切换后观察：第 " + assurance.VerificationCount + " 次复检";
-                    if (rollback && !dryRun && preferences.AutomaticOptimization)
+                    if (rollback && !dryRun)
                     {
                         var old = candidates.FirstOrDefault(x => x.Name == assurance.Previous);
                         CandidateScanResult oldScan = old == null ? null : scanner.ScanSelected(old, servicesToProbe);
@@ -567,7 +610,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 scans.TryGetValue(best.Key, out selectedTargetScan);
                 if (currentCompatible)
                 {
-                    if (!ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan, experience, memoryScope, requiredServices, clock.UtcNow))
+                    if (!SwitchModePolicy.ShouldEvaluateQuality(currentCompatible, preferences.AutomaticOptimization))
+                    {
+                        shouldSwitch = false;
+                        reason = SwitchModePolicy.ConservativeHoldReason;
+                    }
+                    else if (!ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan, experience, memoryScope, requiredServices, clock.UtcNow))
                     {
                         shouldSwitch = false;
                         reason = "target requires account verification";
