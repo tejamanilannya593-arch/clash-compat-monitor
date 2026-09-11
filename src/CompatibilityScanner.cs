@@ -22,13 +22,21 @@ public sealed class CompatibilityScanner
     private readonly IMihomoClient mihomo;
     private readonly IServiceProbe probe;
     private readonly string probeGroup;
+    private readonly IExitIdentityProbe exitIdentityProbe;
     public Func<bool> ShouldStop { get; set; }
 
     public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup)
+        : this(mihomo, probe, probeGroup, null)
+    {
+    }
+
+    public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup,
+        IExitIdentityProbe exitIdentityProbe)
     {
         this.mihomo = mihomo;
         this.probe = probe;
         this.probeGroup = probeGroup;
+        this.exitIdentityProbe = exitIdentityProbe;
     }
 
     public CandidateScanResult Scan(CandidateNode candidate, IEnumerable<ServiceKind> optionalServices)
@@ -41,14 +49,25 @@ public sealed class CompatibilityScanner
         if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
         long totalMilliseconds = 0;
         int probeCount = 0;
+        List<ServiceKind> services = (requiredServices ?? new ServiceKind[0]).Distinct().ToList();
         var pending = new List<string>();
         var partial = new List<string>();
         var measurements = new Dictionary<ServiceKind, ProbeResult>();
         mihomo.Select(probeGroup, candidate.Name);
-        foreach (ServiceKind service in (requiredServices ?? new ServiceKind[0]).Distinct())
+        ExitIdentity identity = new ExitIdentity("", "", "exit identity probe not configured");
+        if (exitIdentityProbe != null && services.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini))
+            identity = exitIdentityProbe.Probe(TimeSpan.FromSeconds(5));
+        foreach (ServiceKind service in services)
         {
             if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
+            if (service == ServiceKind.ChatGPT && result.FailureKind == ProbeFailureKind.None && exitIdentityProbe != null)
+            {
+                if (!identity.Known)
+                    result = ProbeResult.Unverified("无法确认实际出口，不能验证 ChatGPT 地区资格", result.ElapsedMilliseconds);
+                else if (!ChatGptSupportedRegions.Contains(identity.CountryCode))
+                    result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 支持地区快照中", result.ElapsedMilliseconds);
+            }
             measurements[service] = result;
             probeCount++;
             totalMilliseconds += result.ElapsedMilliseconds;
@@ -56,22 +75,23 @@ public sealed class CompatibilityScanner
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
             else if (!result.Passed)
             {
-                foreach (ServiceKind untested in (requiredServices ?? new ServiceKind[0]).Distinct())
+                foreach (ServiceKind untested in services)
                     if (!measurements.ContainsKey(untested)) measurements[untested] = ProbeResult.Unverified("前序服务检测失败，本轮尚未检测");
-                return Failure(candidate.Name, service, result, totalMilliseconds, probeCount, measurements);
+                return Failure(candidate.Name, service, result, totalMilliseconds, probeCount, measurements, identity);
             }
         }
-        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements);
-        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements);
-        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements);
+        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
+        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
+        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
     }
 
     private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result,
-        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements)
+        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements, ExitIdentity identity)
     {
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
-        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements);
+        return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements,
+            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode);
     }
 }
 
@@ -92,11 +112,32 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
 
     public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
     {
+        if (service == ServiceKind.ChatGPT || service == ServiceKind.Gemini)
+            return ProbeLoginChain(service, timeout);
+        return ProbeSingle(service, Endpoint(service), timeout, false, false);
+    }
+
+    private ProbeResult ProbeLoginChain(ServiceKind service, TimeSpan timeout)
+    {
+        var total = Stopwatch.StartNew();
+        ProbeResult application = ProbeSingle(service, Endpoint(service), timeout, true, false);
+        if (application.FailureKind == ProbeFailureKind.Region || application.FailureKind == ProbeFailureKind.Service ||
+            application.FailureKind == ProbeFailureKind.Transient || application.FailureKind == ProbeFailureKind.Unverified)
+            return application;
+        TimeSpan remaining = timeout - total.Elapsed;
+        if (remaining <= TimeSpan.Zero) return ProbeResult.TransientFailure("登录链路检测超时", total.ElapsedMilliseconds);
+        ProbeResult authentication = ProbeSingle(service, AuthenticationEndpoint(service), remaining, false, true);
+        return CombineLoginChain(service, application, authentication);
+    }
+
+    private ProbeResult ProbeSingle(ServiceKind service, Uri endpoint, TimeSpan timeout,
+        bool applicationEndpoint, bool authenticationEndpoint)
+    {
         var timer = Stopwatch.StartNew();
         try
         {
             using (var cancellation = new CancellationTokenSource(timeout))
-            using (var request = new HttpRequestMessage(HttpMethod.Get, Endpoint(service)))
+            using (var request = new HttpRequestMessage(HttpMethod.Get, endpoint))
             using (HttpResponseMessage response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token).GetAwaiter().GetResult())
             {
                 byte[] bytes;
@@ -106,6 +147,10 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                 string body = System.Text.Encoding.UTF8.GetString(bytes);
                 bool challengeHeader = response.Headers.Contains("Cf-Mitigated") &&
                     String.Join(",", response.Headers.GetValues("Cf-Mitigated")).IndexOf("challenge", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (applicationEndpoint)
+                    return EvaluateApplicationResponse(service, (int)response.StatusCode, body, response.Headers.Location, timer.ElapsedMilliseconds, challengeHeader);
+                if (authenticationEndpoint)
+                    return EvaluateAuthenticationResponse(service, (int)response.StatusCode, body, timer.ElapsedMilliseconds, challengeHeader);
                 return EvaluateResponse(service, (int)response.StatusCode, body, response.Headers.Location, timer.ElapsedMilliseconds, challengeHeader);
             }
         }
@@ -135,6 +180,81 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                     default:
                         return status >= 200 && status < 400 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                 }
+    }
+
+    public static ProbeResult EvaluateApplicationResponse(ServiceKind service, int status, string body,
+        Uri location, long elapsed, bool challengeHeader = false)
+    {
+        if (IsRegionBlocked(body)) return ProbeResult.RegionFailure("explicit unsupported-region response", elapsed);
+        if (service == ServiceKind.ChatGPT)
+        {
+            if (status == 200) return ProbeResult.Success(elapsed);
+            if (status == 403 && (challengeHeader || IsChallengeResponse(body)))
+                return ProbeResult.Partial("Cloudflare 验证页可达，登录链路未验证", elapsed);
+            return ProbeResult.ServiceFailure("unexpected application HTTP " + status, elapsed);
+        }
+        if (service == ServiceKind.Gemini)
+        {
+            if (status == 200) return ProbeResult.Success(elapsed);
+            if (status >= 300 && status < 400 && location != null && location.IsAbsoluteUri &&
+                location.Scheme == "https" && String.Equals(location.Host, "accounts.google.com", StringComparison.OrdinalIgnoreCase))
+                return ProbeResult.LoginRedirect("accounts.google.com", elapsed);
+            return ProbeResult.ServiceFailure("unexpected application HTTP " + status, elapsed);
+        }
+        return EvaluateResponse(service, status, body, location, elapsed, challengeHeader);
+    }
+
+    public static ProbeResult EvaluateAuthenticationResponse(ServiceKind service, int status, string body,
+        long elapsed, bool challengeHeader = false)
+    {
+        if (IsRegionBlocked(body)) return ProbeResult.RegionFailure("explicit unsupported-region response", elapsed);
+        if (status == 403 && (challengeHeader || IsChallengeResponse(body)))
+            return ProbeResult.Partial("认证入口验证页可达，登录链路未验证", elapsed);
+        string issuer = service == ServiceKind.ChatGPT ? "https://auth.openai.com" :
+            service == ServiceKind.Gemini ? "https://accounts.google.com" : "";
+        if (status == 200 && !String.IsNullOrEmpty(issuer) && !String.IsNullOrEmpty(body) &&
+            body.IndexOf(issuer, StringComparison.OrdinalIgnoreCase) >= 0 &&
+            body.IndexOf("issuer", StringComparison.OrdinalIgnoreCase) >= 0)
+            return ProbeResult.Success(elapsed);
+        return ProbeResult.ServiceFailure("authentication metadata unavailable", elapsed);
+    }
+
+    public static Uri AuthenticationEndpoint(ServiceKind service)
+    {
+        if (service == ServiceKind.ChatGPT) return new Uri("https://auth.openai.com/.well-known/openid-configuration");
+        if (service == ServiceKind.Gemini) return new Uri("https://accounts.google.com/.well-known/openid-configuration");
+        throw new ArgumentOutOfRangeException("service");
+    }
+
+    public static ProbeResult CombineLoginChain(ServiceKind service, ProbeResult application, ProbeResult authentication)
+    {
+        if (application == null || authentication == null) return ProbeResult.Unverified("登录链路证据不完整");
+        long elapsed = application.ElapsedMilliseconds + authentication.ElapsedMilliseconds;
+        ProbeResult failure = StrongerFailure(application, authentication);
+        if (failure != null)
+        {
+            if (failure.FailureKind == ProbeFailureKind.Region) return ProbeResult.RegionFailure(failure.Detail, elapsed);
+            if (failure.FailureKind == ProbeFailureKind.Transient) return ProbeResult.TransientFailure(failure.Detail, elapsed);
+            if (failure.FailureKind == ProbeFailureKind.Service) return ProbeResult.ServiceFailure(failure.Detail, elapsed);
+            if (failure.FailureKind == ProbeFailureKind.Unverified) return ProbeResult.Unverified(failure.Detail, elapsed);
+        }
+        bool applicationReady = application.FailureKind == ProbeFailureKind.None ||
+            (service == ServiceKind.Gemini && application.FailureKind == ProbeFailureKind.LoginRedirect);
+        if (applicationReady && authentication.FailureKind == ProbeFailureKind.None)
+            return ProbeResult.Success(elapsed);
+        return ProbeResult.Partial("入口可达，但登录链路尚未完整验证", elapsed);
+    }
+
+    private static ProbeResult StrongerFailure(ProbeResult first, ProbeResult second)
+    {
+        ProbeFailureKind[] order = { ProbeFailureKind.Region, ProbeFailureKind.Service,
+            ProbeFailureKind.Transient, ProbeFailureKind.Unverified };
+        foreach (ProbeFailureKind kind in order)
+        {
+            if (first.FailureKind == kind) return first;
+            if (second.FailureKind == kind) return second;
+        }
+        return null;
     }
 
     public static byte[] LimitBody(byte[] bytes)

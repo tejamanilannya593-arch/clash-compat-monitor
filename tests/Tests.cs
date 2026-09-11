@@ -59,6 +59,7 @@ internal static class Tests
         ExperienceBehavior();
         ServiceIncidentBehavior();
         ServiceEvidenceBehavior();
+        LoginChainEvidenceBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
     }
@@ -81,6 +82,80 @@ internal static class Tests
         var state = new HealthState("scope");
         state.RememberPreferred("partial", CandidateHealth.BasicCompatible, DateTime.UtcNow);
         Equal("", state.PreferredNode, "reachable-only scan is not persisted as preferred");
+    }
+
+    private static void LoginChainEvidenceBehavior()
+    {
+        ProbeResult app = ProbeResult.Success(300);
+        ProbeResult auth = ProbeResult.Success(400);
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.ChatGPT, app, auth).FailureKind,
+            "chatgpt app and auth success is login ready");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.ChatGPT,
+                ProbeResult.Partial("challenge", 200), auth).FailureKind,
+            "chatgpt challenge stays reachable only");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.Gemini,
+                ProbeResult.LoginRedirect("accounts.google.com", 200), auth).FailureKind,
+            "gemini exact login redirect plus auth success is login ready");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.Gemini,
+                ProbeResult.Partial("unclassified page", 200), auth).FailureKind,
+            "generic partial page cannot become login ready");
+        Equal("https://auth.openai.com/.well-known/openid-configuration", HttpServiceProbe.AuthenticationEndpoint(ServiceKind.ChatGPT).AbsoluteUri,
+            "chatgpt authentication endpoint");
+        Equal("https://accounts.google.com/.well-known/openid-configuration", HttpServiceProbe.AuthenticationEndpoint(ServiceKind.Gemini).AbsoluteUri,
+            "gemini authentication endpoint");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.ChatGPT, 200, "<html>ChatGPT</html>", null, 100).FailureKind,
+            "chatgpt application page is raw login-chain success");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.ChatGPT, 403, "cf-chl", null, 100).FailureKind,
+            "chatgpt challenge cannot become login ready");
+        Equal(ProbeFailureKind.LoginRedirect,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.Gemini, 302, "",
+                new Uri("https://accounts.google.com/ServiceLogin"), 100).FailureKind,
+            "gemini exact authentication redirect is trusted intermediate evidence");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.Gemini, 302, "",
+                new Uri("https://accounts.google.com.evil.example/"), 100).FailureKind,
+            "gemini lookalike authentication redirect is rejected");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
+                "{\"issuer\":\"https://auth.openai.com\"}", 100).FailureKind,
+            "chatgpt OpenID issuer proves authentication infrastructure");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
+                "<html>captive portal</html>", 100).FailureKind,
+            "generic page cannot prove authentication infrastructure");
+
+        Equal(false, ChatGptSupportedRegions.Contains("HK"), "actual Hong Kong exit is ChatGPT region risk");
+        Equal(true, ChatGptSupportedRegions.Contains("JP"), "Japan is in dated ChatGPT support snapshot");
+        Equal(true, ChatGptSupportedRegions.Contains("SG"), "Singapore is in dated ChatGPT support snapshot");
+        Equal(true, ChatGptSupportedRegions.Contains("TW"), "Taiwan is in dated ChatGPT support snapshot");
+        Equal(false, ChatGptSupportedRegions.Contains(""), "unknown exit is not assumed supported");
+
+        ExitIdentity identity = ExitIdentityParser.Parse("ip=203.0.113.8\nloc=JP\ncolo=NRT\n", new byte[] { 1, 2, 3 });
+        Equal("JP", identity.CountryCode, "trace country parsed");
+        Equal(false, identity.Fingerprint.Contains("203.0.113.8"), "fingerprint hides raw exit IP");
+        Equal(identity.Fingerprint,
+            ExitIdentityParser.Parse("ip=203.0.113.8\nloc=JP\n", new byte[] { 1, 2, 3 }).Fingerprint,
+            "same exit and key have stable fingerprint");
+
+        var probe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        CandidateScanResult supported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("exit-jp", "JP", "ok")))
+            .ScanSelected(new CandidateNode("香港名称但日本出口", 1), new[] { ServiceKind.ChatGPT });
+        Equal(CandidateHealth.Compatible, supported.Health, "actual supported exit wins over node label");
+        Equal("JP", supported.ExitCountryCode, "scan carries actual exit country");
+        Equal("exit-jp", supported.ExitFingerprint, "scan carries encrypted exit fingerprint");
+
+        CandidateScanResult unsupported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("exit-hk", "HK", "ok")))
+            .ScanSelected(new CandidateNode("日本名称但香港出口", 1), new[] { ServiceKind.ChatGPT });
+        Equal(CandidateHealth.RegionBlocked, unsupported.Health, "actual Hong Kong exit blocks ChatGPT switch evidence");
+        Equal(ServiceKind.ChatGPT, unsupported.FailedService.Value, "region gate identifies ChatGPT");
     }
 
     private static void AssuranceBehavior()
@@ -719,6 +794,13 @@ internal static class Tests
         recovery.Records["稳定节点"].Health = CandidateHealth.Transient;
         Equal<string>(null, ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
             TimeSpan.FromMinutes(30)), "failed preferred node not restored");
+    }
+
+    private sealed class FakeExitIdentityProbe : IExitIdentityProbe
+    {
+        private readonly ExitIdentity identity;
+        public FakeExitIdentityProbe(ExitIdentity identity) { this.identity = identity; }
+        public ExitIdentity Probe(TimeSpan timeout) { return identity; }
     }
 
     private sealed class FakeClock : IClock

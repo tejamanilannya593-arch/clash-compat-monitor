@@ -69,11 +69,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             : evidence.WithProgress(stage));
     }
 
-    public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock)
+    public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock,
+        IExitIdentityProbe exitIdentityProbe = null)
     {
         this.config = config;
         this.mihomo = mihomo;
-        this.scanner = new CompatibilityScanner(mihomo, probe, config.ProbeGroup);
+        this.scanner = new CompatibilityScanner(mihomo, probe, config.ProbeGroup, exitIdentityProbe);
         scanner.ShouldStop = StopRequired;
         this.logger = logger;
         this.clock = clock;

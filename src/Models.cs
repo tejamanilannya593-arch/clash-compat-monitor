@@ -27,7 +27,7 @@ public enum ServiceKind
     Epic
 }
 
-public enum ProbeFailureKind { None, Region, Service, Transient, Unverified, Partial }
+public enum ProbeFailureKind { None, Region, Service, Transient, Unverified, Partial, LoginRedirect }
 public enum CandidateHealth { Unknown, Compatible, BasicCompatible, RegionBlocked, ServiceFailed, Transient }
 
 public sealed class ProbeResult
@@ -47,6 +47,7 @@ public sealed class ProbeResult
     public static ProbeResult ReachableChallenge(long elapsedMilliseconds = 0) { return Partial("验证码页面可达，未验证平台功能", elapsedMilliseconds); }
     public static ProbeResult Unverified(string detail, long elapsedMilliseconds = 0) { return new ProbeResult(false, ProbeFailureKind.Unverified, detail, elapsedMilliseconds); }
     public static ProbeResult Partial(string detail, long elapsedMilliseconds = 0) { return new ProbeResult(true, ProbeFailureKind.Partial, detail, elapsedMilliseconds); }
+    public static ProbeResult LoginRedirect(string detail, long elapsedMilliseconds = 0) { return new ProbeResult(true, ProbeFailureKind.LoginRedirect, detail, elapsedMilliseconds); }
     public static ProbeResult RegionFailure(string detail, long elapsedMilliseconds = 0) { return new ProbeResult(false, ProbeFailureKind.Region, detail, elapsedMilliseconds); }
     public static ProbeResult ServiceFailure(string detail, long elapsedMilliseconds = 0) { return new ProbeResult(false, ProbeFailureKind.Service, detail, elapsedMilliseconds); }
     public static ProbeResult TransientFailure(string detail, long elapsedMilliseconds = 0) { return new ProbeResult(false, ProbeFailureKind.Transient, detail, elapsedMilliseconds); }
@@ -55,7 +56,8 @@ public sealed class ProbeResult
 public sealed class CandidateScanResult
 {
     public CandidateScanResult(string name, CandidateHealth health, ServiceKind? failedService, string detail,
-        long totalMilliseconds = 0, int probeCount = 0, IDictionary<ServiceKind, ProbeResult> serviceResults = null)
+        long totalMilliseconds = 0, int probeCount = 0, IDictionary<ServiceKind, ProbeResult> serviceResults = null,
+        string exitFingerprint = null, string exitCountryCode = null)
     {
         Name = name;
         Health = health;
@@ -63,6 +65,8 @@ public sealed class CandidateScanResult
         Detail = detail;
         TotalMilliseconds = totalMilliseconds;
         ProbeCount = probeCount;
+        ExitFingerprint = exitFingerprint ?? "";
+        ExitCountryCode = exitCountryCode ?? "";
         ServiceResults = new ReadOnlyDictionary<ServiceKind, ProbeResult>(
             new Dictionary<ServiceKind, ProbeResult>(serviceResults ?? new Dictionary<ServiceKind, ProbeResult>()));
     }
@@ -72,5 +76,7 @@ public sealed class CandidateScanResult
     public string Detail { get; private set; }
     public long TotalMilliseconds { get; private set; }
     public int ProbeCount { get; private set; }
+    public string ExitFingerprint { get; private set; }
+    public string ExitCountryCode { get; private set; }
     public IDictionary<ServiceKind, ProbeResult> ServiceResults { get; private set; }
 }
