@@ -63,6 +63,7 @@ internal static class Tests
         LoginChainEvidenceBehavior();
         AccountVerificationBehavior();
         BrowserConversationCoordinatorBehavior();
+        BrowserNativeProtocolBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
     }
@@ -369,6 +370,89 @@ internal static class Tests
         private readonly string value;
         public FixedChallengeSource(string value) { this.value = value; }
         public string Create() { return value; }
+    }
+
+    private static void BrowserNativeProtocolBehavior()
+    {
+        var message = new BrowserBridgeMessage {
+            Type = "result",
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = "request-1",
+            Browser = "Chrome",
+            ExtensionVersion = "0.6.2",
+            TaskId = "0123456789abcdef0123456789abcdef",
+            Service = "ChatGPT",
+            Challenge = "CCM-A7F2",
+            Outcome = "Passed",
+            MessageSent = true,
+            ElapsedMilliseconds = 1234
+        };
+        var framed = new MemoryStream();
+        BrowserNativeProtocol.Write(framed, message);
+        byte[] bytes = framed.ToArray();
+        Equal(true, bytes.Length > 4, "native message has length prefix and json body");
+        Equal(bytes.Length - 4, BitConverter.ToInt32(bytes, 0), "native message uses little endian payload length");
+
+        BrowserBridgeMessage roundTrip = BrowserNativeProtocol.Read(new FragmentedReadStream(bytes));
+        Equal("result", roundTrip.Type, "native frame round trips across short reads");
+        Equal("CCM-A7F2", roundTrip.Challenge, "native frame preserves challenge");
+        Equal(true, BrowserMessageValidator.IsValidRequest(roundTrip), "valid native result request accepted");
+        Equal(null, BrowserNativeProtocol.Read(new MemoryStream()), "clean native stream eof is allowed");
+
+        Throws<EndOfStreamException>(() => BrowserNativeProtocol.Read(new MemoryStream(new byte[] { 1, 0 })),
+            "partial native length prefix rejected");
+        Throws<InvalidDataException>(() => BrowserNativeProtocol.Read(
+            new MemoryStream(new byte[] { 1, 0, 1, 0 })), "oversized native frame rejected");
+        Throws<InvalidDataException>(() => BrowserNativeProtocol.Read(
+            new MemoryStream(new byte[] { 1, 0, 0, 0, (byte)'{' })), "invalid native json rejected");
+
+        Equal(true, BrowserOriginPolicy.IsAllowed("chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg/"),
+            "pinned extension origin accepted");
+        Equal(false, BrowserOriginPolicy.IsAllowed("chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg.evil/"),
+            "lookalike extension origin rejected");
+        Equal(false, BrowserOriginPolicy.IsAllowed("https://chatgpt.com/"),
+            "web page origin rejected by native host");
+
+        message.RequestId = new string('x', 65);
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "oversized request id rejected");
+        message.RequestId = "request-1";
+        message.Outcome = "EverythingFine";
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "unknown result outcome rejected");
+        message.Outcome = "Passed";
+        message.Service = "Google";
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "non-ai browser service rejected");
+        message.Service = "ChatGPT";
+        message.Challenge = new string('z', 81);
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "oversized challenge rejected");
+        message.Challenge = "CCM-测试";
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "non-ascii challenge rejected");
+        message.Challenge = "CCM-A7F2";
+        message.Url = new string('u', 2049);
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "oversized result url rejected");
+
+        var poll = new BrowserBridgeMessage {
+            Type = "poll",
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = "poll-1",
+            Browser = "Edge",
+            ExtensionVersion = "0.6.2"
+        };
+        Equal(true, BrowserMessageValidator.IsValidRequest(poll), "valid native poll accepted");
+        poll.ProtocolVersion++;
+        Equal(false, BrowserMessageValidator.IsValidRequest(poll), "unknown native protocol version rejected");
+        poll.ProtocolVersion--;
+        poll.Type = "arbitrary";
+        Equal(false, BrowserMessageValidator.IsValidRequest(poll), "unknown native message type rejected");
+    }
+
+    private sealed class FragmentedReadStream : MemoryStream
+    {
+        public FragmentedReadStream(byte[] bytes) : base(bytes) { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            return base.Read(buffer, offset, Math.Min(count, 1));
+        }
     }
 
     private static void AssuranceBehavior()
