@@ -16,6 +16,7 @@ public sealed class ConnectionAssurance
     public string Target { get; set; }
     public double PreviousResponse { get; set; }
     public bool QualitySwitch { get; set; }
+    public bool ProvisionalSwitch { get; set; }
     public int VerificationCount { get; set; }
     public int FailedChecks { get; set; }
     public int SlowerChecks { get; set; }
@@ -41,15 +42,15 @@ public sealed class ConnectionAssurance
         var names = new HashSet<string>(eligible, StringComparer.Ordinal);
         return Standbys.Where(x => names.Contains(x.Name) && x.Name != current && x.VerifiedUtc <= now && x.VerifiedUtc >= now.AddMinutes(-10)).Select(x => x.Name).ToArray();
     }
-    public void Begin(string previous, string target, double response, bool quality)
-    { Previous = previous; Target = target; PreviousResponse = response; QualitySwitch = quality; VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0; }
+    public void Begin(string previous, string target, double response, bool quality, bool provisional = false)
+    { Previous = previous; Target = target; PreviousResponse = response; QualitySwitch = quality; ProvisionalSwitch = provisional; VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0; }
     public bool NeedsRollback(CandidateScanResult scan)
     {
         VerificationCount++;
         FailedChecks = !Passed(scan) && scan.Health != CandidateHealth.Unknown ? FailedChecks + 1 : 0;
         SlowerChecks = Passed(scan) && QualitySwitch && PreviousResponse > 0 &&
             QualityMeasurement.ResponseMilliseconds(scan, 5000) > PreviousResponse * 1.25 ? SlowerChecks + 1 : 0;
-        return (QualitySwitch && FailedChecks >= 1) || FailedChecks >= 2 || SlowerChecks >= 2;
+        return ((QualitySwitch || ProvisionalSwitch) && FailedChecks >= 1) || FailedChecks >= 2 || SlowerChecks >= 2;
     }
     public TimeSpan Interval(CandidateScanResult scan)
     {

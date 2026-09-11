@@ -260,6 +260,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     }
                 }
                 else if (!observing) controller.Decide(true, false, current, null);
+                if (currentFailureConfirmed && (failedService == ServiceKind.ChatGPT || failedService == ServiceKind.Gemini))
+                    AccountVerificationMemory.Revoke(experience, memoryScope, current, failedService,
+                        clock.UtcNow, "confirmed service failure");
             }
             if (observing && suppressedServices.Count > 0)
             {
@@ -477,15 +480,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 bool currentCompatible = ServiceEvidencePolicy.CanEmergencySwitch(currentScan) && scores.TryGetValue(current, out currentScore);
                 bool shouldSwitch;
                 string reason;
+                CandidateScanResult selectedTargetScan;
+                scans.TryGetValue(best.Key, out selectedTargetScan);
                 if (currentCompatible)
                 {
-                    CandidateScanResult bestScan;
-                    scans.TryGetValue(best.Key, out bestScan);
-                    FailoverDecision qualityDecision = controller.DecideQuality(currentScore.Score, best.Value.Score, false,
-                        freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, best.Key, clock.UtcNow),
-                        experience.RecentResponses(memoryScope, current, 3), experience.RecentResponses(memoryScope, best.Key, 5), bestScan);
-                    shouldSwitch = qualityDecision.ShouldSwitch;
-                    reason = qualityDecision.Reason;
+                    if (!ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan, experience, memoryScope, requiredServices, clock.UtcNow))
+                    {
+                        shouldSwitch = false;
+                        reason = "target requires account verification";
+                    }
+                    else
+                    {
+                        FailoverDecision qualityDecision = controller.DecideQuality(currentScore.Score, best.Value.Score, false,
+                            freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, best.Key, clock.UtcNow),
+                            experience.RecentResponses(memoryScope, current, 3), experience.RecentResponses(memoryScope, best.Key, 5), selectedTargetScan);
+                        shouldSwitch = qualityDecision.ShouldSwitch;
+                        reason = qualityDecision.Reason;
+                    }
                 }
                 else
                 {
@@ -510,14 +521,19 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         scans[best.Key] = finalScan;
                         scanTimes[best.Key] = clock.UtcNow;
                     }
+                    selectedTargetScan = finalScan;
                     shouldSwitch = ServiceEvidencePolicy.CanEmergencySwitch(finalScan);
+                    if (currentCompatible && shouldSwitch)
+                        shouldSwitch = ServiceEvidencePolicy.CanQualitySwitch(finalScan, experience, memoryScope, requiredServices, clock.UtcNow);
                     if (!shouldSwitch) decision = "目标节点复检未通过，保留当前连接";
                 }
                 CheckStop();
                 if (shouldSwitch && !dryRun && preferences.AutomaticOptimization && String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
                 {
                     SelectRecorded(current, best.Key, "自动切换：" + StatusReport.DecisionText(reason));
-                    assurance.Begin(current, best.Key, currentResponse, currentCompatible);
+                    bool provisional = !ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan,
+                        experience, memoryScope, requiredServices, clock.UtcNow);
+                    assurance.Begin(current, best.Key, currentResponse, currentCompatible, provisional);
                     experienceStore.Save(experience, clock.UtcNow);
                     previousSelectedNode = current;
                     controller.RecordSwitch();

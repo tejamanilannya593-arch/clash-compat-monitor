@@ -232,6 +232,8 @@ internal static class Tests
         policy.Begin("a", "b", 100, false);
         Equal(false, policy.NeedsRollback(bad), "failure switch first failure stays");
         Equal(true, policy.NeedsRollback(bad), "failure switch second failure requests rollback verification");
+        policy.Begin("a", "b", 100, false, true);
+        Equal(true, policy.NeedsRollback(bad), "unproven emergency target first explicit failure requests rollback verification");
         policy.Begin("a", "b", 100, true);
         var slow = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 200, 1);
         Equal(false, policy.NeedsRollback(slow), "one slow response does not roll back");
@@ -337,7 +339,10 @@ internal static class Tests
         Equal("legacy|chatgpt,gemini", legacyContinuity.ResolveScope("new", new[] { "a", "b", "c", "d" }, "chatgpt,gemini"),
             "legacy experience infers subscription continuity during upgrade");
         var memory = new ExperienceData();
-        var scan = new CandidateScanResult("stable", CandidateHealth.BasicCompatible, null, "partial", 100, 1);
+        var scan = new CandidateScanResult("stable", CandidateHealth.Compatible, null, "ok", 100, 1);
+        var partialMemory = new ExperienceData();
+        partialMemory.Observe("scope", new CandidateScanResult("partial", CandidateHealth.BasicCompatible, null, "challenge", 100, 1), null, now);
+        Equal(0, partialMemory.Nodes[0].SuccessfulSamples, "reachable-only evidence does not accumulate successful history");
         memory.Observe("scope", scan, null, now);
         memory.Observe("scope", scan, null, now.AddSeconds(1));
         Equal(1, memory.Nodes[0].Samples, "memory deduplicates same-cycle observations");
@@ -357,8 +362,8 @@ internal static class Tests
         for (int i = 0; i < 20; i++)
         {
             DateTime checkedUtc = now.AddMinutes(i * 2);
-            ninetyPercent.Observe("scope", new CandidateScanResult("ninety", i < 2 ? CandidateHealth.Transient : CandidateHealth.BasicCompatible, null, "sample"), null, checkedUtc);
-            ninetyFivePercent.Observe("scope", new CandidateScanResult("ninety-five", i == 0 ? CandidateHealth.Transient : CandidateHealth.BasicCompatible, null, "sample"), null, checkedUtc);
+            ninetyPercent.Observe("scope", new CandidateScanResult("ninety", i < 2 ? CandidateHealth.Transient : CandidateHealth.Compatible, null, "sample"), null, checkedUtc);
+            ninetyFivePercent.Observe("scope", new CandidateScanResult("ninety-five", i == 0 ? CandidateHealth.Transient : CandidateHealth.Compatible, null, "sample"), null, checkedUtc);
         }
         Equal(false, ninetyPercent.IsProvenStable("scope", "ninety", now.AddMinutes(38)), "ninety percent history cannot authorize quality switch");
         Equal(true, ninetyFivePercent.IsProvenStable("scope", "ninety-five", now.AddMinutes(38)), "ninety-five percent history authorizes quality switch");
@@ -623,7 +628,7 @@ internal static class Tests
         MonitorPresentation view = MonitorPresentation.From(snapshot);
         Equal("运行正常", view.StateText, "running label");
         Equal("selected", view.NodeText, "presentation leaf node");
-        Equal("综合响应：75 ms · 优质", view.ResponseText, "presentation shows latency quality band");
+        Equal("综合响应：75 ms · 优秀", view.ResponseText, "presentation shows latency quality band");
         Equal("综合响应：待测", MonitorPresentation.From(MonitorSnapshot.CreateState(MonitorRunState.Starting, "", snapshotTime, snapshotTime)).ResponseText, "presentation handles missing latency");
         Equal("可用 · 75 ms", MonitorPresentation.ServiceText(true, 75, "ok"), "service latency label");
         Equal("不可用", MonitorPresentation.ServiceText(false, 75, "blocked"), "failure hides misleading latency");
@@ -637,6 +642,7 @@ internal static class Tests
         Equal("后台准备备用节点", snapshot.WithProgress("后台准备备用节点").Decision, "maintenance stage remains visible");
         Equal(MonitorRunState.Degraded, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.Transient, null, "timeout"), null, "", snapshotTime, snapshotTime).State, "failed scan is not running normally");
         Equal(MonitorRunState.Pending, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending"), null, "", snapshotTime, snapshotTime).State, "unknown scan is pending");
+        Equal(MonitorRunState.Pending, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.BasicCompatible, null, "challenge"), null, "", snapshotTime, snapshotTime).State, "reachable-only scan is pending not running normally");
         Equal(true, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "definite startup failure gets immediate confirmation");
         Equal(false, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending")), "unknown startup evidence is not forced failure");
         Equal(4, StartupRecovery.MaximumCandidates(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "startup failure search is bounded");
@@ -763,22 +769,23 @@ internal static class Tests
         var clock = new FakeClock { UtcNow = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc) };
         var controller = new FailoverController(clock, TimeSpan.FromMinutes(10));
         Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred HTTP response threshold");
-        Equal("优质", QualityPolicy.LatencyBand(500), "preferred latency band boundary");
-        Equal("可用", QualityPolicy.LatencyBand(501), "usable latency band boundary");
-        Equal("偏慢", QualityPolicy.LatencyBand(801), "slow latency band boundary");
-        Equal("质量较差", QualityPolicy.LatencyBand(1501), "poor latency band boundary");
+        Equal("优秀", QualityPolicy.LatencyBand(500), "excellent latency band boundary");
+        Equal("良好", QualityPolicy.LatencyBand(800), "good latency band boundary");
+        Equal("可连接但偏慢", QualityPolicy.LatencyBand(1500), "connectable but slow latency band boundary");
+        Equal("不适合自动寻优", QualityPolicy.LatencyBand(1501), "automatic optimization latency cutoff");
         Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 1000.0 }), "current latency needs three samples");
         Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 800.0, 900.0 }), "current median at 800 holds");
         Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 900.0 }), "current median above 800 may optimize");
         Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0, 800.0 }), "candidate median p95 and jitter pass");
+        Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1500.0 }), "candidate median 800 and maximum 1500 pass");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0 }), "candidate latency needs five samples");
-        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0, 801.0 }), "candidate p95 above 800 fails");
+        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }), "candidate maximum above 1500 fails");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 100.0, 300.0, 500.0, 700.0, 800.0 }), "candidate jitter above 150 fails");
         var responsiveServices = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1400, 2,
-            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1000) } });
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1500) } });
         var slowService = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1401, 2,
-            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1001) } });
-        Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1000 passes");
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1501) } });
+        Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1500 passes");
         Equal(false, QualityPolicy.ServicesWithinLimit(slowService), "single slow service rejects quality candidate");
         double[] slowCurrent = { 700, 801, 900 };
         double[] preferredTarget = { 300, 400, 500, 600, 800 };
@@ -787,8 +794,12 @@ internal static class Tests
         Equal(false, controller.DecideQuality(70, 90, false, false, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "fresh verification required");
         Equal(false, controller.DecideQuality(70, 90, false, true, false, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "proven stable history required");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, new[] { 700.0, 800.0, 900.0 }, preferredTarget, responsiveServices).ShouldSwitch, "current latency not persistently slow holds");
-        Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, new[] { 300.0, 400.0, 500.0, 600.0, 801.0 }, responsiveServices).ShouldSwitch, "candidate history outside preferred latency cannot switch");
+        Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }, responsiveServices).ShouldSwitch, "candidate history outside preferred latency cannot switch");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, preferredTarget, slowService).ShouldSwitch, "single slow service cannot quality switch");
+        var reachableTarget = new CandidateScanResult("target", CandidateHealth.BasicCompatible, null, "challenge", 100, 1,
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Partial("challenge", 100) } });
+        Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, preferredTarget, reachableTarget).ShouldSwitch,
+            "reachable-only target cannot quality switch");
         Equal(true, controller.DecideQuality(70, 90, true, true, false, new double[0], new double[0], slowService).ShouldSwitch, "disconnect bypasses quality history and latency gates");
         var healthy = new[] { new NodeHealthRecord("next", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false) };
         Equal(false, controller.Decide(false, false, "current", healthy).ShouldSwitch, "first failure stays");

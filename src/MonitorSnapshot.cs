@@ -84,8 +84,8 @@ public sealed class MonitorSnapshot
     {
         if (scan == null) throw new ArgumentNullException("scan");
         return new MonitorSnapshot {
-            State = scan.Health == CandidateHealth.Unknown ? MonitorRunState.Pending :
-                scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible ? MonitorRunState.Running : MonitorRunState.Degraded,
+            State = scan.Health == CandidateHealth.Unknown || scan.Health == CandidateHealth.BasicCompatible ? MonitorRunState.Pending :
+                scan.Health == CandidateHealth.Compatible ? MonitorRunState.Running : MonitorRunState.Degraded,
             ActualNode = node ?? "",
             Score = score,
             Decision = decision ?? "",

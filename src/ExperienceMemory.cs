@@ -109,7 +109,7 @@ public sealed class ExperienceData
             node.RecentResponseMilliseconds.Clear();
         }
         if (node.Samples > 0 && now - node.LastUtc < TimeSpan.FromSeconds(30)) return;
-        bool passed = scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible;
+        bool passed = scan.Health == CandidateHealth.Compatible;
         double weight = node.Samples == 0 ? 1 : 0.2;
         node.Success = (1 - weight) * node.Success + weight * (passed ? 1 : 0);
         double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);

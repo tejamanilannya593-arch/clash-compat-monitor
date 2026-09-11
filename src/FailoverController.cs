@@ -55,6 +55,8 @@ public sealed class FailoverController
         CandidateScanResult targetScan)
     {
         if (!targetFreshlyVerified) return new FailoverDecision(false, null, "target requires fresh verification");
+        if (!ServiceEvidencePolicy.CanEmergencySwitch(targetScan))
+            return new FailoverDecision(false, null, "target requires strict service evidence");
         if (currentDisconnected) return new FailoverDecision(true, null, "current disconnected");
         if (!QualityPolicy.CurrentNeedsOptimization(currentResponses))
             return new FailoverDecision(false, null, "current response not persistently slow");
@@ -80,16 +82,16 @@ public static class QualityPolicy
 {
     public const double PreferredResponseMilliseconds = 500.0;
     public const double OptimizationResponseMilliseconds = 800.0;
-    public const double MaximumServiceResponseMilliseconds = 1000.0;
+    public const double MaximumServiceResponseMilliseconds = 1500.0;
     public const double MaximumJitterMilliseconds = 150.0;
 
     public static string LatencyBand(double milliseconds)
     {
         if (Double.IsNaN(milliseconds) || Double.IsInfinity(milliseconds) || milliseconds < 0) return "待测";
-        if (milliseconds <= PreferredResponseMilliseconds) return "优质";
-        if (milliseconds <= OptimizationResponseMilliseconds) return "可用";
-        if (milliseconds <= 1500.0) return "偏慢";
-        return "质量较差";
+        if (milliseconds <= PreferredResponseMilliseconds) return "优秀";
+        if (milliseconds <= OptimizationResponseMilliseconds) return "良好";
+        if (milliseconds <= MaximumServiceResponseMilliseconds) return "可连接但偏慢";
+        return "不适合自动寻优";
     }
 
     public static bool CurrentNeedsOptimization(IEnumerable<double> responses)
@@ -103,9 +105,9 @@ public static class QualityPolicy
         List<double> recent = Valid(responses).TakeLastCompat(5).OrderBy(x => x).ToList();
         if (recent.Count < 5) return false;
         double median = Median(recent);
-        double percentile95 = recent[(int)Math.Ceiling(recent.Count * 0.95) - 1];
+        double maximum = recent[recent.Count - 1];
         List<double> deviations = recent.Select(x => Math.Abs(x - median)).OrderBy(x => x).ToList();
-        return median <= PreferredResponseMilliseconds && percentile95 <= OptimizationResponseMilliseconds &&
+        return median <= OptimizationResponseMilliseconds && maximum <= MaximumServiceResponseMilliseconds &&
             Median(deviations) <= MaximumJitterMilliseconds;
     }
 
