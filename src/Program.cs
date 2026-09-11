@@ -60,8 +60,11 @@ public static class Program
                         Path.Combine(config.RootPath, "state", "identity.key"));
                     var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe);
                     using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
+                    using (var browserBridge = new BrowserBridgeServer(BrowserPipeIdentity.ForCurrentUser(),
+                        coordinator.HandleBrowserMessage))
                     using (var tray = new TrayHost(coordinator, preferenceStore, preferences))
                     {
+                        browserBridge.Start();
                         activation.Activated += tray.ShowDetailsFromAnyThread;
                         activation.StartListening();
                         coordinator.UpdatePreferences(preferences);

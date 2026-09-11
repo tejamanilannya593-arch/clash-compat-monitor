@@ -146,6 +146,38 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         }
     }
 
+    public bool RecordBrowserConversationProof(string node, string exitFingerprint,
+        ServiceKind service, DateTime verifiedUtc, int protocolVersion)
+    {
+        if ((service != ServiceKind.ChatGPT && service != ServiceKind.Gemini) ||
+            protocolVersion != BrowserConversationProof.CurrentProtocolVersion ||
+            String.IsNullOrWhiteSpace(node) || String.IsNullOrWhiteSpace(exitFingerprint) ||
+            !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal) ||
+            String.IsNullOrWhiteSpace(experience.ActiveScope)) return false;
+        System.Threading.Interlocked.Exchange(ref accountCommandRunning, 1);
+        Stopwatch previousTimer = cycleTimer;
+        cycleTimer = Stopwatch.StartNew();
+        try
+        {
+            CandidateScanResult fresh = scanner.ScanSelected(new CandidateNode(node, null), new[] { service });
+            ProbeResult evidence;
+            if (!fresh.ServiceResults.TryGetValue(service, out evidence) || !evidence.Passed ||
+                evidence.FailureKind != ProbeFailureKind.None ||
+                !String.Equals(fresh.ExitFingerprint, exitFingerprint, StringComparison.Ordinal) ||
+                !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal)) return false;
+            AccountVerificationMemory.MarkBrowserConversation(experience, experience.ActiveScope, node,
+                fresh.ExitFingerprint, service, verifiedUtc, protocolVersion);
+            experienceStore.Save(experience, verifiedUtc);
+            logger.Write("browser conversation proof recorded node=" + SafeName(node) + " service=" + service);
+            return true;
+        }
+        finally
+        {
+            cycleTimer = previousTimer;
+            System.Threading.Volatile.Write(ref accountCommandRunning, 0);
+        }
+    }
+
     public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
     {
         if (service != ServiceKind.ChatGPT && service != ServiceKind.Gemini) return;
@@ -663,7 +695,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 bool hasAiRequirement = requiredServices.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini);
                 if (hasAiRequirement && status == CandidateHealth.Compatible)
                     detail += ServiceEvidencePolicy.CanQualitySwitch(actualScan, experience, memoryScope,
-                        requiredServices, clock.UtcNow) ? "; 所选 AI 账号实测有效" : "; 所选 AI 账号待实测";
+                        requiredServices, clock.UtcNow) ? "; 所选 AI 真实对话验证有效" : "; 所选 AI 真实对话待验证";
                 string text = StatusReport.Format(clock.UtcNow, actual, status, reportedScore, decision, detail);
                 StatusReport.WriteAtomic(Path.Combine(config.RootPath, "current-status.txt"), text);
             }

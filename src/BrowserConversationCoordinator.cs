@@ -211,7 +211,8 @@ public sealed class BrowserConversationCoordinator
                 !String.Equals(active.Node, currentSnapshot.ActualNode, StringComparison.Ordinal) ||
                 !String.Equals(active.ExitFingerprint, currentSnapshot.ExitFingerprint, StringComparison.Ordinal))
             {
-                CompleteActive(active, now, false);
+                completed.Add(active.TaskId);
+                session = null;
                 return BrowserVerificationAcceptance.Drifted;
             }
 
@@ -226,6 +227,18 @@ public sealed class BrowserConversationCoordinator
         return result != null && result.MessageSent &&
             (result.Outcome == BrowserVerificationOutcome.ConversationError ||
              result.Outcome == BrowserVerificationOutcome.GenerationTimeout);
+    }
+
+    public bool Cancel(string taskId)
+    {
+        lock (gate)
+        {
+            BrowserVerificationTask active = session == null ? null : session.ActiveTask;
+            if (active == null || !String.Equals(active.TaskId, taskId, StringComparison.Ordinal)) return false;
+            completed.Add(active.TaskId);
+            session = null;
+            return true;
+        }
     }
 
     private void CompleteActive(BrowserVerificationTask active, DateTime now, bool failed)

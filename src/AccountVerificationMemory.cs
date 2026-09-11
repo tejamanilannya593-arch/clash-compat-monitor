@@ -73,10 +73,18 @@ public static class AccountVerificationMemory
     public static bool IsBrowserConversationValid(ExperienceData data, string scope, string node,
         string exitFingerprint, ServiceKind service, DateTime now, int protocolVersion)
     {
+        return FindBrowserConversationValid(data, scope, node, exitFingerprint,
+            service, now, protocolVersion) != null;
+    }
+
+    public static AccountVerificationRecord FindBrowserConversationValid(ExperienceData data,
+        string scope, string node, string exitFingerprint, ServiceKind service, DateTime now,
+        int protocolVersion)
+    {
         AccountVerificationRecord record = FindValid(data, scope, node, exitFingerprint,
             service, now, CurrentRuleVersion);
         return record != null && record.Method == AccountVerificationMethod.BrowserConversation &&
-            record.ProtocolVersion == protocolVersion;
+            record.ProtocolVersion == protocolVersion ? record : null;
     }
 
     public static bool IsValid(ExperienceData data, string scope, string node, string exitFingerprint,

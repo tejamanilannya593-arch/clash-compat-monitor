@@ -14,6 +14,21 @@ public enum MonitorRunState
     Stopped
 }
 
+public enum BrowserVerificationStatus
+{
+    None,
+    CompanionOffline,
+    Ready,
+    Running,
+    Passed,
+    SignInRequired,
+    ChallengeRequired,
+    AutomationUnsupported,
+    ConversationError,
+    GenerationTimeout,
+    Cancelled
+}
+
 public sealed class ServiceMeasurement
 {
     public ServiceMeasurement(ServiceKind service, bool available, long milliseconds, string detail,
@@ -53,13 +68,16 @@ public sealed class MonitorSnapshot
     public CandidateHealth Health { get; private set; }
     public string ExitFingerprint { get; private set; }
     public string ExitCountryCode { get; private set; }
+    public BrowserVerificationStatus BrowserStatus { get; private set; }
+    public string BrowserStatusDetail { get; private set; }
 
     public MonitorSnapshot WithState(MonitorRunState state, string decision, DateTime nextCheckUtc)
     {
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
             NextCheckUtc = nextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
-            ExitCountryCode = ExitCountryCode, Health = Health };
+            ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
+            BrowserStatusDetail = BrowserStatusDetail };
     }
 
     public MonitorSnapshot WithSelectionReason(string reason)
@@ -67,7 +85,17 @@ public sealed class MonitorSnapshot
         return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = reason ?? "", CheckedUtc = CheckedUtc,
             NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
-            ExitCountryCode = ExitCountryCode, Health = Health };
+            ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
+            BrowserStatusDetail = BrowserStatusDetail };
+    }
+
+    public MonitorSnapshot WithBrowserStatus(BrowserVerificationStatus status, string detail)
+    {
+        return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
+            Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
+            NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = status,
+            BrowserStatusDetail = detail ?? "" };
     }
 
     public MonitorSnapshot WithProgress(string decision)
@@ -80,8 +108,8 @@ public sealed class MonitorSnapshot
     {
         var services = Services.Select(service => {
             AccountVerificationRecord record = (service.Service == ServiceKind.ChatGPT || service.Service == ServiceKind.Gemini)
-                ? AccountVerificationMemory.FindValid(data, scope, ActualNode, ExitFingerprint,
-                    service.Service, now, AccountVerificationMemory.CurrentRuleVersion) : null;
+                ? AccountVerificationMemory.FindBrowserConversationValid(data, scope, ActualNode,
+                    ExitFingerprint, service.Service, now, BrowserConversationProof.CurrentProtocolVersion) : null;
             return new ServiceMeasurement(service.Service, service.Available, service.Milliseconds,
                 service.Detail, service.Evidence, record != null,
                 record == null ? DateTime.MinValue : record.VerifiedUtc);
@@ -93,7 +121,8 @@ public sealed class MonitorSnapshot
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
             NextCheckUtc = NextCheckUtc, Services = services, ExitFingerprint = ExitFingerprint,
-            ExitCountryCode = ExitCountryCode, Health = Health };
+            ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
+            BrowserStatusDetail = BrowserStatusDetail };
     }
 
     public static MonitorSnapshot CreateState(MonitorRunState state, string decision,
@@ -107,6 +136,8 @@ public sealed class MonitorSnapshot
             CheckedUtc = checkedUtc,
             NextCheckUtc = nextCheckUtc,
             Health = CandidateHealth.Unknown,
+            BrowserStatus = BrowserVerificationStatus.None,
+            BrowserStatusDetail = "",
             Services = new List<ServiceMeasurement>().AsReadOnly()
         };
     }
@@ -128,6 +159,8 @@ public sealed class MonitorSnapshot
             CheckedUtc = checkedUtc,
             NextCheckUtc = nextCheckUtc,
             Health = scan.Health,
+            BrowserStatus = BrowserVerificationStatus.None,
+            BrowserStatusDetail = "",
             Services = scan.ServiceResults.OrderBy(pair => pair.Key)
                 .Select(pair => new ServiceMeasurement(pair.Key, pair.Value.Passed,
                     pair.Value.ElapsedMilliseconds, pair.Value.Detail, pair.Value.FailureKind)).ToList().AsReadOnly(),
@@ -149,7 +182,7 @@ public sealed class MonitorPresentation
     {
         if (snapshot == null) throw new ArgumentNullException("snapshot");
         return new MonitorPresentation {
-            StateText = StateLabel(snapshot.State),
+            StateText = StateLabel(snapshot),
             NodeText = String.IsNullOrWhiteSpace(snapshot.ActualNode) ? "尚未检测" : snapshot.ActualNode,
             DecisionText = String.IsNullOrWhiteSpace(snapshot.Decision) ? "等待检测" : StatusReport.DecisionText(snapshot.Decision),
             ResponseText = ResponseLabel(snapshot)
@@ -181,9 +214,10 @@ public sealed class MonitorPresentation
         if ((service.Service == ServiceKind.ChatGPT || service.Service == ServiceKind.Gemini) &&
             service.Available && service.Evidence == ProbeFailureKind.None)
             return service.AccountVerified
-                ? "账号实测通过" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "") +
+                ? "真实对话已验证" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "") +
                     " · 有效至 " + service.AccountVerifiedUtc.AddDays(30).ToString("MM-dd")
-                : "登录链路正常" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "") + " · 账号待实测";
+                : "网络链路兼容 · 真实对话待验证" +
+                    (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "");
         return service.Available ? "探测通过" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "") : "探测失败";
     }
 
@@ -204,9 +238,12 @@ public sealed class MonitorPresentation
         }
     }
 
-    private static string StateLabel(MonitorRunState state)
+    private static string StateLabel(MonitorSnapshot snapshot)
     {
-        switch (state)
+        if (snapshot.BrowserStatus == BrowserVerificationStatus.Running) return "正在验证 AI 对话";
+        if (snapshot.BrowserStatus == BrowserVerificationStatus.SignInRequired) return "需要浏览器登录";
+        if (snapshot.BrowserStatus == BrowserVerificationStatus.AutomationUnsupported) return "浏览器自动化暂不支持";
+        switch (snapshot.State)
         {
             case MonitorRunState.Running: return "运行正常";
             case MonitorRunState.Checking: return "正在检测";

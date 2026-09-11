@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Linq;
 
 public interface IMonitorCycleRunner
 {
@@ -23,6 +24,8 @@ public interface IAccountVerificationRunner : IMonitorCycleRunner
 {
     bool RecordAccountVerification(string node, string exitFingerprint,
         IEnumerable<ServiceKind> services, DateTime verifiedUtc);
+    bool RecordBrowserConversationProof(string node, string exitFingerprint,
+        ServiceKind service, DateTime verifiedUtc, int protocolVersion);
     void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc);
 }
 
@@ -45,10 +48,15 @@ public sealed class MonitorCoordinator : IDisposable
     private readonly TimeSpan interval;
     private readonly TimeSpan watchdog;
     private readonly AutoResetEvent wake = new AutoResetEvent(false);
+    private readonly AutoResetEvent browserWake = new AutoResetEvent(false);
     private readonly object snapshotGate = new object();
     private readonly object preferencesGate = new object();
     private readonly object accountCommandGate = new object();
+    private readonly object browserStatusGate = new object();
     private readonly List<Action<IAccountVerificationRunner>> accountCommands = new List<Action<IAccountVerificationRunner>>();
+    private readonly BrowserConversationCoordinator browserCoordinator;
+    private readonly IClock clock;
+    private readonly TimeSpan browserPollWait;
     private Thread thread;
     private MonitorSnapshot latest;
     private UserPreferences preferences = UserPreferences.Defaults();
@@ -59,8 +67,12 @@ public sealed class MonitorCoordinator : IDisposable
     private int stopping;
     private int cancelCycle;
     private readonly bool persistStatistics;
+    private BrowserVerificationStatus browserStatus = BrowserVerificationStatus.None;
+    private string browserStatusDetail = "";
 
-    public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog, bool persistStatistics = false)
+    public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog,
+        bool persistStatistics = false, IClock clock = null, IChallengeSource challengeSource = null,
+        TimeSpan? browserPollWait = null)
     {
         if (runner == null) throw new ArgumentNullException("runner");
         if (interval <= TimeSpan.Zero) throw new ArgumentOutOfRangeException("interval");
@@ -69,6 +81,12 @@ public sealed class MonitorCoordinator : IDisposable
         this.interval = interval;
         this.watchdog = watchdog;
         this.persistStatistics = persistStatistics;
+        this.clock = clock ?? new SystemClock();
+        this.browserPollWait = browserPollWait ?? TimeSpan.FromSeconds(25);
+        if (this.browserPollWait <= TimeSpan.Zero || this.browserPollWait > TimeSpan.FromSeconds(25))
+            throw new ArgumentOutOfRangeException("browserPollWait");
+        browserCoordinator = new BrowserConversationCoordinator(this.clock,
+            challengeSource ?? new CryptographicChallengeSource());
         latest = MonitorSnapshot.CreateState(MonitorRunState.Starting, "正在启动", DateTime.MinValue, DateTime.MaxValue);
         var progressive = runner as IProgressCycleRunner;
         if (progressive != null)
@@ -124,6 +142,87 @@ public sealed class MonitorCoordinator : IDisposable
         RequestCheck();
     }
 
+    public BrowserVerificationStart StartBrowserVerification(bool userInitiated)
+    {
+        MonitorSnapshot snapshot = Latest;
+        BrowserVerificationStart started = browserCoordinator.StartCurrent(snapshot,
+            EligibleAiServices(snapshot), userInitiated);
+        if (started == BrowserVerificationStart.Started)
+        {
+            PublishBrowserStatus(BrowserVerificationStatus.Running, "正在进行真实对话验证");
+            browserWake.Set();
+        }
+        else if (started == BrowserVerificationStart.CompanionOffline)
+            PublishBrowserStatus(BrowserVerificationStatus.CompanionOffline, "浏览器扩展未连接");
+        return started;
+    }
+
+    public BrowserBridgeMessage HandleBrowserMessage(BrowserBridgeMessage request)
+    {
+        if (!BrowserMessageValidator.IsValidRequest(request))
+            return BrowserResponse("error", request == null ? null : request.RequestId, "invalid-request");
+        DateTime now = clock.UtcNow;
+        if (String.Equals(request.Type, "hello", StringComparison.Ordinal))
+        {
+            browserCoordinator.ObserveCompanion(request.Browser, now);
+            PublishBrowserStatus(BrowserVerificationStatus.Ready, request.Browser + " 浏览器扩展已连接");
+            TryStartAutomaticBrowserVerification(Latest);
+            return BrowserResponse("ready", request.RequestId, null);
+        }
+        if (String.Equals(request.Type, "poll", StringComparison.Ordinal))
+        {
+            browserCoordinator.ObserveCompanion(request.Browser, now);
+            BrowserVerificationTask task = browserCoordinator.Poll(request.Browser, now);
+            if (task == null && Volatile.Read(ref stopping) == 0)
+            {
+                browserWake.WaitOne(browserPollWait);
+                now = clock.UtcNow;
+                task = browserCoordinator.Poll(request.Browser, now);
+            }
+            return task == null ? BrowserResponse("idle", request.RequestId, null) : BrowserTaskResponse(request, task);
+        }
+        if (String.Equals(request.Type, "cancel", StringComparison.Ordinal))
+        {
+            bool cancelled = browserCoordinator.Cancel(request.TaskId);
+            if (cancelled) PublishBrowserStatus(BrowserVerificationStatus.Cancelled, "浏览器验证已取消");
+            browserWake.Set();
+            return BrowserResponse(cancelled ? "ack" : "error", request.RequestId,
+                cancelled ? null : "unknown-task");
+        }
+
+        BrowserVerificationOutcome outcome;
+        ServiceKind service;
+        if (!Enum.TryParse(request.Outcome, false, out outcome) ||
+            !Enum.TryParse(request.Service, false, out service))
+            return BrowserResponse("error", request.RequestId, "invalid-result");
+        var result = new BrowserVerificationResult {
+            TaskId = request.TaskId,
+            Service = service,
+            Challenge = request.Challenge,
+            Outcome = outcome,
+            MessageSent = request.MessageSent,
+            ElapsedMilliseconds = request.ElapsedMilliseconds
+        };
+        MonitorSnapshot current = Latest;
+        BrowserVerificationAcceptance acceptance = browserCoordinator.Accept(result, current, now);
+        if (acceptance != BrowserVerificationAcceptance.Accepted)
+        {
+            if (acceptance == BrowserVerificationAcceptance.Drifted)
+                PublishBrowserStatus(BrowserVerificationStatus.Cancelled, "节点或出口已变化，请重新验证");
+            browserWake.Set();
+            return BrowserResponse("error", request.RequestId,
+                acceptance.ToString().ToLowerInvariant());
+        }
+
+        PublishBrowserOutcome(result);
+        if (result.Outcome == BrowserVerificationOutcome.Passed)
+            QueueBrowserProof(current.ActualNode, current.ExitFingerprint, result.Service, now);
+        else if (BrowserConversationCoordinator.IsRollbackEligible(result))
+            QueueBrowserFailure(current.ActualNode, result.Service, now);
+        browserWake.Set();
+        return BrowserResponse("ack", request.RequestId, null);
+    }
+
     public AccountVerificationSession BeginAccountVerification()
     {
         bool wasPaused = Volatile.Read(ref paused) != 0;
@@ -176,6 +275,7 @@ public sealed class MonitorCoordinator : IDisposable
         if (value == null || value.RequiredServices == null || value.RequiredServices.Count == 0)
             throw new ArgumentException("At least one required service is needed.", "value");
         lock (preferencesGate) preferences = Copy(value);
+        browserCoordinator.SetConsent(value.BrowserConversationVerification);
         RequestCheck();
     }
 
@@ -245,6 +345,7 @@ public sealed class MonitorCoordinator : IDisposable
             else if (cycle.IsCompleted && cycle.Result != null)
             {
                 Publish(cycle.Result, cycle.Result.State == MonitorRunState.Degraded || cycle.Result.State == MonitorRunState.Stuck);
+                TryStartAutomaticBrowserVerification(cycle.Result);
             }
             RunStatistics.CycleCompleted(Latest.State, elapsed.Elapsed.TotalSeconds);
             if (persistStatistics) RunStatistics.SaveLocal();
@@ -278,6 +379,7 @@ public sealed class MonitorCoordinator : IDisposable
 
     private void Publish(MonitorSnapshot value, bool attention)
     {
+        lock (browserStatusGate) value = value.WithBrowserStatus(browserStatus, browserStatusDetail);
         bool emitAttention = false;
         lock (snapshotGate)
         {
@@ -297,6 +399,110 @@ public sealed class MonitorCoordinator : IDisposable
             Action<MonitorSnapshot> required = AttentionRequired;
             if (required != null) required(value);
         }
+    }
+
+    private void TryStartAutomaticBrowserVerification(MonitorSnapshot snapshot)
+    {
+        UserPreferences current;
+        lock (preferencesGate) current = Copy(preferences);
+        if (!current.BrowserConversationVerification || snapshot == null) return;
+        BrowserVerificationStart started = browserCoordinator.StartCurrent(snapshot,
+            EligibleAiServices(snapshot), false);
+        if (started == BrowserVerificationStart.Started)
+        {
+            PublishBrowserStatus(BrowserVerificationStatus.Running, "正在进行真实对话验证");
+            browserWake.Set();
+        }
+    }
+
+    private IEnumerable<ServiceKind> EligibleAiServices(MonitorSnapshot snapshot)
+    {
+        UserPreferences current;
+        lock (preferencesGate) current = Copy(preferences);
+        if (snapshot == null || snapshot.Services == null) return new ServiceKind[0];
+        var available = new HashSet<ServiceKind>(snapshot.Services.Where(x =>
+            (x.Service == ServiceKind.ChatGPT || x.Service == ServiceKind.Gemini) &&
+            x.Available && x.Evidence == ProbeFailureKind.None && !x.AccountVerified).Select(x => x.Service));
+        return current.RequiredServices.Where(available.Contains).ToList();
+    }
+
+    private void QueueBrowserProof(string node, string exitFingerprint, ServiceKind service, DateTime verifiedUtc)
+    {
+        lock (accountCommandGate)
+            accountCommands.Add(value => {
+                if (!value.RecordBrowserConversationProof(node, exitFingerprint, service, verifiedUtc,
+                    BrowserConversationProof.CurrentProtocolVersion))
+                    throw new InvalidOperationException("节点、出口或登录链路已经变化，请重新验证");
+            });
+        RequestCheck();
+    }
+
+    private void QueueBrowserFailure(string node, ServiceKind service, DateTime reportedUtc)
+    {
+        lock (accountCommandGate)
+            accountCommands.Add(value => value.ReportServiceFailure(node, service, reportedUtc));
+        RequestCheck();
+    }
+
+    private void PublishBrowserOutcome(BrowserVerificationResult result)
+    {
+        BrowserVerificationStatus status;
+        string detail;
+        switch (result.Outcome)
+        {
+            case BrowserVerificationOutcome.Passed:
+                status = BrowserVerificationStatus.Passed; detail = "真实对话已通过，正在复检网络链路"; break;
+            case BrowserVerificationOutcome.SignInRequired:
+                status = BrowserVerificationStatus.SignInRequired; detail = "需要先在浏览器中登录"; break;
+            case BrowserVerificationOutcome.ChallengeRequired:
+                status = BrowserVerificationStatus.ChallengeRequired; detail = "网页要求完成验证码或安全挑战"; break;
+            case BrowserVerificationOutcome.AutomationUnsupported:
+                status = BrowserVerificationStatus.AutomationUnsupported; detail = "网页结构暂不受支持"; break;
+            case BrowserVerificationOutcome.ConversationError:
+                status = BrowserVerificationStatus.ConversationError; detail = "消息已发送，但服务返回明确错误"; break;
+            case BrowserVerificationOutcome.GenerationTimeout:
+                status = BrowserVerificationStatus.GenerationTimeout; detail = "消息已发送，但等待回复超时"; break;
+            default:
+                status = BrowserVerificationStatus.Cancelled; detail = "浏览器验证已取消"; break;
+        }
+        PublishBrowserStatus(status, detail);
+    }
+
+    private void PublishBrowserStatus(BrowserVerificationStatus status, string detail)
+    {
+        lock (browserStatusGate)
+        {
+            browserStatus = status;
+            browserStatusDetail = detail ?? "";
+        }
+        Publish(Latest.WithBrowserStatus(status, detail), false);
+    }
+
+    private static BrowserBridgeMessage BrowserTaskResponse(BrowserBridgeMessage request,
+        BrowserVerificationTask task)
+    {
+        return new BrowserBridgeMessage {
+            Type = "run",
+            ProtocolVersion = BrowserNativeProtocol.ProtocolVersion,
+            RequestId = request.RequestId,
+            TaskId = task.TaskId,
+            Service = task.Service.ToString(),
+            Node = task.Node,
+            Challenge = task.Challenge,
+            Url = task.Service == ServiceKind.ChatGPT ? "https://chatgpt.com/" : "https://gemini.google.com/app",
+            Prompt = "Reply with exactly this token and nothing else: " + task.Challenge,
+            ExpiresUtc = task.ExpiresUtc.ToUniversalTime().ToString("o")
+        };
+    }
+
+    private static BrowserBridgeMessage BrowserResponse(string type, string requestId, string error)
+    {
+        return new BrowserBridgeMessage {
+            Type = type,
+            ProtocolVersion = BrowserNativeProtocol.ProtocolVersion,
+            RequestId = requestId,
+            Error = error
+        };
     }
 
     private static bool WaitWithoutThrowing(Task task, TimeSpan timeout)
@@ -319,8 +525,13 @@ public sealed class MonitorCoordinator : IDisposable
     {
         if (Interlocked.Exchange(ref stopping, 1) != 0) return;
         wake.Set();
+        browserWake.Set();
         var progressive = runner as IProgressCycleRunner;
         if (progressive != null) progressive.Progress -= OnProgress;
-        if (thread == null || thread.Join(TimeSpan.FromSeconds(2))) wake.Dispose();
+        if (thread == null || thread.Join(TimeSpan.FromSeconds(2)))
+        {
+            wake.Dispose();
+            browserWake.Dispose();
+        }
     }
 }
