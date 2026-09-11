@@ -13,7 +13,7 @@ Clash Compatibility Monitor keeps a working node in place, performs conservative
 ## Why use it
 
 - Discovers actual leaf nodes from `proxies`, `proxy-providers`, and mixed subscription layouts without relying on region names.
-- Checks selected services including ChatGPT, Gemini, Google, GitHub, Steam, Discord, Spotify, Epic, and optional JMComic web reachability.
+- Checks selected services including ChatGPT, Gemini, Google, GitHub, Steam, Discord, Spotify, and Epic.
 - Requires five observations spanning at least 30 minutes with a success rate of 95% or higher before a performance-only switch.
 - Keeps two recent standbys, observes every automatic switch, and can safely roll back.
 - Does not modify Clash configuration files, take ownership of subscriptions, inspect browser history, or upload telemetry.
@@ -34,7 +34,9 @@ The installer only selects nodes in the generated proxy group. It does not edit 
 
 ## Evidence boundaries
 
-HTTP reachability cannot prove that a signed-in ChatGPT conversation, Gemini generation, account state, or a complete web application flow works. Challenge and login pages are shown as basic reachability rather than full compatibility. JMComic probing is opt-in and currently targets `https://18comic.vip/`, whose domain may change independently of this project.
+The monitor separates entry reachability, login-chain evidence, and account verification. For ChatGPT and Gemini it checks both the application entry and official authentication infrastructure; a challenge page alone is not full compatibility. The optional local verification dialog opens only the official ChatGPT and Gemini pages. After the user signs in and sends one minimal message, the result is bound to the node and an encrypted exit fingerprint for 30 days. The application does not read cookies, accounts, prompts, replies, or browser state.
+
+Anonymous probes and displayed HTTP latency still cannot measure actual model-generation latency or guarantee future account behavior. A performance-only AI switch requires strict probe evidence, the user's account verification, five successful-history observations spanning 30 minutes at 95% or better, a five-sample median at or below 800 ms, no sample or selected-service response above 1500 ms, and jitter at or below 150 ms.
 
 Steam game traffic and downloads continue to follow the user's existing Clash direct-routing rules.
 

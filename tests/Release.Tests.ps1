@@ -6,7 +6,7 @@ $required = @(
     'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1',
     '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
     '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml',
-    'assets\social-preview.png', 'docs\images\service-incident-flow.png'
+    'assets\social-preview.png', 'docs\images\service-incident-flow.png', 'docs\release-notes\v0.6.1.md'
 )
 foreach ($relative in $required) {
     $path = Join-Path $root $relative
@@ -15,6 +15,10 @@ foreach ($relative in $required) {
 $packageScript = Get-Content -LiteralPath (Join-Path $root 'package-release.ps1') -Raw
 $installScript = Get-Content -LiteralPath (Join-Path $root 'scripts\install.ps1') -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
+$readmeEn = Get-Content -LiteralPath (Join-Path $root 'README.en.md') -Raw -Encoding UTF8
+$quickStart = Get-Content -LiteralPath (Join-Path $root 'QUICKSTART.md') -Raw -Encoding UTF8
+$contributing = Get-Content -LiteralPath (Join-Path $root 'CONTRIBUTING.md') -Raw -Encoding UTF8
+$releaseNotes = Get-Content -LiteralPath (Join-Path $root 'docs\release-notes\v0.6.1.md') -Raw -Encoding UTF8
 $program = Get-Content -LiteralPath (Join-Path $root 'src\Program.cs') -Raw
 $trayHost = Get-Content -LiteralPath (Join-Path $root 'src\TrayHost.cs') -Raw
 $detailsForm = Get-Content -LiteralPath (Join-Path $root 'src\DetailsForm.cs') -Raw
@@ -38,7 +42,7 @@ try {
 if (!$readme.Contains('docs/images/service-incident-flow.png')) {
     throw 'README does not link the service incident flow image.'
 }
-if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.0')) { throw 'Release package version is not v0.6.0.' }
+if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.1')) { throw 'Release package version is not v0.6.1.' }
 $checksumAssignment = '$checksumFile = $zip + ''.sha256'''
 $checksumFormat = '$archiveHash + ''  '' + (Split-Path -Leaf $zip)'
 if (!$packageScript.Contains($checksumAssignment) -or
@@ -50,12 +54,12 @@ if (!$packageScript.Contains($checksumAssignment) -or
 if (!$packageScript.Contains('docs\images') -or !$packageScript.Contains('service-incident-flow.png')) {
     throw 'Release package does not include the README flow image.'
 }
-if (!$installScript.Contains("Version='0.6.0'")) { throw 'Installer status version is not v0.6.0.' }
+if (!$installScript.Contains("Version='0.6.1'")) { throw 'Installer status version is not v0.6.1.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }
-if (!$readme.Contains('v0.6.0') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
+if (!$readme.Contains('v0.6.1') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
     !$program.Contains('InstanceActivation.TryOwn') -or !$trayHost.Contains('NotifyIcon')) {
-    throw 'README does not describe v0.6.0 tray and intent behavior.'
+    throw 'README does not describe v0.6.1 tray and intent behavior.'
 }
 $stabilityFirst = ([char[]](0x7A33,0x5B9A,0x4F18,0x5148,0x7684,0x20,0x43,0x6C,0x61,0x73,0x68,0x2F,0x4D,0x69,0x68,0x6F,0x6D,0x6F,0x20,0x57,0x69,0x6E,0x64,0x6F,0x77,0x73,0x20,0x8282,0x70B9,0x5B88,0x62A4,0x7A0B,0x5E8F)) -join ''
 $doesNotModify = ([char[]](0x4E0D,0x4FEE,0x6539,0x20,0x43,0x6C,0x61,0x73,0x68,0x20,0x914D,0x7F6E,0x6587,0x4EF6)) -join ''
@@ -72,8 +76,19 @@ if (!$readme.Contains($twoRecentStandbys) -or !$readme.Contains($sameFailure) -o
     !$readme.Contains($notAttributed)) {
     throw 'README does not describe the v0.6.0 service incident circuit.'
 }
-if (!$readme.Contains('JMComic') -or !$readme.Contains('18comic.vip')) {
-    throw 'README does not describe the opt-in JMComic web probe.'
+$accountProof = ([char[]](0x8D26,0x53F7,0x5B9E,0x6D4B)) -join ''
+$loginChain = ([char[]](0x767B,0x5F55,0x94FE,0x8DEF)) -join ''
+$noCookieRead = (([char[]](0x4E0D,0x8BFB,0x53D6)) -join '') + ' Cookie'
+if (!$readme.Contains($accountProof) -or !$readme.Contains($loginChain) -or !$readme.Contains($noCookieRead)) {
+    throw 'README does not explain account verification, login-chain evidence, and browser privacy.'
+}
+$currentDocs = $readme + $readmeEn + $quickStart + $contributing
+if ($currentDocs -match '(?i)JMComic|18comic') {
+    throw 'Current user-facing documentation still advertises the retired JMComic probe.'
+}
+$removed = ([char[]](0x79FB,0x9664)) -join ''
+if (!$releaseNotes.Contains('JMComic') -or !$releaseNotes.Contains($removed)) {
+    throw 'Release notes do not explain the JMComic retirement.'
 }
 if (!$security.Contains('Security Advisory') -or !$conduct.Contains('Contributor Covenant')) {
     throw 'Repository security or conduct policy is incomplete.'
@@ -96,7 +111,8 @@ if (!$readme.Contains($fiveChecks) -or !$readme.Contains($thirtyMinutes) -or !$r
 if (!$readme.Contains('500 ms') -or !$readme.Contains('1500 ms')) {
     throw 'README does not describe the HTTP response quality bands.'
 }
-if (!$readme.Contains('P95') -or !$readme.Contains('800 ms') -or !$readme.Contains('150 ms') -or !$readme.Contains('1000 ms')) {
+$median = ([char[]](0x4E2D,0x4F4D,0x6570)) -join ''
+if (!$readme.Contains($median) -or !$readme.Contains('800 ms') -or !$readme.Contains('150 ms') -or !$readme.Contains('1500 ms')) {
     throw 'README does not describe robust latency and per-service gates.'
 }
 if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf) -or

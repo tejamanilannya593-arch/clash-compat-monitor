@@ -58,6 +58,7 @@ public sealed class UserPreferenceStore
             var services = new List<ServiceKind>();
             foreach (string name in serviceValue.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
             {
+                if (String.Equals(name, "JMComicWeb", StringComparison.Ordinal)) continue;
                 ServiceKind service;
                 if (!Enum.TryParse(name, false, out service) || !Enum.IsDefined(typeof(ServiceKind), service))
                     throw new InvalidDataException("Preferences contain an unknown service.");

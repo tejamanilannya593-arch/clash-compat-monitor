@@ -2,7 +2,7 @@
 
 项目目前最需要不同订阅、Clash Verge Rev 版本和 Windows 缩放环境下的真实验证。提交问题前请先运行发布包中的 `Diagnose.cmd`，并确认问题可以重复出现。
 
-问题报告请包含 Windows 版本、Clash Verge Rev 版本、程序版本、复现步骤、预期结果和实际结果。可以附上“运行统计”手动导出的 JSON。不要上传 Clash 配置、订阅链接、完整日志或 `experience.json`；这些内容可能暴露节点名称、控制器密钥或供应商信息。
+问题报告请包含 Windows 版本、Clash Verge Rev 版本、程序版本、复现步骤、预期结果和实际结果。涉及 AI 服务时，请区分入口可达、登录链路探测结果和用户账号实测结果。可以附上“运行统计”手动导出的 JSON。不要上传 Clash 配置、订阅链接、完整日志或 `experience.json`；不要提供 Cookie、账号、消息或回复，这些内容既不需要也可能泄露隐私。
 
 代码修改应保持以下边界：不接管订阅、不上传遥测、不根据地区名称直接排除节点、Steam 游戏和下载维持现有直连规则。运行 `build.ps1`、`clash/enhancement.test.js` 和 `tests/Release.Tests.ps1` 后再提交变更。
 

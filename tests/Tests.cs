@@ -40,7 +40,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.0", MonitorIdentity.Version, "release version");
+        Equal("0.6.1", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         CandidateFiltering();
         PipeHttpDecoding();
@@ -52,14 +52,195 @@ internal static class Tests
         StabilityAndState();
         RuntimeGuards();
         UserPreferenceBehavior();
+        AccountVerificationUiBehavior();
         MonitorCoordinatorBehavior();
         InstanceActivationBehavior();
         CommandLineBehavior();
         StatusReporting();
         ExperienceBehavior();
         ServiceIncidentBehavior();
+        ServiceEvidenceBehavior();
+        LoginChainEvidenceBehavior();
+        AccountVerificationBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void ServiceEvidenceBehavior()
+    {
+        var strict = new CandidateScanResult("strict", CandidateHealth.Compatible, null, "ok");
+        var reachable = new CandidateScanResult("reachable", CandidateHealth.BasicCompatible, null, "challenge");
+        Equal(true, ServiceEvidencePolicy.CanHold(strict), "strict scan can hold");
+        Equal(true, ServiceEvidencePolicy.CanHold(reachable), "reachable scan can hold without churn");
+        Equal(true, ServiceEvidencePolicy.CanEmergencySwitch(strict), "strict scan can be emergency target");
+        Equal(false, ServiceEvidencePolicy.CanEmergencySwitch(reachable), "reachable-only scan cannot be emergency target");
+
+        var assurance = new ConnectionAssurance();
+        assurance.Remember(reachable, "current", DateTime.UtcNow);
+        Equal(0, assurance.Standbys.Count, "reachable-only scan cannot enter standby pool");
+        assurance.Remember(strict, "current", DateTime.UtcNow);
+        Equal(1, assurance.Standbys.Count, "strict scan enters standby pool");
+
+        var state = new HealthState("scope");
+        state.RememberPreferred("partial", CandidateHealth.BasicCompatible, DateTime.UtcNow);
+        Equal("", state.PreferredNode, "reachable-only scan is not persisted as preferred");
+    }
+
+    private static void LoginChainEvidenceBehavior()
+    {
+        ProbeResult app = ProbeResult.Success(300);
+        ProbeResult auth = ProbeResult.Success(400);
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.ChatGPT, app, auth).FailureKind,
+            "chatgpt app and auth success is login ready");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.ChatGPT,
+                ProbeResult.Partial("challenge", 200), auth).FailureKind,
+            "chatgpt challenge stays reachable only");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.Gemini,
+                ProbeResult.LoginRedirect("accounts.google.com", 200), auth).FailureKind,
+            "gemini exact login redirect plus auth success is login ready");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.CombineLoginChain(ServiceKind.Gemini,
+                ProbeResult.Partial("unclassified page", 200), auth).FailureKind,
+            "generic partial page cannot become login ready");
+        Equal("https://auth.openai.com/.well-known/openid-configuration", HttpServiceProbe.AuthenticationEndpoint(ServiceKind.ChatGPT).AbsoluteUri,
+            "chatgpt authentication endpoint");
+        Equal("https://accounts.google.com/.well-known/openid-configuration", HttpServiceProbe.AuthenticationEndpoint(ServiceKind.Gemini).AbsoluteUri,
+            "gemini authentication endpoint");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.ChatGPT, 200, "<html>ChatGPT</html>", null, 100).FailureKind,
+            "chatgpt application page is raw login-chain success");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.ChatGPT, 403, "cf-chl", null, 100).FailureKind,
+            "chatgpt challenge cannot become login ready");
+        Equal(ProbeFailureKind.LoginRedirect,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.Gemini, 302, "",
+                new Uri("https://accounts.google.com/ServiceLogin"), 100).FailureKind,
+            "gemini exact authentication redirect is trusted intermediate evidence");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateApplicationResponse(ServiceKind.Gemini, 302, "",
+                new Uri("https://accounts.google.com.evil.example/"), 100).FailureKind,
+            "gemini lookalike authentication redirect is rejected");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
+                "{\"issuer\":\"https://auth.openai.com\"}", 100).FailureKind,
+            "chatgpt OpenID issuer proves authentication infrastructure");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
+                "<html>captive portal</html>", 100).FailureKind,
+            "generic page cannot prove authentication infrastructure");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
+                "{\"issuer\":\"https://auth.openai.com.evil.example\"}", 100).FailureKind,
+            "lookalike OpenID issuer cannot prove authentication infrastructure");
+
+        Equal(false, ChatGptSupportedRegions.Contains("HK"), "actual Hong Kong exit is ChatGPT region risk");
+        Equal(true, ChatGptSupportedRegions.Contains("JP"), "Japan is in dated ChatGPT support snapshot");
+        Equal(true, ChatGptSupportedRegions.Contains("SG"), "Singapore is in dated ChatGPT support snapshot");
+        Equal(true, ChatGptSupportedRegions.Contains("TW"), "Taiwan is in dated ChatGPT support snapshot");
+        Equal(false, ChatGptSupportedRegions.Contains(""), "unknown exit is not assumed supported");
+
+        ExitIdentity identity = ExitIdentityParser.Parse("ip=203.0.113.8\nloc=JP\ncolo=NRT\n", new byte[] { 1, 2, 3 });
+        Equal("JP", identity.CountryCode, "trace country parsed");
+        Equal(false, identity.Fingerprint.Contains("203.0.113.8"), "fingerprint hides raw exit IP");
+        Equal(identity.Fingerprint,
+            ExitIdentityParser.Parse("ip=203.0.113.8\nloc=JP\n", new byte[] { 1, 2, 3 }).Fingerprint,
+            "same exit and key have stable fingerprint");
+
+        var probe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        CandidateScanResult supported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("exit-jp", "JP", "ok")))
+            .ScanSelected(new CandidateNode("香港名称但日本出口", 1), new[] { ServiceKind.ChatGPT });
+        Equal(CandidateHealth.Compatible, supported.Health, "actual supported exit wins over node label");
+        Equal("JP", supported.ExitCountryCode, "scan carries actual exit country");
+        Equal("exit-jp", supported.ExitFingerprint, "scan carries encrypted exit fingerprint");
+        Equal("exit-jp", MonitorSnapshot.CreateRunning(supported.Name, supported, null, "ok",
+            DateTime.UtcNow, DateTime.UtcNow).ExitFingerprint, "snapshot carries exit fingerprint for user verification");
+
+        CandidateScanResult unsupported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("exit-hk", "HK", "ok")))
+            .ScanSelected(new CandidateNode("日本名称但香港出口", 1), new[] { ServiceKind.ChatGPT });
+        Equal(CandidateHealth.RegionBlocked, unsupported.Health, "actual Hong Kong exit blocks ChatGPT switch evidence");
+        Equal(ServiceKind.ChatGPT, unsupported.FailedService.Value, "region gate identifies ChatGPT");
+    }
+
+    private static void AccountVerificationBehavior()
+    {
+        var data = new ExperienceData();
+        DateTime now = new DateTime(2026, 9, 11, 0, 0, 0, DateTimeKind.Utc);
+        AccountVerificationMemory.Mark(data, "scope", "node", "fingerprint", ServiceKind.ChatGPT,
+            true, now, AccountVerificationMemory.CurrentRuleVersion);
+        Equal(true, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(29), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof valid for same exit before thirty days");
+        Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "changed",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof invalid after exit change");
+        Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(30), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof expires at thirty days");
+        Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion + 1),
+            "account proof invalid after evidence rule upgrade");
+
+        var strict = new CandidateScanResult("node", CandidateHealth.Compatible, null, "ok", 200, 2,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(100) },
+                { ServiceKind.Gemini, ProbeResult.Success(100) }
+            }, "fingerprint", "JP");
+        Equal(false, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "quality switch waits for every selected AI account proof");
+        AccountVerificationMemory.Mark(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
+            true, now, AccountVerificationMemory.CurrentRuleVersion);
+        Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "quality switch accepts current exit after both AI proofs");
+        Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, new ExperienceData(), "scope",
+            new[] { ServiceKind.Google, ServiceKind.GitHub }, now),
+            "non-AI configuration does not require account proof");
+        Equal(false, ServiceEvidencePolicy.CanRestoreAfterReload(strict, new ExperienceData(), "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "reload recovery cannot proactively select unverified AI target");
+        Equal(true, ServiceEvidencePolicy.CanRestoreAfterReload(strict, data, "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "reload recovery accepts account-verified AI target");
+
+        string path = Path.Combine(Path.GetTempPath(), "account-proof-" + Guid.NewGuid().ToString("N"), "experience.json");
+        var store = new ExperienceStore(path);
+        store.Save(data, now);
+        ExperienceData loaded = store.Load();
+        Equal(true, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof survives restart");
+        Equal(false, File.ReadAllText(path).Contains("203.0.113.8"), "account proof store contains no raw exit IP");
+
+        AccountVerificationMemory.Revoke(loaded, "scope", "node", ServiceKind.ChatGPT,
+            now.AddDays(1), "explicit failure");
+        Equal(false, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
+            "explicit failure revokes account proof");
+
+        string workerRoot = Path.Combine(Path.GetTempPath(), "account-worker-" + Guid.NewGuid().ToString("N"));
+        var workerData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        var workerStore = new ExperienceStore(Path.Combine(workerRoot, "state", "experience.json"));
+        workerStore.Save(workerData, now);
+        var workerConfig = new MonitorConfiguration { RootPath = workerRoot, SharedGroup = "shared", ProbeGroup = "probe" };
+        var workerMihomo = new VerificationMihomo("node", new[] { "node" });
+        var worker = new MonitorWorker(workerConfig, workerMihomo,
+            new FakeProbe { DefaultResult = ProbeResult.Success(100) },
+            new BoundedLogger(Path.Combine(workerRoot, "logs", "monitor.log"), 1024 * 1024),
+            new FakeClock { UtcNow = now },
+            new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
+        Equal(false, worker.RecordAccountVerification("node", "stale-exit",
+            new[] { ServiceKind.ChatGPT }, now), "worker rejects account proof after exit changed");
+        Equal(true, worker.RecordAccountVerification("node", "fresh-exit",
+            new[] { ServiceKind.ChatGPT }, now), "worker accepts proof after fresh login-chain and exit check");
+        Equal(true, AccountVerificationMemory.IsValid(workerStore.Load(), "scope", "node", "fresh-exit",
+            ServiceKind.ChatGPT, now, AccountVerificationMemory.CurrentRuleVersion),
+            "worker persists freshly revalidated account proof");
     }
 
     private static void AssuranceBehavior()
@@ -67,7 +248,7 @@ internal static class Tests
         DateTime now = DateTime.UtcNow;
         var policy = new ConnectionAssurance();
         policy.SetScope("scope");
-        var healthy = new CandidateScanResult("b", CandidateHealth.BasicCompatible, null, "ok", 100, 1);
+        var healthy = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 100, 1);
         var bad = new CandidateScanResult("b", CandidateHealth.Transient, null, "timeout");
         policy.Remember(healthy, "a", now);
         Equal(1, policy.Available(new[] { "a", "b" }, "a", now).Length, "fresh standby available");
@@ -83,6 +264,12 @@ internal static class Tests
         policy.Begin("a", "b", 100, false);
         Equal(false, policy.NeedsRollback(bad), "failure switch first failure stays");
         Equal(true, policy.NeedsRollback(bad), "failure switch second failure requests rollback verification");
+        policy.Begin("a", "b", 100, false, true);
+        Equal(true, policy.NeedsRollback(bad), "unproven emergency target first explicit failure requests rollback verification");
+        policy.Begin("a", "b", 100, false, true, now);
+        Equal(true, policy.CanUserFeedbackRollback("b", now.AddMinutes(1)), "recent active switch permits feedback rollback");
+        Equal(false, policy.CanUserFeedbackRollback("manual", now.AddMinutes(1)), "manual node cannot use stale rollback origin");
+        Equal(false, policy.CanUserFeedbackRollback("b", now.AddMinutes(11)), "expired switch transaction cannot use rollback origin");
         policy.Begin("a", "b", 100, true);
         var slow = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 200, 1);
         Equal(false, policy.NeedsRollback(slow), "one slow response does not roll back");
@@ -105,7 +292,7 @@ internal static class Tests
     private static void ServiceIncidentBehavior()
     {
         DateTime now = new DateTime(2026, 9, 10, 0, 0, 0, DateTimeKind.Utc);
-        ServiceKind service = ServiceKind.JMComicWeb;
+        ServiceKind service = ServiceKind.Discord;
         var current = IncidentScan("current", service, ProbeFailureKind.Service);
         var sameA = IncidentScan("a", service, ProbeFailureKind.Service);
         var sameB = IncidentScan("b", service, ProbeFailureKind.Service);
@@ -132,10 +319,12 @@ internal static class Tests
         var remaining = ServiceIncidentPolicy.ServicesToProbe(new[] { ServiceKind.ChatGPT, service }, incidents, now.AddMinutes(1));
         Equal("ChatGPT", String.Join(",", remaining), "active incident is omitted while other services continue");
         var healthyOthers = new CandidateScanResult("current", CandidateHealth.Compatible, null, "ok", 40, 1,
-            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Success(40) } });
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Success(40) } }, "exit-fp", "JP");
         CandidateScanResult suppressed = ServiceIncidentPolicy.AttachSuppressed(healthyOthers, new[] { service });
         Equal(CandidateHealth.Unknown, suppressed.Health, "suppressed endpoint does not mark node healthy or failed");
         Equal(ProbeFailureKind.Unverified, suppressed.ServiceResults[service].FailureKind, "suppressed endpoint is explicit in evidence");
+        Equal("exit-fp", suppressed.ExitFingerprint, "service suppression preserves exit fingerprint");
+        Equal("JP", suppressed.ExitCountryCode, "service suppression preserves exit country");
         CandidateScanResult suppressedOwnFailure = ServiceIncidentPolicy.AttachSuppressed(current, new[] { service });
         Equal(CandidateHealth.Unknown, suppressedOwnFailure.Health, "suppressed endpoint clears its node failure attribution");
         var unrelatedFailure = IncidentScan("current", ServiceKind.ChatGPT, ProbeFailureKind.Transient);
@@ -187,8 +376,22 @@ internal static class Tests
             { Scope = legacyContinuity.ActiveScope, Node = x }));
         Equal("legacy|chatgpt,gemini", legacyContinuity.ResolveScope("new", new[] { "a", "b", "c", "d" }, "chatgpt,gemini"),
             "legacy experience infers subscription continuity during upgrade");
+        var jmMigration = new ExperienceData {
+            ActiveScope = "old|ChatGPT,JMComicWeb,GitHub",
+            ActiveServicesKey = "ChatGPT,JMComicWeb,GitHub",
+            ActiveCandidateNames = new List<string> { "a", "b" },
+            Assurance = new ConnectionAssurance { Scope = "old|ChatGPT,JMComicWeb,GitHub" }
+        };
+        jmMigration.Nodes.Add(new NodeExperience { Scope = jmMigration.ActiveScope, Node = "a" });
+        string migratedScope = jmMigration.ResolveScope("new", new[] { "a", "b" }, "ChatGPT,GitHub");
+        Equal("new|ChatGPT,GitHub", migratedScope, "JMComic removal rekeys but preserves remaining service history");
+        Equal(migratedScope, jmMigration.Nodes[0].Scope, "JMComic migration keeps node history reachable");
+        Equal(migratedScope, jmMigration.Assurance.Scope, "JMComic migration keeps assurance scope aligned");
         var memory = new ExperienceData();
-        var scan = new CandidateScanResult("stable", CandidateHealth.BasicCompatible, null, "partial", 100, 1);
+        var scan = new CandidateScanResult("stable", CandidateHealth.Compatible, null, "ok", 100, 1);
+        var partialMemory = new ExperienceData();
+        partialMemory.Observe("scope", new CandidateScanResult("partial", CandidateHealth.BasicCompatible, null, "challenge", 100, 1), null, now);
+        Equal(0, partialMemory.Nodes[0].SuccessfulSamples, "reachable-only evidence does not accumulate successful history");
         memory.Observe("scope", scan, null, now);
         memory.Observe("scope", scan, null, now.AddSeconds(1));
         Equal(1, memory.Nodes[0].Samples, "memory deduplicates same-cycle observations");
@@ -208,8 +411,8 @@ internal static class Tests
         for (int i = 0; i < 20; i++)
         {
             DateTime checkedUtc = now.AddMinutes(i * 2);
-            ninetyPercent.Observe("scope", new CandidateScanResult("ninety", i < 2 ? CandidateHealth.Transient : CandidateHealth.BasicCompatible, null, "sample"), null, checkedUtc);
-            ninetyFivePercent.Observe("scope", new CandidateScanResult("ninety-five", i == 0 ? CandidateHealth.Transient : CandidateHealth.BasicCompatible, null, "sample"), null, checkedUtc);
+            ninetyPercent.Observe("scope", new CandidateScanResult("ninety", i < 2 ? CandidateHealth.Transient : CandidateHealth.Compatible, null, "sample"), null, checkedUtc);
+            ninetyFivePercent.Observe("scope", new CandidateScanResult("ninety-five", i == 0 ? CandidateHealth.Transient : CandidateHealth.Compatible, null, "sample"), null, checkedUtc);
         }
         Equal(false, ninetyPercent.IsProvenStable("scope", "ninety", now.AddMinutes(38)), "ninety percent history cannot authorize quality switch");
         Equal(true, ninetyFivePercent.IsProvenStable("scope", "ninety-five", now.AddMinutes(38)), "ninety-five percent history authorizes quality switch");
@@ -399,13 +602,6 @@ internal static class Tests
         Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.ChatGPT, 403, "cf-chl", null, 1).FailureKind, "403 challenge is basic reachability");
         Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.ChatGPT, 403, "", null, 1, true).FailureKind, "challenge header is basic reachability");
         Equal(ProbeFailureKind.Region, HttpServiceProbe.EvaluateResponse(ServiceKind.ChatGPT, 403, "unsupported_country_region_territory", null, 1).FailureKind, "structured region error recognized");
-        Equal("https://18comic.vip/", HttpServiceProbe.Endpoint(ServiceKind.JMComicWeb).AbsoluteUri, "jmcomic web endpoint is fixed mirror");
-        Equal(ProbeFailureKind.None, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 200, "<html>JMComic</html>", null, 123).FailureKind, "jmcomic homepage success measured");
-        Equal(ProbeFailureKind.None, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 302, "", new Uri("https://another.example/"), 123).FailureKind, "jmcomic redirect is reachable");
-        Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 403, "Just a moment... cf-chl", null, 123).FailureKind, "jmcomic challenge is basic reachability");
-        Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 403, "", null, 123, true).FailureKind, "jmcomic challenge header is basic reachability");
-        Equal(ProbeFailureKind.Region, HttpServiceProbe.EvaluateResponse(ServiceKind.JMComicWeb, 403, "Restricted Access!", null, 123).FailureKind, "jmcomic explicit restriction is region failure");
-        Equal("JMComic 网页", MonitorPresentation.ServiceLabel(ServiceKind.JMComicWeb), "jmcomic service label");
         Equal(ProbeFailureKind.Partial, HttpServiceProbe.EvaluateResponse(ServiceKind.Gemini, 302, "", new Uri("https://accounts.google.com/ServiceLogin"), 1).FailureKind, "gemini login is basic reachability");
         Equal(ProbeFailureKind.Service, HttpServiceProbe.EvaluateResponse(ServiceKind.Gemini, 302, "", new Uri("https://accounts.google.com.evil.example/"), 1).FailureKind, "login host exact match");
         Equal("https://chatgpt.com/", HttpServiceProbe.Endpoint(ServiceKind.ChatGPT).AbsoluteUri, "application endpoint not trace");
@@ -446,6 +642,7 @@ internal static class Tests
         Equal(false, probe.Calls.Contains(ServiceKind.Epic), "inactive optional skipped");
         Equal(4096, HttpServiceProbe.LimitBody(new byte[6000]).Length, "response body cap");
         Equal(4096, HttpServiceProbe.ReadLimited(new MemoryStream(new byte[6000]), 4096).Length, "stream body cap");
+        Equal(120L, HttpServiceProbe.ResponseLatency(120, 900), "service latency uses response headers not body transfer");
         var bodyTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
         bool bodyCanceled = false;
         var bodyTimer = System.Diagnostics.Stopwatch.StartNew();
@@ -468,7 +665,8 @@ internal static class Tests
             "empty scan uses fallback");
 
         probe = new FakeProbe { DefaultResult = ProbeResult.Success(75) };
-        scanner = new CompatibilityScanner(mihomo, probe, "probe");
+        scanner = new CompatibilityScanner(mihomo, probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("selected-fp", "JP", "ok")));
         CandidateScanResult selected = scanner.ScanSelected(new CandidateNode("selected", 1),
             new[] { ServiceKind.ChatGPT, ServiceKind.GitHub });
         Equal(2, probe.Calls.Count, "only selected services probed");
@@ -479,9 +677,21 @@ internal static class Tests
         Equal("selected", snapshot.ActualNode, "snapshot leaf node");
         Equal(2, snapshot.Services.Count, "snapshot retains service evidence");
         MonitorPresentation view = MonitorPresentation.From(snapshot);
-        Equal("运行正常", view.StateText, "running label");
+        Equal("部分服务待验证", view.StateText, "login-ready AI scan waits for account verification");
+        Equal("登录链路正常 · 75 ms · 账号待实测",
+            MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
+            "AI service distinguishes login chain from account proof");
+        var accountData = new ExperienceData();
+        AccountVerificationMemory.Mark(accountData, "scope", "selected", "selected-fp",
+            ServiceKind.ChatGPT, true, snapshotTime, AccountVerificationMemory.CurrentRuleVersion);
+        snapshot = snapshot.WithAccountVerification(accountData, "scope", snapshotTime);
+        view = MonitorPresentation.From(snapshot);
+        Equal("运行正常", view.StateText, "account-verified AI scan is running normally");
+        Equal("账号实测通过 · 75 ms · 有效至 10-08",
+            MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
+            "AI service shows account verification evidence");
         Equal("selected", view.NodeText, "presentation leaf node");
-        Equal("综合响应：75 ms · 优质", view.ResponseText, "presentation shows latency quality band");
+        Equal("综合响应：75 ms · 优秀", view.ResponseText, "presentation shows latency quality band");
         Equal("综合响应：待测", MonitorPresentation.From(MonitorSnapshot.CreateState(MonitorRunState.Starting, "", snapshotTime, snapshotTime)).ResponseText, "presentation handles missing latency");
         Equal("可用 · 75 ms", MonitorPresentation.ServiceText(true, 75, "ok"), "service latency label");
         Equal("不可用", MonitorPresentation.ServiceText(false, 75, "blocked"), "failure hides misleading latency");
@@ -495,6 +705,7 @@ internal static class Tests
         Equal("后台准备备用节点", snapshot.WithProgress("后台准备备用节点").Decision, "maintenance stage remains visible");
         Equal(MonitorRunState.Degraded, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.Transient, null, "timeout"), null, "", snapshotTime, snapshotTime).State, "failed scan is not running normally");
         Equal(MonitorRunState.Pending, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending"), null, "", snapshotTime, snapshotTime).State, "unknown scan is pending");
+        Equal(MonitorRunState.Pending, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.BasicCompatible, null, "challenge"), null, "", snapshotTime, snapshotTime).State, "reachable-only scan is pending not running normally");
         Equal(true, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "definite startup failure gets immediate confirmation");
         Equal(false, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending")), "unknown startup evidence is not forced failure");
         Equal(4, StartupRecovery.MaximumCandidates(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "startup failure search is bounded");
@@ -546,6 +757,20 @@ internal static class Tests
         public string[] GetChoices(string groupName) { return new string[0]; }
         public string GetSelected(string groupName) { return LastSelected; }
         public void Select(string groupName, string proxyName) { LastSelected = proxyName; }
+        public int GetDelay(string proxyName, string url, int timeoutMilliseconds) { return 50; }
+        public bool IsRuntimeIpv6Enabled() { return false; }
+        public bool IsAvailable() { return true; }
+    }
+
+    private sealed class VerificationMihomo : IMihomoClient
+    {
+        private readonly string[] choices;
+        private string sharedSelected;
+        public VerificationMihomo(string selected, string[] choices)
+        { sharedSelected = selected; this.choices = choices; }
+        public string[] GetChoices(string groupName) { return groupName == "shared" ? choices : choices; }
+        public string GetSelected(string groupName) { return groupName == "shared" ? sharedSelected : ""; }
+        public void Select(string groupName, string proxyName) { if (groupName == "shared") sharedSelected = proxyName; }
         public int GetDelay(string proxyName, string url, int timeoutMilliseconds) { return 50; }
         public bool IsRuntimeIpv6Enabled() { return false; }
         public bool IsAvailable() { return true; }
@@ -621,22 +846,23 @@ internal static class Tests
         var clock = new FakeClock { UtcNow = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc) };
         var controller = new FailoverController(clock, TimeSpan.FromMinutes(10));
         Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred HTTP response threshold");
-        Equal("优质", QualityPolicy.LatencyBand(500), "preferred latency band boundary");
-        Equal("可用", QualityPolicy.LatencyBand(501), "usable latency band boundary");
-        Equal("偏慢", QualityPolicy.LatencyBand(801), "slow latency band boundary");
-        Equal("质量较差", QualityPolicy.LatencyBand(1501), "poor latency band boundary");
+        Equal("优秀", QualityPolicy.LatencyBand(500), "excellent latency band boundary");
+        Equal("良好", QualityPolicy.LatencyBand(800), "good latency band boundary");
+        Equal("可连接但偏慢", QualityPolicy.LatencyBand(1500), "connectable but slow latency band boundary");
+        Equal("不适合自动寻优", QualityPolicy.LatencyBand(1501), "automatic optimization latency cutoff");
         Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 1000.0 }), "current latency needs three samples");
         Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 800.0, 900.0 }), "current median at 800 holds");
         Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 900.0 }), "current median above 800 may optimize");
         Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0, 800.0 }), "candidate median p95 and jitter pass");
+        Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1500.0 }), "candidate median 800 and maximum 1500 pass");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0 }), "candidate latency needs five samples");
-        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0, 801.0 }), "candidate p95 above 800 fails");
+        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }), "candidate maximum above 1500 fails");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 100.0, 300.0, 500.0, 700.0, 800.0 }), "candidate jitter above 150 fails");
         var responsiveServices = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1400, 2,
-            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1000) } });
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1500) } });
         var slowService = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1401, 2,
-            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1001) } });
-        Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1000 passes");
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1501) } });
+        Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1500 passes");
         Equal(false, QualityPolicy.ServicesWithinLimit(slowService), "single slow service rejects quality candidate");
         double[] slowCurrent = { 700, 801, 900 };
         double[] preferredTarget = { 300, 400, 500, 600, 800 };
@@ -645,8 +871,12 @@ internal static class Tests
         Equal(false, controller.DecideQuality(70, 90, false, false, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "fresh verification required");
         Equal(false, controller.DecideQuality(70, 90, false, true, false, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "proven stable history required");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, new[] { 700.0, 800.0, 900.0 }, preferredTarget, responsiveServices).ShouldSwitch, "current latency not persistently slow holds");
-        Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, new[] { 300.0, 400.0, 500.0, 600.0, 801.0 }, responsiveServices).ShouldSwitch, "candidate history outside preferred latency cannot switch");
+        Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }, responsiveServices).ShouldSwitch, "candidate history outside preferred latency cannot switch");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, preferredTarget, slowService).ShouldSwitch, "single slow service cannot quality switch");
+        var reachableTarget = new CandidateScanResult("target", CandidateHealth.BasicCompatible, null, "challenge", 100, 1,
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Partial("challenge", 100) } });
+        Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, preferredTarget, reachableTarget).ShouldSwitch,
+            "reachable-only target cannot quality switch");
         Equal(true, controller.DecideQuality(70, 90, true, true, false, new double[0], new double[0], slowService).ShouldSwitch, "disconnect bypasses quality history and latency gates");
         var healthy = new[] { new NodeHealthRecord("next", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false) };
         Equal(false, controller.Decide(false, false, "current", healthy).ShouldSwitch, "first failure stays");
@@ -663,7 +893,7 @@ internal static class Tests
         var basicController = new FailoverController(clock, TimeSpan.FromMinutes(10));
         var basic = new[] { new NodeHealthRecord("basic", CandidateHealth.BasicCompatible, clock.UtcNow, clock.UtcNow, false) };
         Equal(false, basicController.Decide(false, false, "current", basic).ShouldSwitch, "first basic-compatible failure stays");
-        Equal(true, basicController.Decide(false, false, "current", basic).ShouldSwitch, "basic-compatible replacement switches");
+        Equal(false, basicController.Decide(false, false, "current", basic).ShouldSwitch, "basic-compatible replacement remains ineligible");
 
         Equal(clock.UtcNow.AddMinutes(5), HealthPolicy.CooldownUntil(CandidateHealth.Transient, clock.UtcNow), "transient cooldown");
         Equal(clock.UtcNow.AddMinutes(30), HealthPolicy.CooldownUntil(CandidateHealth.ServiceFailed, clock.UtcNow), "service cooldown");
@@ -672,7 +902,7 @@ internal static class Tests
         var state = new HealthState("old");
         state.Records["节点\t一"] = new NodeHealthRecord("节点\t一", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false);
         state.Records["香港"] = new NodeHealthRecord("香港", CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
-        state.RememberPreferred("节点\t一", CandidateHealth.BasicCompatible, clock.UtcNow);
+        state.RememberPreferred("节点\t一", CandidateHealth.Compatible, clock.UtcNow);
         var store = new StateStore(statePath);
         store.Save(state, state.Records.Keys);
         var loaded = store.Load();
@@ -686,12 +916,12 @@ internal static class Tests
         Equal(CandidateHealth.RegionBlocked, loaded.Records["香港"].Health, "fingerprint preserves local exclusion");
 
         var recovery = new HealthState("same");
-        recovery.Records["稳定节点"] = new NodeHealthRecord("稳定节点", CandidateHealth.BasicCompatible,
+        recovery.Records["稳定节点"] = new NodeHealthRecord("稳定节点", CandidateHealth.Compatible,
             clock.UtcNow, clock.UtcNow, false);
-        recovery.RememberPreferred("稳定节点", CandidateHealth.BasicCompatible, clock.UtcNow);
+        recovery.RememberPreferred("稳定节点", CandidateHealth.Compatible, clock.UtcNow);
         var recoveryCandidates = new[] { new CandidateNode("稳定节点", 1), new CandidateNode("其他节点", 1) };
         Equal("稳定节点", ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
-            TimeSpan.FromMinutes(30)), "recent basic node restored");
+            TimeSpan.FromMinutes(30)), "recent strict node restored");
         recovery.ApplySubscriptionFingerprint("changed");
         Equal("稳定节点", ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
             TimeSpan.FromMinutes(30)), "recent preferred node invalidated by reload is selected for live recheck");
@@ -705,6 +935,13 @@ internal static class Tests
         recovery.Records["稳定节点"].Health = CandidateHealth.Transient;
         Equal<string>(null, ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
             TimeSpan.FromMinutes(30)), "failed preferred node not restored");
+    }
+
+    private sealed class FakeExitIdentityProbe : IExitIdentityProbe
+    {
+        private readonly ExitIdentity identity;
+        public FakeExitIdentityProbe(ExitIdentity identity) { this.identity = identity; }
+        public ExitIdentity Probe(TimeSpan timeout) { return identity; }
     }
 
     private sealed class FakeClock : IClock
@@ -767,6 +1004,7 @@ internal static class Tests
 
     private static void UserPreferenceBehavior()
     {
+        Equal(false, Enum.GetNames(typeof(ServiceKind)).Contains("JMComicWeb"), "jmcomic service removed");
         string root = Path.Combine(Path.GetTempPath(), "monitor-prefs-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(root, "preferences.state");
         var store = new UserPreferenceStore(path);
@@ -776,17 +1014,28 @@ internal static class Tests
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
-        Equal(false, defaults.RequiredServices.Contains(ServiceKind.JMComicWeb), "jmcomic is opt-in");
         defaults.FirstRunComplete = true;
-        defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub, ServiceKind.JMComicWeb };
+        defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub };
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
-        Equal(3, loaded.RequiredServices.Count, "service selection persisted");
-        Equal(true, loaded.RequiredServices.Contains(ServiceKind.JMComicWeb), "jmcomic selection persisted");
+        Equal(2, loaded.RequiredServices.Count, "service selection persisted");
         File.WriteAllText(path, "broken", Encoding.UTF8);
         Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
+
+        string migrationRoot = Path.Combine(Path.GetTempPath(), "monitor-prefs-migration-" + Guid.NewGuid().ToString("N"));
+        string migrationPath = Path.Combine(migrationRoot, "preferences.state");
+        Directory.CreateDirectory(migrationRoot);
+        File.WriteAllText(migrationPath,
+            "version=1\r\nfirstRun=True\r\nautomatic=True\r\nservices=ChatGPT,JMComicWeb,GitHub\r\n", Encoding.UTF8);
+        var migrationStore = new UserPreferenceStore(migrationPath);
+        UserPreferences migrated = migrationStore.Load();
+        Equal("ChatGPT,GitHub", String.Join(",", migrated.RequiredServices), "legacy jmcomic preference ignored");
+        Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
+            "legacy jmcomic preference is migration not corruption");
+        migrationStore.Save(migrated);
+        Equal(false, File.ReadAllText(migrationPath).Contains("JMComic"), "saving removes legacy jmcomic value");
     }
 
     private static void MonitorCoordinatorBehavior()
@@ -859,6 +1108,55 @@ internal static class Tests
             coordinator.RequestCheck();
             Equal(true, SpinWait.SpinUntil(() => coordinator.Latest.State == MonitorRunState.Running, 1000), "coordinator recovers after restore exception");
         }
+
+        var accountRunner = new AccountVerificationCycleRunner();
+        using (var coordinator = new MonitorCoordinator(accountRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, accountRunner.WaitForRunCount(1, 1000), "account runner initial cycle");
+            coordinator.RequestAccountVerification("node", "fingerprint",
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, new DateTime(2026, 9, 11, 0, 0, 0, DateTimeKind.Utc));
+            Equal(true, SpinWait.SpinUntil(() => accountRunner.VerificationCount == 1, 1000),
+                "account verification command reaches runner once");
+            Equal(true, accountRunner.WaitForRunCount(2, 1000), "account verification requests follow-up scan");
+            Equal("fingerprint", accountRunner.LastFingerprint, "account command preserves exit fingerprint");
+            coordinator.ReportServiceFailure("node", ServiceKind.ChatGPT,
+                new DateTime(2026, 9, 11, 0, 1, 0, DateTimeKind.Utc));
+            Equal(true, SpinWait.SpinUntil(() => accountRunner.FailureCount == 1, 1000),
+                "negative account feedback reaches runner once");
+            Equal(true, accountRunner.WaitForRunCount(3, 1000), "negative feedback requests follow-up scan");
+        }
+
+        var sessionRunner = new AccountVerificationCycleRunner();
+        using (var coordinator = new MonitorCoordinator(sessionRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, sessionRunner.WaitForRunCount(1, 1000), "verification session initial cycle");
+            AccountVerificationSession session = coordinator.BeginAccountVerification();
+            Equal("session-node", session.Node, "verification session freezes current node");
+            Equal("session-fingerprint", session.ExitFingerprint, "verification session freezes current exit");
+            int before = sessionRunner.RunCount;
+            Thread.Sleep(80);
+            Equal(before, sessionRunner.RunCount, "verification session pauses automatic cycles");
+            coordinator.CompleteAccountVerification(session,
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, null, DateTime.UtcNow);
+            Equal(true, SpinWait.SpinUntil(() => sessionRunner.VerificationCount == 1, 1000),
+                "verification session records captured evidence once");
+            Equal("session-node", sessionRunner.LastNode, "verification result cannot drift to a newer snapshot node");
+            Equal("session-fingerprint", sessionRunner.LastFingerprint, "verification result cannot drift to a newer exit");
+        }
+    }
+
+    private static void AccountVerificationUiBehavior()
+    {
+        Equal(AccountVerificationSelection.ChatGPT | AccountVerificationSelection.Gemini,
+            AccountVerificationForm.SelectedServices(true, true), "verification selects both AI services");
+        Equal(AccountVerificationSelection.ChatGPT,
+            AccountVerificationForm.SelectedServices(true, false), "verification selects ChatGPT only");
+        Equal(AccountVerificationSelection.Gemini,
+            AccountVerificationForm.SelectedServices(false, true), "verification selects Gemini only");
+        Equal(AccountVerificationSelection.None,
+            AccountVerificationForm.SelectedServices(false, false), "verification cancel selects no service");
     }
 
     private sealed class ThrowingRestoreRunner : IRestorableCycleRunner
@@ -924,26 +1222,67 @@ internal static class Tests
         }
     }
 
+    private sealed class AccountVerificationCycleRunner : IAccountVerificationRunner
+    {
+        private int runCount;
+        private int verificationCount;
+        private int failureCount;
+        public int VerificationCount { get { return Volatile.Read(ref verificationCount); } }
+        public int FailureCount { get { return Volatile.Read(ref failureCount); } }
+        public int RunCount { get { return Volatile.Read(ref runCount); } }
+        public string LastNode { get; private set; }
+        public string LastFingerprint { get; private set; }
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateRunning("session-node",
+                new CandidateScanResult("session-node", CandidateHealth.Compatible, null, "ok", 100, 1,
+                    new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(100) } },
+                    "session-fingerprint", "JP"), null, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+        }
+        public bool RecordAccountVerification(string node, string exitFingerprint,
+            IEnumerable<ServiceKind> services, DateTime verifiedUtc)
+        {
+            LastNode = node;
+            LastFingerprint = exitFingerprint;
+            Interlocked.Increment(ref verificationCount);
+            return true;
+        }
+        public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
+        {
+            Interlocked.Increment(ref failureCount);
+        }
+        public bool WaitForRunCount(int expected, int milliseconds)
+        {
+            return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
+        }
+    }
+
     private static void StatusReporting()
     {
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.0"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.1"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
         Equal(false, report.Contains("secret"), "status omits credentials");
+        Equal(true, StatusReport.Format(now, "日本 J1", CandidateHealth.Compatible, 88,
+            "保持当前节点", "ok").Contains("检测状态：登录链路及后台服务探测通过"),
+            "status does not mislabel anonymous login-chain evidence as account proof");
 
         string translated = StatusReport.Format(now, "新加坡 S1", CandidateHealth.BasicCompatible, 74.8,
             "quality difference below threshold", "AI 登录待确认");
         Equal(true, translated.Contains("决定：质量提升不足 20%，保持当前节点"), "status translates controller decision");
         Equal(false, translated.Contains("quality difference below threshold"), "status omits raw English decision");
         Equal("候选节点尚未积累 5 次、跨度 30 分钟且成功率不低于 95% 的历史", StatusReport.DecisionText("target requires proven stability"), "status explains conservative quality gate");
-        Equal("当前节点响应不超过 500 ms，保持当前节点", StatusReport.DecisionText("current response already preferred"), "status explains good-enough latency hold");
-        Equal("候选节点响应超过 500 ms，不进行性能切换", StatusReport.DecisionText("target response exceeds preferred threshold"), "status explains candidate latency gate");
+        Equal("当前节点响应不超过 800 ms，保持当前节点", StatusReport.DecisionText("current response already preferred"), "status explains good-enough latency hold");
+        Equal("候选节点响应超过自动寻优标准，不进行性能切换", StatusReport.DecisionText("target response exceeds preferred threshold"), "status explains candidate latency gate");
         Equal("当前节点最近 3 次中位响应未超过 800 ms，保持当前节点", StatusReport.DecisionText("current response not persistently slow"), "status explains latency hysteresis");
-        Equal("候选节点最近 5 次延迟未达到优质标准", StatusReport.DecisionText("target response history not preferred"), "status explains robust candidate latency gate");
-        Equal("候选节点存在超过 1000 ms 的服务响应", StatusReport.DecisionText("target service response exceeds limit"), "status explains per-service latency gate");
+        Equal("候选节点最近 5 次延迟未达到中位数不超过 800 ms、单次不超过 1500 ms 的标准", StatusReport.DecisionText("target response history not preferred"), "status explains robust candidate latency gate");
+        Equal("候选节点存在超过 1500 ms 的服务响应", StatusReport.DecisionText("target service response exceeds limit"), "status explains per-service latency gate");
+        Equal("候选节点尚未完成所选 AI 服务的账号实测，不进行性能切换", StatusReport.DecisionText("target requires account verification"), "status explains account proof gate");
+        Equal("当前节点故障，临时切换到登录链路已通过但尚未账号实测的节点", StatusReport.DecisionText("provisional emergency failover"), "status explains provisional emergency target");
     }
 }

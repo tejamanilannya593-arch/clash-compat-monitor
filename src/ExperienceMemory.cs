@@ -49,12 +49,14 @@ public sealed class ExperienceData
     public List<NodeExperience> Nodes { get; set; }
     public List<NodeChange> Changes { get; set; }
     public List<ServiceIncidentRecord> ServiceIncidents { get; set; }
+    public List<AccountVerificationRecord> AccountVerifications { get; set; }
     public ExperienceData()
     {
         ActiveCandidateNames = new List<string>();
         Nodes = new List<NodeExperience>();
         Changes = new List<NodeChange>();
         ServiceIncidents = new List<ServiceIncidentRecord>();
+        AccountVerifications = new List<AccountVerificationRecord>();
     }
 
     public string ResolveScope(string fingerprint, IEnumerable<string> candidates, string servicesKey)
@@ -78,16 +80,34 @@ public sealed class ExperienceData
         int overlap = previous.Intersect(current, StringComparer.Ordinal).Count();
         int smaller = Math.Min(previous.Count, current.Count);
         bool compatibleUpdate = smaller >= 2 && overlap >= 2 && (double)overlap / smaller >= 0.60;
-        bool preserve = !String.IsNullOrEmpty(ActiveScope) && sameServices && (exact || compatibleUpdate);
+        bool legacyServiceRemoval = !sameServices && (exact || compatibleUpdate) &&
+            String.Equals(RemoveLegacyJmComic(previousServices), normalizedServices, StringComparison.Ordinal);
+        bool preserve = !String.IsNullOrEmpty(ActiveScope) && (sameServices || legacyServiceRemoval) &&
+            (exact || compatibleUpdate);
 
-        if (!preserve)
+        if (legacyServiceRemoval && preserve)
+        {
+            string oldScope = ActiveScope;
             ActiveScope = (fingerprint ?? "") + "|" + normalizedServices;
-        ScopeContinuityReason = preserve ? (exact ? "same-candidates" : "compatible-update") :
+            foreach (NodeExperience item in Nodes.Where(x => x != null && x.Scope == oldScope)) item.Scope = ActiveScope;
+            foreach (AccountVerificationRecord item in (AccountVerifications ?? new List<AccountVerificationRecord>())
+                .Where(x => x != null && x.Scope == oldScope)) item.Scope = ActiveScope;
+            if (Assurance != null && Assurance.Scope == oldScope) Assurance.Scope = ActiveScope;
+        }
+        else if (!preserve)
+            ActiveScope = (fingerprint ?? "") + "|" + normalizedServices;
+        ScopeContinuityReason = legacyServiceRemoval && preserve ? "legacy-service-migration" : preserve ? (exact ? "same-candidates" : "compatible-update") :
             (previous.Count == 0 || String.IsNullOrEmpty(previousServices) ? "initial" :
             (sameServices ? "different-subscription" : "services-changed"));
         ActiveCandidateNames = current;
         ActiveServicesKey = normalizedServices;
         return ActiveScope;
+    }
+
+    private static string RemoveLegacyJmComic(string servicesKey)
+    {
+        return String.Join(",", (servicesKey ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(x => !String.Equals(x.Trim(), "JMComicWeb", StringComparison.Ordinal)).Select(x => x.Trim()));
     }
 
     public void Observe(string scope, CandidateScanResult scan, QualitySample quality, DateTime now)
@@ -107,7 +127,7 @@ public sealed class ExperienceData
             node.RecentResponseMilliseconds.Clear();
         }
         if (node.Samples > 0 && now - node.LastUtc < TimeSpan.FromSeconds(30)) return;
-        bool passed = scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible;
+        bool passed = scan.Health == CandidateHealth.Compatible;
         double weight = node.Samples == 0 ? 1 : 0.2;
         node.Success = (1 - weight) * node.Success + weight * (passed ? 1 : 0);
         double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
@@ -193,6 +213,7 @@ public sealed class ExperienceStore
             if (data == null || data.Nodes == null || data.Changes == null || data.Nodes.Any(x => x == null) || data.Changes.Any(x => x == null)) throw new InvalidDataException();
             if (data.ActiveCandidateNames == null) data.ActiveCandidateNames = new List<string>();
             if (data.ServiceIncidents == null) data.ServiceIncidents = new List<ServiceIncidentRecord>();
+            if (data.AccountVerifications == null) data.AccountVerifications = new List<AccountVerificationRecord>();
             return data;
         }
         catch (Exception ex)
@@ -209,6 +230,11 @@ public sealed class ExperienceStore
         data.Changes = data.Changes.OrderByDescending(x => x.Utc).Take(300).OrderBy(x => x.Utc).ToList();
         data.ServiceIncidents = (data.ServiceIncidents ?? new List<ServiceIncidentRecord>()).Where(x => x != null && x.UntilUtc > now)
             .GroupBy(x => x.Service).Select(x => x.OrderByDescending(y => y.UntilUtc).First()).ToList();
+        data.AccountVerifications = (data.AccountVerifications ?? new List<AccountVerificationRecord>())
+            .Where(x => x != null && x.VerifiedUtc > now.AddDays(-30))
+            .GroupBy(x => (x.Scope ?? "") + "\n" + (x.Node ?? "") + "\n" + x.Service)
+            .Select(x => x.OrderByDescending(y => y.VerifiedUtc).First())
+            .OrderByDescending(x => x.VerifiedUtc).Take(256).ToList();
         StatusReport.WriteAtomic(path, new JavaScriptSerializer().Serialize(data));
     }
 }

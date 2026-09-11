@@ -6,7 +6,7 @@ using System.Windows.Forms;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.6.0";
+    public const string Version = "0.6.1";
 }
 
 public static class Program
@@ -37,7 +37,9 @@ public static class Program
                     if (!headlessClient.IsAvailable()) throw new InvalidOperationException("Mihomo pipe is unavailable.");
                     using (var probe = new HttpServiceProbe(config.ProbeProxy))
                     {
-                        var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock());
+                        var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
+                            Path.Combine(config.RootPath, "state", "identity.key"));
+                        var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock(), exitProbe);
                         worker.RunOnce(options.DryRun, new UserPreferenceStore(config.PreferencesPath).Load());
                     }
                 }
@@ -54,7 +56,9 @@ public static class Program
                 Application.SetCompatibleTextRenderingDefault(false);
                 using (var probe = new HttpServiceProbe(config.ProbeProxy))
                 {
-                    var worker = new MonitorWorker(config, client, probe, logger, new SystemClock());
+                    var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
+                        Path.Combine(config.RootPath, "state", "identity.key"));
+                    var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe);
                     using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
                     using (var tray = new TrayHost(coordinator, preferenceStore, preferences))
                     {

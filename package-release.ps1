@@ -7,7 +7,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Enhancement tests failed.' }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Release.Tests.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Release checks failed.' }
 $distRoot = Join-Path $root 'dist'
-$release = Join-Path $distRoot 'ClashCompatibilityMonitor-v0.6.0'
+$release = Join-Path $distRoot 'ClashCompatibilityMonitor-v0.6.1'
 $resolvedRoot = [IO.Path]::GetFullPath($distRoot).TrimEnd('\') + '\'
 $resolvedRelease = [IO.Path]::GetFullPath($release)
 if (!$resolvedRelease.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe release path.' }
