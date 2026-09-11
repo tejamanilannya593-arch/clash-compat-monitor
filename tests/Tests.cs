@@ -62,6 +62,7 @@ internal static class Tests
         ServiceEvidenceBehavior();
         LoginChainEvidenceBehavior();
         AccountVerificationBehavior();
+        BrowserConversationCoordinatorBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
     }
@@ -258,6 +259,116 @@ internal static class Tests
         Equal(true, AccountVerificationMemory.IsValid(workerStore.Load(), "scope", "node", "fresh-exit",
             ServiceKind.ChatGPT, now, AccountVerificationMemory.CurrentRuleVersion),
             "worker persists freshly revalidated account proof");
+    }
+
+    private static void BrowserConversationCoordinatorBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 11, 3, 0, 0, DateTimeKind.Utc);
+        var clock = new FakeClock { UtcNow = now };
+        var strict = new CandidateScanResult("node", CandidateHealth.Compatible, null, "ok", 200, 2,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(100) },
+                { ServiceKind.Gemini, ProbeResult.Success(100) }
+            }, "exit", "JP");
+        MonitorSnapshot snapshot = MonitorSnapshot.CreateRunning("node", strict, null, "ok", now, now.AddMinutes(1));
+        var coordinator = new BrowserConversationCoordinator(clock, new FixedChallengeSource("CCM-A7F2"));
+
+        Equal(BrowserVerificationStart.CompanionOffline,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "browser verification requires online companion");
+        coordinator.ObserveCompanion("Chrome", now);
+        Equal(BrowserVerificationStart.ConsentRequired,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, false),
+            "automatic browser verification requires consent");
+        coordinator.SetConsent(true);
+        Equal(BrowserVerificationStart.Started,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, false),
+            "online consented companion starts verification");
+        Equal(BrowserVerificationStart.Busy,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "only one browser verification session runs");
+
+        BrowserVerificationTask first = coordinator.Poll("Chrome", now);
+        Equal(ServiceKind.ChatGPT, first.Service, "chatgpt browser verification runs first");
+        Equal("CCM-A7F2", first.Challenge, "browser verification uses generated challenge");
+        var passed = new BrowserVerificationResult {
+            TaskId = first.TaskId,
+            Service = first.Service,
+            Challenge = first.Challenge,
+            Outcome = BrowserVerificationOutcome.Passed,
+            MessageSent = true,
+            ElapsedMilliseconds = 1234
+        };
+        Equal(BrowserVerificationAcceptance.Accepted,
+            coordinator.Accept(passed, snapshot, now.AddSeconds(2)),
+            "fresh matching browser result accepted");
+        Equal(BrowserVerificationAcceptance.Replayed,
+            coordinator.Accept(passed, snapshot, now.AddSeconds(3)),
+            "browser result replay rejected");
+        BrowserVerificationTask second = coordinator.Poll("Chrome", now.AddSeconds(3));
+        Equal(ServiceKind.Gemini, second.Service, "gemini browser verification runs second");
+
+        var changed = new CandidateScanResult("node", CandidateHealth.Compatible, null, "ok", 200, 2,
+            strict.ServiceResults, "changed-exit", "JP");
+        MonitorSnapshot changedSnapshot = MonitorSnapshot.CreateRunning("node", changed, null, "ok", now, now.AddMinutes(1));
+        var drifted = new BrowserVerificationResult {
+            TaskId = second.TaskId,
+            Service = second.Service,
+            Challenge = second.Challenge,
+            Outcome = BrowserVerificationOutcome.Passed,
+            MessageSent = true
+        };
+        Equal(BrowserVerificationAcceptance.Drifted,
+            coordinator.Accept(drifted, changedSnapshot, now.AddSeconds(4)),
+            "browser result rejected after exit drift");
+
+        var expiry = new BrowserConversationCoordinator(clock, new FixedChallengeSource("CCM-B8E3"));
+        expiry.ObserveCompanion("Edge", now);
+        Equal(BrowserVerificationStart.Started,
+            expiry.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "user initiated browser verification does not require persistent consent");
+        BrowserVerificationTask expiring = expiry.Poll("Edge", now);
+        var late = new BrowserVerificationResult {
+            TaskId = expiring.TaskId,
+            Service = expiring.Service,
+            Challenge = expiring.Challenge,
+            Outcome = BrowserVerificationOutcome.Passed,
+            MessageSent = true
+        };
+        Equal(BrowserVerificationAcceptance.Expired,
+            expiry.Accept(late, snapshot, now.AddMinutes(5)),
+            "browser task expires at five minutes");
+
+        var cooldown = new BrowserConversationCoordinator(clock, new FixedChallengeSource("CCM-C9D4"));
+        cooldown.SetConsent(true);
+        cooldown.ObserveCompanion("Chrome", now);
+        Equal(BrowserVerificationStart.Started,
+            cooldown.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, false),
+            "automatic browser verification starts before failure cooldown");
+        BrowserVerificationTask failing = cooldown.Poll("Chrome", now);
+        var failure = new BrowserVerificationResult {
+            TaskId = failing.TaskId,
+            Service = failing.Service,
+            Challenge = failing.Challenge,
+            Outcome = BrowserVerificationOutcome.GenerationTimeout,
+            MessageSent = true
+        };
+        Equal(BrowserVerificationAcceptance.Accepted,
+            cooldown.Accept(failure, snapshot, now.AddMinutes(1)),
+            "sent generation timeout accepted as browser outcome");
+        Equal(BrowserVerificationStart.NoEligibleServices,
+            cooldown.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, false),
+            "automatic browser failure has six hour cooldown");
+        Equal(BrowserVerificationStart.Started,
+            cooldown.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "user retry bypasses automatic browser cooldown");
+    }
+
+    private sealed class FixedChallengeSource : IChallengeSource
+    {
+        private readonly string value;
+        public FixedChallengeSource(string value) { this.value = value; }
+        public string Create() { return value; }
     }
 
     private static void AssuranceBehavior()
