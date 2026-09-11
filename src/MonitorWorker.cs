@@ -102,7 +102,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         if (!mihomo.GetChoices(config.SharedGroup).Contains(previousSelectedNode, StringComparer.Ordinal)) return false;
         string target = previousSelectedNode;
         CandidateScanResult verified = scanner.ScanSelected(new CandidateNode(target, null), lastPreferences.RequiredServices);
-        if (verified.Health != CandidateHealth.Compatible && verified.Health != CandidateHealth.BasicCompatible) return false;
+        if (!ServiceEvidencePolicy.CanEmergencySwitch(verified)) return false;
         CheckStop();
         if (mihomo.GetSelected(config.SharedGroup) != current) return false;
         SelectRecorded(current, target, "用户恢复上一个节点（已复检）");
@@ -185,7 +185,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 CandidateScanResult recoveryScan = scanner.ScanSelected(new CandidateNode(recoveryTarget, null), requiredServices);
                 CheckStop();
                 if (!dryRun && preferences.AutomaticOptimization &&
-                    (recoveryScan.Health == CandidateHealth.Compatible || recoveryScan.Health == CandidateHealth.BasicCompatible) &&
+                    ServiceEvidencePolicy.CanEmergencySwitch(recoveryScan) &&
                     mihomo.GetSelected(config.SharedGroup) == current)
                 {
                     SelectRecorded(current, recoveryTarget, "配置重载后恢复（已复检）");
@@ -284,7 +284,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     {
                         var old = candidates.FirstOrDefault(x => x.Name == assurance.Previous);
                         CandidateScanResult oldScan = old == null ? null : scanner.ScanSelected(old, servicesToProbe);
-                        if (oldScan != null && ConnectionAssurance.Passed(oldScan) &&
+                        if (ServiceEvidencePolicy.CanEmergencySwitch(oldScan) &&
                             (!ConnectionAssurance.Passed(currentScan) || QualityMeasurement.ResponseMilliseconds(oldScan, 5000) < QualityMeasurement.ResponseMilliseconds(currentScan, 5000) * 0.8) &&
                             mihomo.GetSelected(config.SharedGroup) == current)
                         {
@@ -318,7 +318,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
             QualitySample priorCurrent = Latest(qualityHistory, current);
             double currentResponse = QualityMeasurement.ResponseMilliseconds(currentScan, priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
-            if (currentScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(currentScan.Name, clock.UtcNow, currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible,
+            if (currentScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(currentScan.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(currentScan),
                 currentResponse, Jitter(qualityHistory, currentScan.Name, currentResponse), priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
                 currentCandidate == null ? (double?)null : currentCandidate.Multiplier));
             experience.Observe(memoryScope, currentScan, null, clock.UtcNow);
@@ -333,10 +333,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             refreshQuality = refreshQuality || standbyDue;
             if (observing) refreshQuality = false;
             if (serviceIncidentDecision != null && currentScan.Health == CandidateHealth.Unknown) refreshQuality = false;
-            if (!trafficIdle && (currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible)) refreshQuality = false;
+            if (!trafficIdle && ServiceEvidencePolicy.CanHold(currentScan)) refreshQuality = false;
 
             var freshlyVerified = new HashSet<string>(StringComparer.Ordinal);
-            if (currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible) freshlyVerified.Add(currentScan.Name);
+            if (ServiceEvidencePolicy.CanEmergencySwitch(currentScan)) freshlyVerified.Add(currentScan.Name);
             if (refreshQuality)
             {
                 var delays = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -347,7 +347,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     scans[standby] = standbyScan;
                     scanTimes[standby] = clock.UtcNow;
                     if (suppressedServices.Count == 0) assurance.Remember(standbyScan, current, clock.UtcNow);
-                    if (ConnectionAssurance.Passed(standbyScan)) delays[standby] = (int)Math.Min(Int32.MaxValue, QualityMeasurement.ResponseMilliseconds(standbyScan, 5000));
+                    if (ServiceEvidencePolicy.CanEmergencySwitch(standbyScan)) delays[standby] = (int)Math.Min(Int32.MaxValue, QualityMeasurement.ResponseMilliseconds(standbyScan, 5000));
                 }
                 foreach (var remembered in experience.Recommend(memoryScope, candidates.Select(x => x.Name), clock.UtcNow).Take(3))
                 {
@@ -382,14 +382,14 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     if (suppressedServices.Count == 0) assurance.Remember(scan, current, clock.UtcNow);
                     CandidateScanResult historicalScan = ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices);
                     if (historicalScan.Health != CandidateHealth.Unknown) state.Records[candidate.Name] = Record(historicalScan);
-                    if (scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
+                    if (ServiceEvidencePolicy.CanEmergencySwitch(scan)) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
                     QualitySample previous = Latest(qualityHistory, candidate.Name);
                     double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
-                    if (suppressedServices.Count == 0 && scan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible,
+                    if (suppressedServices.Count == 0 && scan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(scan),
                         MedianResponse(qualityHistory, candidate.Name, response), Jitter(qualityHistory, candidate.Name, response),
                         previous == null ? 0 : previous.ThroughputBytesPerSecond, candidate.Multiplier));
                     experience.Observe(memoryScope, historicalScan, null, clock.UtcNow);
-                    if (scan.Health != CandidateHealth.Compatible && scan.Health != CandidateHealth.BasicCompatible)
+                    if (!ServiceEvidencePolicy.CanHold(scan))
                     {
                         string failureKey = scan.FailedService.HasValue ? scan.FailedService.Value.ToString() : scan.Health.ToString();
                         int count;
@@ -442,7 +442,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 scores[sample.Name] = QualityScorer.Score(sample, qualityHistory.Where(x => x.Name == sample.Name), latestCohort, clock.UtcNow);
             if (suppressedServices.Count > 0)
             {
-                var incidentCohort = scans.Values.Where(x => freshlyVerified.Contains(x.Name) && ConnectionAssurance.Passed(x))
+                var incidentCohort = scans.Values.Where(x => freshlyVerified.Contains(x.Name) && ServiceEvidencePolicy.CanEmergencySwitch(x))
                     .Select(x => new QualitySample(x.Name, clock.UtcNow, true,
                         QualityMeasurement.ResponseMilliseconds(x, 5000), 0, 0,
                         candidates.First(y => y.Name == x.Name).Multiplier)).ToList();
@@ -460,7 +460,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             double? reportedScore = null;
             QualityBreakdown reportedCurrent;
             if (scores.TryGetValue(current, out reportedCurrent)) reportedScore = reportedCurrent.Score;
-            if (currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible || currentScan.Health == CandidateHealth.Unknown)
+            if (ServiceEvidencePolicy.CanHold(currentScan) || currentScan.Health == CandidateHealth.Unknown)
                 controller.Decide(true, false, current, null);
             FailoverDecision confirmedFailure = null;
             if (currentFailureConfirmed || (currentScan.Health != CandidateHealth.Unknown &&
@@ -468,12 +468,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             {
                 IEnumerable<NodeHealthRecord> decisionCandidates = suppressedServices.Count == 0
                     ? state.Records.Values.Where(x => freshlyVerified.Contains(x.Name))
-                    : scans.Values.Where(x => freshlyVerified.Contains(x.Name) && ConnectionAssurance.Passed(x)).Select(Record);
+                    : scans.Values.Where(x => freshlyVerified.Contains(x.Name) && ServiceEvidencePolicy.CanEmergencySwitch(x)).Select(Record);
                 confirmedFailure = controller.Decide(false, false, current, decisionCandidates);
             }
             if (!observing && currentScan.Health != CandidateHealth.Unknown && !String.IsNullOrEmpty(best.Key) && best.Key != current)
             {
-                bool currentCompatible = (currentScan.Health == CandidateHealth.Compatible || currentScan.Health == CandidateHealth.BasicCompatible) && scores.TryGetValue(current, out currentScore);
+                bool currentCompatible = ServiceEvidencePolicy.CanEmergencySwitch(currentScan) && scores.TryGetValue(current, out currentScore);
                 bool shouldSwitch;
                 string reason;
                 if (currentCompatible)
@@ -509,7 +509,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         scans[best.Key] = finalScan;
                         scanTimes[best.Key] = clock.UtcNow;
                     }
-                    shouldSwitch = finalScan.Health == CandidateHealth.Compatible || finalScan.Health == CandidateHealth.BasicCompatible;
+                    shouldSwitch = ServiceEvidencePolicy.CanEmergencySwitch(finalScan);
                     if (!shouldSwitch) decision = "目标节点复检未通过，保留当前连接";
                 }
                 CheckStop();
@@ -532,7 +532,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 decision = "证据不足，保留当前节点";
                 logger.Write("待验证，保留当前连接；" + currentScan.Detail);
             }
-            else if (!switched && currentScan.Health != CandidateHealth.Compatible && currentScan.Health != CandidateHealth.BasicCompatible) logger.Write("current check failed " + currentScan.Health + "; awaiting safe replacement");
+            else if (!switched && !ServiceEvidencePolicy.CanHold(currentScan)) logger.Write("current check failed " + currentScan.Health + "; awaiting safe replacement");
             string actual = dryRun ? current : mihomo.GetSelected(config.SharedGroup);
             if (assuranceDecision != null) decision = assuranceDecision;
             CandidateScanResult actualScan;

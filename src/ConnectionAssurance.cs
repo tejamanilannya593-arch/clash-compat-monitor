@@ -24,7 +24,7 @@ public sealed class ConnectionAssurance
     public int StableCycles { get; set; }
     public ConnectionAssurance() { Standbys = new List<StandbyNode>(); }
     public static bool Passed(CandidateScanResult scan)
-    { return scan.Health == CandidateHealth.Compatible || scan.Health == CandidateHealth.BasicCompatible; }
+    { return ServiceEvidencePolicy.CanHold(scan); }
     public void SetScope(string scope)
     {
         if (Scope == scope) return;
@@ -33,7 +33,7 @@ public sealed class ConnectionAssurance
     public void Remember(CandidateScanResult scan, string current, DateTime now)
     {
         Standbys.RemoveAll(x => x.Name == scan.Name || x.Name == current || x.VerifiedUtc < now.AddMinutes(-10));
-        if (scan.Name != current && Passed(scan)) Standbys.Add(new StandbyNode { Name = scan.Name, VerifiedUtc = now });
+        if (scan.Name != current && ServiceEvidencePolicy.CanEmergencySwitch(scan)) Standbys.Add(new StandbyNode { Name = scan.Name, VerifiedUtc = now });
         Standbys = Standbys.OrderByDescending(x => x.VerifiedUtc).Take(2).ToList();
     }
     public string[] Available(IEnumerable<string> eligible, string current, DateTime now)

@@ -38,7 +38,7 @@ public sealed class HealthState
 
     public void RememberPreferred(string name, CandidateHealth health, DateTime verifiedUtc)
     {
-        if (health != CandidateHealth.Compatible && health != CandidateHealth.BasicCompatible) return;
+        if (health != CandidateHealth.Compatible) return;
         PreferredNode = name ?? "";
         PreferredNodeVerifiedUtc = verifiedUtc.ToUniversalTime();
     }

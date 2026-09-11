@@ -58,8 +58,29 @@ internal static class Tests
         StatusReporting();
         ExperienceBehavior();
         ServiceIncidentBehavior();
+        ServiceEvidenceBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void ServiceEvidenceBehavior()
+    {
+        var strict = new CandidateScanResult("strict", CandidateHealth.Compatible, null, "ok");
+        var reachable = new CandidateScanResult("reachable", CandidateHealth.BasicCompatible, null, "challenge");
+        Equal(true, ServiceEvidencePolicy.CanHold(strict), "strict scan can hold");
+        Equal(true, ServiceEvidencePolicy.CanHold(reachable), "reachable scan can hold without churn");
+        Equal(true, ServiceEvidencePolicy.CanEmergencySwitch(strict), "strict scan can be emergency target");
+        Equal(false, ServiceEvidencePolicy.CanEmergencySwitch(reachable), "reachable-only scan cannot be emergency target");
+
+        var assurance = new ConnectionAssurance();
+        assurance.Remember(reachable, "current", DateTime.UtcNow);
+        Equal(0, assurance.Standbys.Count, "reachable-only scan cannot enter standby pool");
+        assurance.Remember(strict, "current", DateTime.UtcNow);
+        Equal(1, assurance.Standbys.Count, "strict scan enters standby pool");
+
+        var state = new HealthState("scope");
+        state.RememberPreferred("partial", CandidateHealth.BasicCompatible, DateTime.UtcNow);
+        Equal("", state.PreferredNode, "reachable-only scan is not persisted as preferred");
     }
 
     private static void AssuranceBehavior()
@@ -67,7 +88,7 @@ internal static class Tests
         DateTime now = DateTime.UtcNow;
         var policy = new ConnectionAssurance();
         policy.SetScope("scope");
-        var healthy = new CandidateScanResult("b", CandidateHealth.BasicCompatible, null, "ok", 100, 1);
+        var healthy = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 100, 1);
         var bad = new CandidateScanResult("b", CandidateHealth.Transient, null, "timeout");
         policy.Remember(healthy, "a", now);
         Equal(1, policy.Available(new[] { "a", "b" }, "a", now).Length, "fresh standby available");
@@ -663,7 +684,7 @@ internal static class Tests
         var basicController = new FailoverController(clock, TimeSpan.FromMinutes(10));
         var basic = new[] { new NodeHealthRecord("basic", CandidateHealth.BasicCompatible, clock.UtcNow, clock.UtcNow, false) };
         Equal(false, basicController.Decide(false, false, "current", basic).ShouldSwitch, "first basic-compatible failure stays");
-        Equal(true, basicController.Decide(false, false, "current", basic).ShouldSwitch, "basic-compatible replacement switches");
+        Equal(false, basicController.Decide(false, false, "current", basic).ShouldSwitch, "basic-compatible replacement remains ineligible");
 
         Equal(clock.UtcNow.AddMinutes(5), HealthPolicy.CooldownUntil(CandidateHealth.Transient, clock.UtcNow), "transient cooldown");
         Equal(clock.UtcNow.AddMinutes(30), HealthPolicy.CooldownUntil(CandidateHealth.ServiceFailed, clock.UtcNow), "service cooldown");
@@ -672,7 +693,7 @@ internal static class Tests
         var state = new HealthState("old");
         state.Records["节点\t一"] = new NodeHealthRecord("节点\t一", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false);
         state.Records["香港"] = new NodeHealthRecord("香港", CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
-        state.RememberPreferred("节点\t一", CandidateHealth.BasicCompatible, clock.UtcNow);
+        state.RememberPreferred("节点\t一", CandidateHealth.Compatible, clock.UtcNow);
         var store = new StateStore(statePath);
         store.Save(state, state.Records.Keys);
         var loaded = store.Load();
@@ -686,12 +707,12 @@ internal static class Tests
         Equal(CandidateHealth.RegionBlocked, loaded.Records["香港"].Health, "fingerprint preserves local exclusion");
 
         var recovery = new HealthState("same");
-        recovery.Records["稳定节点"] = new NodeHealthRecord("稳定节点", CandidateHealth.BasicCompatible,
+        recovery.Records["稳定节点"] = new NodeHealthRecord("稳定节点", CandidateHealth.Compatible,
             clock.UtcNow, clock.UtcNow, false);
-        recovery.RememberPreferred("稳定节点", CandidateHealth.BasicCompatible, clock.UtcNow);
+        recovery.RememberPreferred("稳定节点", CandidateHealth.Compatible, clock.UtcNow);
         var recoveryCandidates = new[] { new CandidateNode("稳定节点", 1), new CandidateNode("其他节点", 1) };
         Equal("稳定节点", ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
-            TimeSpan.FromMinutes(30)), "recent basic node restored");
+            TimeSpan.FromMinutes(30)), "recent strict node restored");
         recovery.ApplySubscriptionFingerprint("changed");
         Equal("稳定节点", ReloadRecovery.ChooseTarget(true, recovery, recoveryCandidates, clock.UtcNow,
             TimeSpan.FromMinutes(30)), "recent preferred node invalidated by reload is selected for live recheck");
