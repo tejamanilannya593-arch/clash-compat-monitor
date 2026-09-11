@@ -131,6 +131,10 @@ internal static class Tests
             HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
                 "<html>captive portal</html>", 100).FailureKind,
             "generic page cannot prove authentication infrastructure");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateAuthenticationResponse(ServiceKind.ChatGPT, 200,
+                "{\"issuer\":\"https://auth.openai.com.evil.example\"}", 100).FailureKind,
+            "lookalike OpenID issuer cannot prove authentication infrastructure");
 
         Equal(false, ChatGptSupportedRegions.Contains("HK"), "actual Hong Kong exit is ChatGPT region risk");
         Equal(true, ChatGptSupportedRegions.Contains("JP"), "Japan is in dated ChatGPT support snapshot");

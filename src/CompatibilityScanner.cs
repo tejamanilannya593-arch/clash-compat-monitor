@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Linq;
+using System.Web.Script.Serialization;
 
 public interface IServiceProbe
 {
@@ -212,10 +213,19 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             return ProbeResult.Partial("认证入口验证页可达，登录链路未验证", elapsed);
         string issuer = service == ServiceKind.ChatGPT ? "https://auth.openai.com" :
             service == ServiceKind.Gemini ? "https://accounts.google.com" : "";
-        if (status == 200 && !String.IsNullOrEmpty(issuer) && !String.IsNullOrEmpty(body) &&
-            body.IndexOf(issuer, StringComparison.OrdinalIgnoreCase) >= 0 &&
-            body.IndexOf("issuer", StringComparison.OrdinalIgnoreCase) >= 0)
-            return ProbeResult.Success(elapsed);
+        if (status == 200 && !String.IsNullOrEmpty(issuer) && !String.IsNullOrEmpty(body))
+        {
+            try
+            {
+                var metadata = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(body);
+                object actual;
+                if (metadata != null && metadata.TryGetValue("issuer", out actual) && actual != null &&
+                    String.Equals(Convert.ToString(actual), issuer, StringComparison.OrdinalIgnoreCase))
+                    return ProbeResult.Success(elapsed);
+            }
+            catch (ArgumentException) { }
+            catch (InvalidOperationException) { }
+        }
         return ProbeResult.ServiceFailure("authentication metadata unavailable", elapsed);
     }
 
