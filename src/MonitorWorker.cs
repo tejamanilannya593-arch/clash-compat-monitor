@@ -591,7 +591,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 decision = reason;
                 if (currentCompatible && clock.UtcNow < assurance.HoldUntilUtc) { shouldSwitch = false; decision = "处于切换观察后的稳定期，保持连接"; }
                 if (currentCompatible && !trafficIdle) { shouldSwitch = false; decision = "检测到较大流量，保持当前节点"; }
-                if (shouldSwitch && !dryRun && preferences.AutomaticOptimization)
+                if (shouldSwitch && !dryRun && SwitchModePolicy.AllowsAutomaticSwitch(currentCompatible, preferences.AutomaticOptimization))
                 {
                     DateTime verifiedUtc;
                     CandidateScanResult finalScan;
@@ -610,7 +610,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     if (!shouldSwitch) decision = "目标节点复检未通过，保留当前连接";
                 }
                 CheckStop();
-                if (shouldSwitch && !dryRun && preferences.AutomaticOptimization && String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
+                if (shouldSwitch && !dryRun && SwitchModePolicy.AllowsAutomaticSwitch(currentCompatible, preferences.AutomaticOptimization) &&
+                    String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
                 {
                     bool provisional = !ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan,
                         experience, memoryScope, requiredServices, clock.UtcNow);

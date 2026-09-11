@@ -19,6 +19,14 @@ public sealed class FailoverDecision
     public string Reason { get; private set; }
 }
 
+public static class SwitchModePolicy
+{
+    public static bool AllowsAutomaticSwitch(bool currentCompatible, bool performanceOptimization)
+    {
+        return !currentCompatible || performanceOptimization;
+    }
+}
+
 public sealed class FailoverController
 {
     private readonly IClock clock;

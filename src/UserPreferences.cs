@@ -8,12 +8,14 @@ public sealed class UserPreferences
 {
     public bool FirstRunComplete { get; set; }
     public bool AutomaticOptimization { get; set; }
+    public bool BrowserConversationVerification { get; set; }
     public List<ServiceKind> RequiredServices { get; set; }
 
     public static UserPreferences Defaults()
     {
         return new UserPreferences {
-            AutomaticOptimization = true,
+            AutomaticOptimization = false,
+            BrowserConversationVerification = false,
             RequiredServices = new List<ServiceKind> {
                 ServiceKind.Google,
                 ServiceKind.GitHub,
@@ -46,14 +48,29 @@ public sealed class UserPreferenceStore
                 .Select(line => line.Split(new[] { '=' }, 2))
                 .Where(parts => parts.Length == 2)
                 .ToDictionary(parts => parts[0], parts => parts[1], StringComparer.OrdinalIgnoreCase);
+            int version;
             bool firstRun;
             bool automatic;
+            bool browserConversation = false;
+            string versionValue;
             string firstRunValue;
             string automaticValue;
+            string browserConversationValue;
             string serviceValue;
-            if (!values.TryGetValue("firstRun", out firstRunValue) || !Boolean.TryParse(firstRunValue, out firstRun) ||
+            if (!values.TryGetValue("version", out versionValue) || !Int32.TryParse(versionValue, out version) ||
+                (version != 1 && version != 2) ||
+                !values.TryGetValue("firstRun", out firstRunValue) || !Boolean.TryParse(firstRunValue, out firstRun) ||
                 !values.TryGetValue("automatic", out automaticValue) || !Boolean.TryParse(automaticValue, out automatic) ||
                 !values.TryGetValue("services", out serviceValue)) throw new InvalidDataException("Preferences are incomplete.");
+            if (version == 1)
+            {
+                automatic = false;
+            }
+            else if (!values.TryGetValue("browserConversation", out browserConversationValue) ||
+                !Boolean.TryParse(browserConversationValue, out browserConversation))
+            {
+                throw new InvalidDataException("Preferences are incomplete.");
+            }
 
             var services = new List<ServiceKind>();
             foreach (string name in serviceValue.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
@@ -68,6 +85,7 @@ public sealed class UserPreferenceStore
             return new UserPreferences {
                 FirstRunComplete = firstRun,
                 AutomaticOptimization = automatic,
+                BrowserConversationVerification = browserConversation,
                 RequiredServices = services
             };
         }
@@ -89,9 +107,10 @@ public sealed class UserPreferenceStore
         string directory = Path.GetDirectoryName(path);
         if (!String.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
         string temporary = path + ".tmp";
-        string text = "version=1" + Environment.NewLine +
+        string text = "version=2" + Environment.NewLine +
             "firstRun=" + value.FirstRunComplete + Environment.NewLine +
             "automatic=" + value.AutomaticOptimization + Environment.NewLine +
+            "browserConversation=" + value.BrowserConversationVerification + Environment.NewLine +
             "services=" + String.Join(",", services.Select(service => service.ToString())) + Environment.NewLine;
         File.WriteAllText(temporary, text, Encoding.UTF8);
         if (File.Exists(path)) File.Replace(temporary, path, null);

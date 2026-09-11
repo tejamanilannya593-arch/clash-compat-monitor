@@ -845,6 +845,9 @@ internal static class Tests
     {
         var clock = new FakeClock { UtcNow = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc) };
         var controller = new FailoverController(clock, TimeSpan.FromMinutes(10));
+        Equal(true, SwitchModePolicy.AllowsAutomaticSwitch(false, false), "fault failover remains enabled in conservative mode");
+        Equal(false, SwitchModePolicy.AllowsAutomaticSwitch(true, false), "healthy current holds in conservative mode");
+        Equal(true, SwitchModePolicy.AllowsAutomaticSwitch(true, true), "advanced mode may optimize healthy current");
         Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred HTTP response threshold");
         Equal("优秀", QualityPolicy.LatencyBand(500), "excellent latency band boundary");
         Equal("良好", QualityPolicy.LatencyBand(800), "good latency band boundary");
@@ -1014,12 +1017,19 @@ internal static class Tests
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
+        Equal(false, defaults.AutomaticOptimization, "performance optimization defaults off");
+        Equal(false, defaults.BrowserConversationVerification, "browser proof defaults off");
         defaults.FirstRunComplete = true;
         defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub };
+        defaults.AutomaticOptimization = true;
+        defaults.BrowserConversationVerification = true;
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
         Equal(2, loaded.RequiredServices.Count, "service selection persisted");
+        Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
+        Equal(true, loaded.BrowserConversationVerification, "browser proof consent persisted");
+        Equal(true, File.ReadAllText(path).Contains("version=2"), "preference schema upgraded");
         File.WriteAllText(path, "broken", Encoding.UTF8);
         Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
@@ -1032,6 +1042,8 @@ internal static class Tests
         var migrationStore = new UserPreferenceStore(migrationPath);
         UserPreferences migrated = migrationStore.Load();
         Equal("ChatGPT,GitHub", String.Join(",", migrated.RequiredServices), "legacy jmcomic preference ignored");
+        Equal(false, migrated.AutomaticOptimization, "v1 optimization migrates to conservative mode");
+        Equal(false, migrated.BrowserConversationVerification, "v1 browser proof requires consent");
         Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
             "legacy jmcomic preference is migration not corruption");
         migrationStore.Save(migrated);

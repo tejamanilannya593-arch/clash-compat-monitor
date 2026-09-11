@@ -310,6 +310,7 @@ public sealed class MonitorCoordinator : IDisposable
         return new UserPreferences {
             FirstRunComplete = value.FirstRunComplete,
             AutomaticOptimization = value.AutomaticOptimization,
+            BrowserConversationVerification = value.BrowserConversationVerification,
             RequiredServices = new System.Collections.Generic.List<ServiceKind>(value.RequiredServices)
         };
     }

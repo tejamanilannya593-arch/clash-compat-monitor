@@ -18,6 +18,8 @@ public sealed class DetailsForm : Form
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
     private readonly List<ServiceChoice> choices = new List<ServiceChoice>();
+    private readonly CheckBox performanceOptimization = new CheckBox();
+    private readonly CheckBox browserConversationVerification = new CheckBox();
     private readonly Label stateLabel = HeadingLabel();
     private readonly Label nodeLabel = new Label();
     private readonly Label decisionLabel = new Label();
@@ -89,6 +91,16 @@ public sealed class DetailsForm : Form
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);
+        performanceOptimization.Text = "当前节点可用时允许性能寻优（高级）";
+        performanceOptimization.AutoSize = true;
+        performanceOptimization.Checked = preferences.AutomaticOptimization;
+        performanceOptimization.Margin = new Padding(0, 12, 0, 0);
+        layout.Controls.Add(performanceOptimization);
+        browserConversationVerification.Text = "允许浏览器伴侣自动进行真实对话验证";
+        browserConversationVerification.AutoSize = true;
+        browserConversationVerification.Checked = preferences.BrowserConversationVerification;
+        browserConversationVerification.Margin = new Padding(0, 7, 0, 0);
+        layout.Controls.Add(browserConversationVerification);
         var save = new Button { Text = "保存并开始自动优化", AutoSize = true, Height = 38,
             Padding = new Padding(14, 4, 14, 4), BackColor = Color.FromArgb(45, 120, 240), ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 16, 0, 0) };
@@ -115,7 +127,10 @@ public sealed class DetailsForm : Form
             MessageBox.Show(this, "请至少选择一个服务。", "节点守护", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        savePreferences(new UserPreferences { FirstRunComplete = true, AutomaticOptimization = true, RequiredServices = selected });
+        savePreferences(new UserPreferences { FirstRunComplete = true,
+            AutomaticOptimization = performanceOptimization.Checked,
+            BrowserConversationVerification = browserConversationVerification.Checked,
+            RequiredServices = selected });
         ShowSettings(false);
     }
 
