@@ -175,6 +175,20 @@ internal static class Tests
         Equal(true, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
             ServiceKind.ChatGPT, now.AddDays(29), AccountVerificationMemory.CurrentRuleVersion),
             "account proof valid for same exit before thirty days");
+        Equal(false, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), BrowserConversationProof.CurrentProtocolVersion),
+            "legacy manual proof cannot authorize browser proof");
+        AccountVerificationMemory.MarkBrowserConversation(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now, BrowserConversationProof.CurrentProtocolVersion);
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(29), BrowserConversationProof.CurrentProtocolVersion),
+            "browser proof valid for same exit before thirty days");
+        Equal(false, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(30), BrowserConversationProof.CurrentProtocolVersion),
+            "browser proof expires at thirty days");
+        Equal(false, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), BrowserConversationProof.CurrentProtocolVersion + 1),
+            "browser proof invalid after protocol upgrade");
         Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "changed",
             ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
             "account proof invalid after exit change");
@@ -193,8 +207,8 @@ internal static class Tests
         Equal(false, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
             "quality switch waits for every selected AI account proof");
-        AccountVerificationMemory.Mark(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
-            true, now, AccountVerificationMemory.CurrentRuleVersion);
+        AccountVerificationMemory.MarkBrowserConversation(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
+            now, BrowserConversationProof.CurrentProtocolVersion);
         Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
             "quality switch accepts current exit after both AI proofs");
@@ -212,6 +226,9 @@ internal static class Tests
         var store = new ExperienceStore(path);
         store.Save(data, now);
         ExperienceData loaded = store.Load();
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(loaded, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), BrowserConversationProof.CurrentProtocolVersion),
+            "browser proof method survives restart");
         Equal(true, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
             ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
             "account proof survives restart");

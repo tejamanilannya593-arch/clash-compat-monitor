@@ -22,8 +22,8 @@ public static class ServiceEvidencePolicy
         foreach (ServiceKind service in (requiredServices ?? Enumerable.Empty<ServiceKind>())
             .Where(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini).Distinct())
         {
-            if (!AccountVerificationMemory.IsValid(data, scope, scan.Name, scan.ExitFingerprint,
-                service, now, AccountVerificationMemory.CurrentRuleVersion)) return false;
+            if (!AccountVerificationMemory.IsBrowserConversationValid(data, scope, scan.Name,
+                scan.ExitFingerprint, service, now, BrowserConversationProof.CurrentProtocolVersion)) return false;
         }
         return true;
     }
