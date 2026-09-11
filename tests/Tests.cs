@@ -52,6 +52,7 @@ internal static class Tests
         StabilityAndState();
         RuntimeGuards();
         UserPreferenceBehavior();
+        AccountVerificationUiBehavior();
         MonitorCoordinatorBehavior();
         InstanceActivationBehavior();
         CommandLineBehavior();
@@ -151,6 +152,8 @@ internal static class Tests
         Equal(CandidateHealth.Compatible, supported.Health, "actual supported exit wins over node label");
         Equal("JP", supported.ExitCountryCode, "scan carries actual exit country");
         Equal("exit-jp", supported.ExitFingerprint, "scan carries encrypted exit fingerprint");
+        Equal("exit-jp", MonitorSnapshot.CreateRunning(supported.Name, supported, null, "ok",
+            DateTime.UtcNow, DateTime.UtcNow).ExitFingerprint, "snapshot carries exit fingerprint for user verification");
 
         CandidateScanResult unsupported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
             new FakeExitIdentityProbe(new ExitIdentity("exit-hk", "HK", "ok")))
@@ -1031,6 +1034,36 @@ internal static class Tests
             coordinator.RequestCheck();
             Equal(true, SpinWait.SpinUntil(() => coordinator.Latest.State == MonitorRunState.Running, 1000), "coordinator recovers after restore exception");
         }
+
+        var accountRunner = new AccountVerificationCycleRunner();
+        using (var coordinator = new MonitorCoordinator(accountRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, accountRunner.WaitForRunCount(1, 1000), "account runner initial cycle");
+            coordinator.RequestAccountVerification("node", "fingerprint",
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, new DateTime(2026, 9, 11, 0, 0, 0, DateTimeKind.Utc));
+            Equal(true, SpinWait.SpinUntil(() => accountRunner.VerificationCount == 1, 1000),
+                "account verification command reaches runner once");
+            Equal(true, accountRunner.WaitForRunCount(2, 1000), "account verification requests follow-up scan");
+            Equal("fingerprint", accountRunner.LastFingerprint, "account command preserves exit fingerprint");
+            coordinator.ReportServiceFailure("node", ServiceKind.ChatGPT,
+                new DateTime(2026, 9, 11, 0, 1, 0, DateTimeKind.Utc));
+            Equal(true, SpinWait.SpinUntil(() => accountRunner.FailureCount == 1, 1000),
+                "negative account feedback reaches runner once");
+            Equal(true, accountRunner.WaitForRunCount(3, 1000), "negative feedback requests follow-up scan");
+        }
+    }
+
+    private static void AccountVerificationUiBehavior()
+    {
+        Equal(AccountVerificationSelection.ChatGPT | AccountVerificationSelection.Gemini,
+            AccountVerificationForm.SelectedServices(true, true), "verification selects both AI services");
+        Equal(AccountVerificationSelection.ChatGPT,
+            AccountVerificationForm.SelectedServices(true, false), "verification selects ChatGPT only");
+        Equal(AccountVerificationSelection.Gemini,
+            AccountVerificationForm.SelectedServices(false, true), "verification selects Gemini only");
+        Equal(AccountVerificationSelection.None,
+            AccountVerificationForm.SelectedServices(false, false), "verification cancel selects no service");
     }
 
     private sealed class ThrowingRestoreRunner : IRestorableCycleRunner
@@ -1096,6 +1129,36 @@ internal static class Tests
         }
     }
 
+    private sealed class AccountVerificationCycleRunner : IAccountVerificationRunner
+    {
+        private int runCount;
+        private int verificationCount;
+        private int failureCount;
+        public int VerificationCount { get { return Volatile.Read(ref verificationCount); } }
+        public int FailureCount { get { return Volatile.Read(ref failureCount); } }
+        public string LastFingerprint { get; private set; }
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+        }
+        public bool RecordAccountVerification(string node, string exitFingerprint,
+            IEnumerable<ServiceKind> services, DateTime verifiedUtc)
+        {
+            LastFingerprint = exitFingerprint;
+            Interlocked.Increment(ref verificationCount);
+            return true;
+        }
+        public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
+        {
+            Interlocked.Increment(ref failureCount);
+        }
+        public bool WaitForRunCount(int expected, int milliseconds)
+        {
+            return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
+        }
+    }
+
     private static void StatusReporting()
     {
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
@@ -1112,10 +1175,12 @@ internal static class Tests
         Equal(true, translated.Contains("决定：质量提升不足 20%，保持当前节点"), "status translates controller decision");
         Equal(false, translated.Contains("quality difference below threshold"), "status omits raw English decision");
         Equal("候选节点尚未积累 5 次、跨度 30 分钟且成功率不低于 95% 的历史", StatusReport.DecisionText("target requires proven stability"), "status explains conservative quality gate");
-        Equal("当前节点响应不超过 500 ms，保持当前节点", StatusReport.DecisionText("current response already preferred"), "status explains good-enough latency hold");
-        Equal("候选节点响应超过 500 ms，不进行性能切换", StatusReport.DecisionText("target response exceeds preferred threshold"), "status explains candidate latency gate");
+        Equal("当前节点响应不超过 800 ms，保持当前节点", StatusReport.DecisionText("current response already preferred"), "status explains good-enough latency hold");
+        Equal("候选节点响应超过自动寻优标准，不进行性能切换", StatusReport.DecisionText("target response exceeds preferred threshold"), "status explains candidate latency gate");
         Equal("当前节点最近 3 次中位响应未超过 800 ms，保持当前节点", StatusReport.DecisionText("current response not persistently slow"), "status explains latency hysteresis");
-        Equal("候选节点最近 5 次延迟未达到优质标准", StatusReport.DecisionText("target response history not preferred"), "status explains robust candidate latency gate");
-        Equal("候选节点存在超过 1000 ms 的服务响应", StatusReport.DecisionText("target service response exceeds limit"), "status explains per-service latency gate");
+        Equal("候选节点最近 5 次延迟未达到中位数不超过 800 ms、单次不超过 1500 ms 的标准", StatusReport.DecisionText("target response history not preferred"), "status explains robust candidate latency gate");
+        Equal("候选节点存在超过 1500 ms 的服务响应", StatusReport.DecisionText("target service response exceeds limit"), "status explains per-service latency gate");
+        Equal("候选节点尚未完成所选 AI 服务的账号实测，不进行性能切换", StatusReport.DecisionText("target requires account verification"), "status explains account proof gate");
+        Equal("当前节点故障，临时切换到登录链路已通过但尚未账号实测的节点", StatusReport.DecisionText("provisional emergency failover"), "status explains provisional emergency target");
     }
 }

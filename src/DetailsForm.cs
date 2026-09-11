@@ -10,6 +10,8 @@ public sealed class DetailsForm : Form
     private readonly Action requestCheck;
     private readonly Action<bool> setPaused;
     private readonly Action restorePrevious;
+    private readonly Action<string, string, IEnumerable<ServiceKind>, DateTime> recordAccountVerification;
+    private readonly Action<string, ServiceKind, DateTime> reportServiceFailure;
     private readonly Action exitApplication;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
@@ -23,14 +25,19 @@ public sealed class DetailsForm : Form
     private readonly ListView serviceList = new ListView();
     private readonly Button pauseButton = new Button();
     private bool paused;
+    private MonitorSnapshot latestSnapshot;
 
     public DetailsForm(UserPreferences preferences, Action<UserPreferences> savePreferences,
-        Action requestCheck, Action<bool> setPaused, Action restorePrevious, Action exitApplication)
+        Action requestCheck, Action<bool> setPaused, Action restorePrevious,
+        Action<string, string, IEnumerable<ServiceKind>, DateTime> recordAccountVerification,
+        Action<string, ServiceKind, DateTime> reportServiceFailure, Action exitApplication)
     {
         this.savePreferences = savePreferences;
         this.requestCheck = requestCheck;
         this.setPaused = setPaused;
         this.restorePrevious = restorePrevious;
+        this.recordAccountVerification = recordAccountVerification;
+        this.reportServiceFailure = reportServiceFailure;
         this.exitApplication = exitApplication;
 
         Text = "节点守护";
@@ -160,6 +167,9 @@ public sealed class DetailsForm : Form
         };
         buttons.Controls.Add(pauseButton);
         buttons.Controls.Add(ActionButton("恢复上一个节点", delegate { restorePrevious(); }));
+        buttons.Controls.Add(ActionButton("验证当前节点的 AI 服务", delegate { VerifyCurrentNode(); }));
+        buttons.Controls.Add(ActionButton("当前节点 ChatGPT 不可用", delegate { ReportCurrentFailure(ServiceKind.ChatGPT); }));
+        buttons.Controls.Add(ActionButton("当前节点 Gemini 不可用", delegate { ReportCurrentFailure(ServiceKind.Gemini); }));
         buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
         buttons.Controls.Add(ActionButton("切换记录与推荐", delegate { using (var window = new ExperienceForm()) window.ShowDialog(this); }));
         buttons.Controls.Add(ActionButton("运行统计", delegate { using (var window = new StatisticsForm()) window.ShowDialog(this); }));
@@ -172,6 +182,7 @@ public sealed class DetailsForm : Form
     public void UpdateSnapshot(MonitorSnapshot snapshot)
     {
         if (snapshot == null || IsDisposed) return;
+        latestSnapshot = snapshot;
         MonitorPresentation view = MonitorPresentation.From(snapshot);
         stateLabel.Text = view.StateText;
         nodeLabel.Text = view.NodeText;
@@ -192,6 +203,38 @@ public sealed class DetailsForm : Form
             serviceList.Items.Add(item);
         }
         serviceList.EndUpdate();
+    }
+
+    private void VerifyCurrentNode()
+    {
+        if (latestSnapshot == null || String.IsNullOrWhiteSpace(latestSnapshot.ActualNode) ||
+            String.IsNullOrWhiteSpace(latestSnapshot.ExitFingerprint))
+        {
+            MessageBox.Show(this, "请先完成一次当前节点检测，以确认实际出口。", "节点守护",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        using (var form = new AccountVerificationForm(latestSnapshot.ActualNode))
+        {
+            if (form.ShowDialog(this) != DialogResult.OK) return;
+            var verified = AccountVerificationForm.Services(form.VerifiedSelection).ToList();
+            if (verified.Count > 0)
+                recordAccountVerification(latestSnapshot.ActualNode, latestSnapshot.ExitFingerprint,
+                    verified, DateTime.UtcNow);
+            if (form.FailedService.HasValue)
+                reportServiceFailure(latestSnapshot.ActualNode, form.FailedService.Value, DateTime.UtcNow);
+        }
+    }
+
+    private void ReportCurrentFailure(ServiceKind service)
+    {
+        if (latestSnapshot == null || String.IsNullOrWhiteSpace(latestSnapshot.ActualNode))
+        {
+            MessageBox.Show(this, "当前还没有可反馈的节点。", "节点守护",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        reportServiceFailure(latestSnapshot.ActualNode, service, DateTime.UtcNow);
     }
 
     private void ShowSettings(bool value)

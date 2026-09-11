@@ -44,19 +44,23 @@ public sealed class MonitorSnapshot
     public DateTime CheckedUtc { get; private set; }
     public DateTime NextCheckUtc { get; private set; }
     public IList<ServiceMeasurement> Services { get; private set; }
+    public string ExitFingerprint { get; private set; }
+    public string ExitCountryCode { get; private set; }
 
     public MonitorSnapshot WithState(MonitorRunState state, string decision, DateTime nextCheckUtc)
     {
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = nextCheckUtc, Services = Services };
+            NextCheckUtc = nextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            ExitCountryCode = ExitCountryCode };
     }
 
     public MonitorSnapshot WithSelectionReason(string reason)
     {
         return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = reason ?? "", CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = Services };
+            NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            ExitCountryCode = ExitCountryCode };
     }
 
     public MonitorSnapshot WithProgress(string decision)
@@ -94,7 +98,9 @@ public sealed class MonitorSnapshot
             NextCheckUtc = nextCheckUtc,
             Services = scan.ServiceResults.OrderBy(pair => pair.Key)
                 .Select(pair => new ServiceMeasurement(pair.Key, pair.Value.Passed,
-                    pair.Value.ElapsedMilliseconds, pair.Value.Detail, pair.Value.FailureKind)).ToList().AsReadOnly()
+                    pair.Value.ElapsedMilliseconds, pair.Value.Detail, pair.Value.FailureKind)).ToList().AsReadOnly(),
+            ExitFingerprint = scan.ExitFingerprint ?? "",
+            ExitCountryCode = scan.ExitCountryCode ?? ""
         };
     }
 }

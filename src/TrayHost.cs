@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.Windows.Forms;
+using System.Linq;
 
 public sealed class TrayHost : ApplicationContext
 {
@@ -23,6 +24,9 @@ public sealed class TrayHost : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add("打开详情", null, delegate { ShowDetails(); });
         menu.Items.Add("立即复检", null, delegate { coordinator.RequestCheck(); });
+        menu.Items.Add("验证当前节点的 AI 服务", null, delegate { ShowAccountVerification(); });
+        menu.Items.Add("当前节点 ChatGPT 不可用", null, delegate { ReportCurrentFailure(ServiceKind.ChatGPT); });
+        menu.Items.Add("当前节点 Gemini 不可用", null, delegate { ReportCurrentFailure(ServiceKind.Gemini); });
         menu.Items.Add("暂停自动优化", null, delegate { coordinator.SetPaused(true); });
         menu.Items.Add("恢复自动优化", null, delegate { coordinator.SetPaused(false); });
         menu.Items.Add(new ToolStripSeparator());
@@ -55,13 +59,47 @@ public sealed class TrayHost : ApplicationContext
         if (details == null || details.IsDisposed)
         {
             details = new DetailsForm(preferences, SavePreferences, coordinator.RequestCheck,
-                coordinator.SetPaused, coordinator.RequestRestorePrevious, ExitThread);
+                coordinator.SetPaused, coordinator.RequestRestorePrevious,
+                coordinator.RequestAccountVerification, coordinator.ReportServiceFailure, ExitThread);
             details.FormClosed += delegate { details = null; MemoryTrimmer.TrimIdleWorkingSet(); };
         }
         details.UpdateSnapshot(coordinator.Latest);
         details.Show();
         if (details.WindowState == FormWindowState.Minimized) details.WindowState = FormWindowState.Normal;
         details.Activate();
+    }
+
+    private void ShowAccountVerification()
+    {
+        MonitorSnapshot snapshot = coordinator.Latest;
+        if (snapshot == null || String.IsNullOrWhiteSpace(snapshot.ActualNode) ||
+            String.IsNullOrWhiteSpace(snapshot.ExitFingerprint))
+        {
+            tray.ShowBalloonTip(4000, "节点守护", "请先完成一次当前节点检测，以确认实际出口。", ToolTipIcon.Info);
+            coordinator.RequestCheck();
+            return;
+        }
+        using (var form = new AccountVerificationForm(snapshot.ActualNode))
+        {
+            if (form.ShowDialog() != DialogResult.OK) return;
+            var services = AccountVerificationForm.Services(form.VerifiedSelection).ToList();
+            if (services.Count > 0)
+                coordinator.RequestAccountVerification(snapshot.ActualNode, snapshot.ExitFingerprint,
+                    services, DateTime.UtcNow);
+            if (form.FailedService.HasValue)
+                coordinator.ReportServiceFailure(snapshot.ActualNode, form.FailedService.Value, DateTime.UtcNow);
+        }
+    }
+
+    private void ReportCurrentFailure(ServiceKind service)
+    {
+        MonitorSnapshot snapshot = coordinator.Latest;
+        if (snapshot == null || String.IsNullOrWhiteSpace(snapshot.ActualNode))
+        {
+            tray.ShowBalloonTip(4000, "节点守护", "当前还没有可反馈的节点。", ToolTipIcon.Info);
+            return;
+        }
+        coordinator.ReportServiceFailure(snapshot.ActualNode, service, DateTime.UtcNow);
     }
 
     private void SavePreferences(UserPreferences value)

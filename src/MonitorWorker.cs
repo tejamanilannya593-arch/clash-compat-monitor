@@ -38,7 +38,7 @@ public sealed class BoundedLogger
     }
 }
 
-public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
+public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner, IAccountVerificationRunner
 {
     private readonly MonitorConfiguration config;
     private readonly IMihomoClient mihomo;
@@ -111,6 +111,53 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         controller.RecordSwitch();
         logger.Write("restored previous node=" + SafeName(target));
         return true;
+    }
+
+    public bool RecordAccountVerification(string node, string exitFingerprint,
+        IEnumerable<ServiceKind> services, DateTime verifiedUtc)
+    {
+        if (String.IsNullOrWhiteSpace(node) || String.IsNullOrWhiteSpace(exitFingerprint) ||
+            !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal) ||
+            String.IsNullOrWhiteSpace(experience.ActiveScope)) return false;
+        int recorded = 0;
+        foreach (ServiceKind service in (services ?? new ServiceKind[0]).Distinct())
+        {
+            if (service != ServiceKind.ChatGPT && service != ServiceKind.Gemini) continue;
+            AccountVerificationMemory.Mark(experience, experience.ActiveScope, node, exitFingerprint,
+                service, true, verifiedUtc, AccountVerificationMemory.CurrentRuleVersion);
+            recorded++;
+        }
+        if (recorded == 0) return false;
+        experienceStore.Save(experience, verifiedUtc);
+        logger.Write("account verification recorded node=" + SafeName(node) + " services=" + recorded);
+        return true;
+    }
+
+    public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
+    {
+        if (service != ServiceKind.ChatGPT && service != ServiceKind.Gemini) return;
+        AccountVerificationMemory.Revoke(experience, experience.ActiveScope, node, service,
+            reportedUtc, "user reported failure");
+        logger.Write("user reported service failure node=" + SafeName(node) + " service=" + service);
+        ConnectionAssurance assurance = experience.Assurance;
+        string current = mihomo.GetSelected(config.SharedGroup);
+        if (String.Equals(current, node, StringComparison.Ordinal) && assurance != null &&
+            !String.IsNullOrWhiteSpace(assurance.Previous) && assurance.Previous != current &&
+            mihomo.GetChoices(config.SharedGroup).Contains(assurance.Previous, StringComparer.Ordinal))
+        {
+            string previous = assurance.Previous;
+            CandidateScanResult verified = scanner.ScanSelected(new CandidateNode(previous, null), lastPreferences.RequiredServices);
+            if (ServiceEvidencePolicy.CanEmergencySwitch(verified) && mihomo.GetSelected(config.SharedGroup) == current)
+            {
+                SelectRecorded(current, previous, "用户反馈 AI 服务失败，旧节点复检通过，自动回退");
+                previousSelectedNode = current;
+                assurance.Target = null;
+                assurance.HoldUntilUtc = reportedUtc.AddMinutes(30);
+                controller.RecordSwitch();
+                logger.Write("user feedback rollback node=" + SafeName(previous));
+            }
+        }
+        experienceStore.Save(experience, reportedUtc);
     }
 
     public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)
@@ -202,6 +249,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, servicesToProbe);
             currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
+            AccountVerificationMemory.RevokeForChangedExit(experience, memoryScope, current,
+                currentScan.ExitFingerprint, clock.UtcNow);
             logger.Write("current check completed elapsed_seconds=" + cycleTimer.Elapsed.TotalSeconds.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) +
                 " health=" + currentScan.Health);
             string assuranceDecision = null;
@@ -456,7 +505,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             foreach (var remembered in experience.Recommend(memoryScope, scores.Keys, clock.UtcNow))
                 scores[remembered.Node].Score = 0.8 * scores[remembered.Node].Score + 0.2 * remembered.Rank(clock.UtcNow);
             QualityBreakdown currentScore = null;
-            var best = scores.OrderByDescending(x => x.Value.Score).FirstOrDefault();
+            var best = scores.OrderByDescending(x => {
+                CandidateScanResult candidateScan;
+                scans.TryGetValue(x.Key, out candidateScan);
+                return ServiceEvidencePolicy.CanQualitySwitch(candidateScan, experience,
+                    memoryScope, requiredServices, clock.UtcNow);
+            }).ThenByDescending(x => x.Value.Score).FirstOrDefault();
             bool switched = false;
             string decision = serviceIncidentDecision ??
                 (recoveredAfterReload ? "配置重载后恢复最近稳定节点" : "保持当前节点");
@@ -530,9 +584,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 CheckStop();
                 if (shouldSwitch && !dryRun && preferences.AutomaticOptimization && String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
                 {
-                    SelectRecorded(current, best.Key, "自动切换：" + StatusReport.DecisionText(reason));
                     bool provisional = !ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan,
                         experience, memoryScope, requiredServices, clock.UtcNow);
+                    if (!currentCompatible && provisional) reason = "provisional emergency failover";
+                    SelectRecorded(current, best.Key, "自动切换：" + StatusReport.DecisionText(reason));
                     assurance.Begin(current, best.Key, currentResponse, currentCompatible, provisional);
                     experienceStore.Save(experience, clock.UtcNow);
                     previousSelectedNode = current;
@@ -544,6 +599,11 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
             }
             if (dryRun) logger.Write("dry-run quality evaluation completed; shared selector unchanged");
+            else if (!switched && currentScan.Health == CandidateHealth.BasicCompatible && serviceIncidentDecision == null)
+            {
+                decision = "current entry reachable but login unverified";
+                logger.Write("current entry reachable but login remains unverified; holding current node");
+            }
             else if (!switched && currentScan.Health == CandidateHealth.Unknown && serviceIncidentDecision == null)
             {
                 decision = "证据不足，保留当前节点";

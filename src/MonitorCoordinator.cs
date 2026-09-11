@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 
 public interface IMonitorCycleRunner
 {
@@ -18,6 +19,13 @@ public interface IProgressCycleRunner : IMonitorCycleRunner
     Func<bool> ShouldStop { get; set; }
 }
 
+public interface IAccountVerificationRunner : IMonitorCycleRunner
+{
+    bool RecordAccountVerification(string node, string exitFingerprint,
+        IEnumerable<ServiceKind> services, DateTime verifiedUtc);
+    void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc);
+}
+
 public sealed class MonitorCoordinator : IDisposable
 {
     private readonly IMonitorCycleRunner runner;
@@ -26,6 +34,8 @@ public sealed class MonitorCoordinator : IDisposable
     private readonly AutoResetEvent wake = new AutoResetEvent(false);
     private readonly object snapshotGate = new object();
     private readonly object preferencesGate = new object();
+    private readonly object accountCommandGate = new object();
+    private readonly List<Action<IAccountVerificationRunner>> accountCommands = new List<Action<IAccountVerificationRunner>>();
     private Thread thread;
     private MonitorSnapshot latest;
     private UserPreferences preferences = UserPreferences.Defaults();
@@ -82,6 +92,22 @@ public sealed class MonitorCoordinator : IDisposable
         RequestCheck();
     }
 
+    public void RequestAccountVerification(string node, string exitFingerprint,
+        IEnumerable<ServiceKind> services, DateTime verifiedUtc)
+    {
+        var selected = new List<ServiceKind>(services ?? new ServiceKind[0]);
+        lock (accountCommandGate)
+            accountCommands.Add(value => value.RecordAccountVerification(node, exitFingerprint, selected, verifiedUtc));
+        RequestCheck();
+    }
+
+    public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
+    {
+        lock (accountCommandGate)
+            accountCommands.Add(value => value.ReportServiceFailure(node, service, reportedUtc));
+        RequestCheck();
+    }
+
     public void SetPaused(bool value)
     {
         Interlocked.Exchange(ref paused, value ? 1 : 0);
@@ -124,6 +150,7 @@ public sealed class MonitorCoordinator : IDisposable
             lock (preferencesGate) current = Copy(preferences);
             Publish(Latest.WithState(MonitorRunState.Checking, "正在检测当前节点及所选服务", DateTime.MaxValue), false);
             Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => {
+                RunAccountCommands();
                 if (restore)
                 {
                     var restorable = runner as IRestorableCycleRunner;
@@ -165,6 +192,19 @@ public sealed class MonitorCoordinator : IDisposable
             nextRunUtc = requested > DateTime.UtcNow && requested < DateTime.UtcNow.AddMinutes(5) ? requested : DateTime.UtcNow.Add(interval);
         }
         Publish(MonitorSnapshot.CreateState(MonitorRunState.Stopped, "已退出", DateTime.UtcNow, DateTime.MaxValue), false);
+    }
+
+    private void RunAccountCommands()
+    {
+        List<Action<IAccountVerificationRunner>> pending;
+        lock (accountCommandGate)
+        {
+            pending = new List<Action<IAccountVerificationRunner>>(accountCommands);
+            accountCommands.Clear();
+        }
+        IAccountVerificationRunner accountRunner = runner as IAccountVerificationRunner;
+        if (accountRunner == null) return;
+        foreach (Action<IAccountVerificationRunner> command in pending) command(accountRunner);
     }
 
     private void OnProgress(MonitorSnapshot value)

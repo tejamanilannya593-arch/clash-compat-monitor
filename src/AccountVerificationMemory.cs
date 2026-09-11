@@ -65,6 +65,19 @@ public static class AccountVerificationMemory
         }
     }
 
+    public static void RevokeForChangedExit(ExperienceData data, string scope, string node,
+        string currentExitFingerprint, DateTime now)
+    {
+        if (data == null || data.AccountVerifications == null || String.IsNullOrEmpty(currentExitFingerprint)) return;
+        foreach (AccountVerificationRecord record in data.AccountVerifications.Where(x => x != null &&
+            x.Scope == (scope ?? "") && x.Node == (node ?? "") && x.ExitFingerprint != currentExitFingerprint &&
+            x.RevokedUtc == DateTime.MinValue))
+        {
+            record.RevokedUtc = now;
+            record.Reason = "exit fingerprint changed";
+        }
+    }
+
     private static bool IsAccountService(ServiceKind service)
     {
         return service == ServiceKind.ChatGPT || service == ServiceKind.Gemini;
