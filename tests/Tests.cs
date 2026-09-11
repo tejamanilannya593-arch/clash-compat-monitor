@@ -60,6 +60,7 @@ internal static class Tests
         ServiceIncidentBehavior();
         ServiceEvidenceBehavior();
         LoginChainEvidenceBehavior();
+        AccountVerificationBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
     }
@@ -156,6 +157,58 @@ internal static class Tests
             .ScanSelected(new CandidateNode("日本名称但香港出口", 1), new[] { ServiceKind.ChatGPT });
         Equal(CandidateHealth.RegionBlocked, unsupported.Health, "actual Hong Kong exit blocks ChatGPT switch evidence");
         Equal(ServiceKind.ChatGPT, unsupported.FailedService.Value, "region gate identifies ChatGPT");
+    }
+
+    private static void AccountVerificationBehavior()
+    {
+        var data = new ExperienceData();
+        DateTime now = new DateTime(2026, 9, 11, 0, 0, 0, DateTimeKind.Utc);
+        AccountVerificationMemory.Mark(data, "scope", "node", "fingerprint", ServiceKind.ChatGPT,
+            true, now, AccountVerificationMemory.CurrentRuleVersion);
+        Equal(true, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(29), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof valid for same exit before thirty days");
+        Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "changed",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof invalid after exit change");
+        Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(30), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof expires at thirty days");
+        Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion + 1),
+            "account proof invalid after evidence rule upgrade");
+
+        var strict = new CandidateScanResult("node", CandidateHealth.Compatible, null, "ok", 200, 2,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(100) },
+                { ServiceKind.Gemini, ProbeResult.Success(100) }
+            }, "fingerprint", "JP");
+        Equal(false, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "quality switch waits for every selected AI account proof");
+        AccountVerificationMemory.Mark(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
+            true, now, AccountVerificationMemory.CurrentRuleVersion);
+        Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "quality switch accepts current exit after both AI proofs");
+        Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, new ExperienceData(), "scope",
+            new[] { ServiceKind.Google, ServiceKind.GitHub }, now),
+            "non-AI configuration does not require account proof");
+
+        string path = Path.Combine(Path.GetTempPath(), "account-proof-" + Guid.NewGuid().ToString("N"), "experience.json");
+        var store = new ExperienceStore(path);
+        store.Save(data, now);
+        ExperienceData loaded = store.Load();
+        Equal(true, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
+            "account proof survives restart");
+        Equal(false, File.ReadAllText(path).Contains("203.0.113.8"), "account proof store contains no raw exit IP");
+
+        AccountVerificationMemory.Revoke(loaded, "scope", "node", ServiceKind.ChatGPT,
+            now.AddDays(1), "explicit failure");
+        Equal(false, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
+            "explicit failure revokes account proof");
     }
 
     private static void AssuranceBehavior()

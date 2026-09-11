@@ -49,12 +49,14 @@ public sealed class ExperienceData
     public List<NodeExperience> Nodes { get; set; }
     public List<NodeChange> Changes { get; set; }
     public List<ServiceIncidentRecord> ServiceIncidents { get; set; }
+    public List<AccountVerificationRecord> AccountVerifications { get; set; }
     public ExperienceData()
     {
         ActiveCandidateNames = new List<string>();
         Nodes = new List<NodeExperience>();
         Changes = new List<NodeChange>();
         ServiceIncidents = new List<ServiceIncidentRecord>();
+        AccountVerifications = new List<AccountVerificationRecord>();
     }
 
     public string ResolveScope(string fingerprint, IEnumerable<string> candidates, string servicesKey)
@@ -193,6 +195,7 @@ public sealed class ExperienceStore
             if (data == null || data.Nodes == null || data.Changes == null || data.Nodes.Any(x => x == null) || data.Changes.Any(x => x == null)) throw new InvalidDataException();
             if (data.ActiveCandidateNames == null) data.ActiveCandidateNames = new List<string>();
             if (data.ServiceIncidents == null) data.ServiceIncidents = new List<ServiceIncidentRecord>();
+            if (data.AccountVerifications == null) data.AccountVerifications = new List<AccountVerificationRecord>();
             return data;
         }
         catch (Exception ex)
@@ -209,6 +212,11 @@ public sealed class ExperienceStore
         data.Changes = data.Changes.OrderByDescending(x => x.Utc).Take(300).OrderBy(x => x.Utc).ToList();
         data.ServiceIncidents = (data.ServiceIncidents ?? new List<ServiceIncidentRecord>()).Where(x => x != null && x.UntilUtc > now)
             .GroupBy(x => x.Service).Select(x => x.OrderByDescending(y => y.UntilUtc).First()).ToList();
+        data.AccountVerifications = (data.AccountVerifications ?? new List<AccountVerificationRecord>())
+            .Where(x => x != null && x.VerifiedUtc > now.AddDays(-30))
+            .GroupBy(x => (x.Scope ?? "") + "\n" + (x.Node ?? "") + "\n" + x.Service)
+            .Select(x => x.OrderByDescending(y => y.VerifiedUtc).First())
+            .OrderByDescending(x => x.VerifiedUtc).Take(256).ToList();
         StatusReport.WriteAtomic(path, new JavaScriptSerializer().Serialize(data));
     }
 }
