@@ -64,6 +64,7 @@ internal static class Tests
         AccountVerificationBehavior();
         BrowserConversationCoordinatorBehavior();
         BrowserNativeProtocolBehavior();
+        BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
     }
@@ -374,6 +375,8 @@ internal static class Tests
 
     private static void BrowserNativeProtocolBehavior()
     {
+        Equal(BrowserConversationProof.CurrentProtocolVersion, BrowserNativeProtocol.ProtocolVersion,
+            "browser proof and transport protocol versions stay aligned");
         var message = new BrowserBridgeMessage {
             Type = "result",
             ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
@@ -453,6 +456,72 @@ internal static class Tests
         {
             return base.Read(buffer, offset, Math.Min(count, 1));
         }
+    }
+
+    private static void BrowserBridgeBehavior()
+    {
+        string derived = BrowserPipeIdentity.ForCurrentUser();
+        Equal(false, derived.IndexOf(Environment.UserName, StringComparison.OrdinalIgnoreCase) >= 0,
+            "browser pipe name hides username");
+
+        string pipe = "ccm-browser-test-" + Guid.NewGuid().ToString("N");
+        int handled = 0;
+        using (var server = new BrowserBridgeServer(pipe, request => {
+            Interlocked.Increment(ref handled);
+            return new BrowserBridgeMessage {
+                Type = request.Type == "poll" ? "idle" : request.Type == "result" ? "ack" : "ready",
+                ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+                RequestId = request.RequestId
+            };
+        }))
+        {
+            server.Start();
+            BrowserBridgeMessage ready = BrowserHostBridge.RoundTrip(pipe,
+                ValidBrowserRequest("hello", "bridge-hello"), TimeSpan.FromSeconds(2));
+            Equal("ready", ready.Type, "host bridges hello request response");
+            BrowserBridgeMessage idle = BrowserHostBridge.RoundTrip(pipe,
+                ValidBrowserRequest("poll", "bridge-poll"), TimeSpan.FromSeconds(2));
+            Equal("idle", idle.Type, "host bridges long poll response");
+
+            var result = ValidBrowserRequest("result", "bridge-result");
+            result.TaskId = "0123456789abcdef0123456789abcdef";
+            result.Service = "Gemini";
+            result.Challenge = "CCM-B8E3";
+            result.Outcome = "Passed";
+            result.MessageSent = true;
+            result.ElapsedMilliseconds = 1800;
+            Equal("ack", BrowserHostBridge.RoundTrip(pipe, result, TimeSpan.FromSeconds(2)).Type,
+                "host bridges browser result");
+
+            BrowserBridgeMessage malformed = ValidBrowserRequest("unknown", "bridge-invalid");
+            Equal("error", BrowserHostBridge.RoundTrip(pipe, malformed, TimeSpan.FromSeconds(2)).Type,
+                "bridge rejects malformed request");
+            Equal(3, handled, "malformed bridge request never reaches monitor handler");
+
+            using (var abandoned = new NamedPipeClientStream(".", pipe, PipeDirection.InOut))
+                abandoned.Connect(2000);
+            Equal("ready", BrowserHostBridge.RoundTrip(pipe,
+                ValidBrowserRequest("hello", "bridge-after-disconnect"), TimeSpan.FromSeconds(2)).Type,
+                "bridge survives clean client disconnect");
+            Equal(null, server.LastError, "clean bridge disconnect is not a server error");
+        }
+
+        BrowserBridgeMessage unavailable = BrowserHostBridge.RoundTrip(
+            "ccm-browser-missing-" + Guid.NewGuid().ToString("N"),
+            ValidBrowserRequest("hello", "bridge-missing"), TimeSpan.FromMilliseconds(100));
+        Equal("unavailable", unavailable.Type, "native host reports monitor unavailable");
+        Equal("bridge-missing", unavailable.RequestId, "unavailable response retains request correlation");
+    }
+
+    private static BrowserBridgeMessage ValidBrowserRequest(string type, string requestId)
+    {
+        return new BrowserBridgeMessage {
+            Type = type,
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = requestId,
+            Browser = "Chrome",
+            ExtensionVersion = "0.6.2"
+        };
     }
 
     private static void AssuranceBehavior()

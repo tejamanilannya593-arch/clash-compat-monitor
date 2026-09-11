@@ -27,6 +27,7 @@ public sealed class BrowserBridgeMessage
 
 public static class BrowserNativeProtocol
 {
+    public const int ProtocolVersion = 1;
     public const int MaxFrameBytes = 64 * 1024;
     private static readonly Encoding Utf8 = new UTF8Encoding(false, true);
 
@@ -108,11 +109,14 @@ public static class BrowserOriginPolicy
 public static class BrowserMessageValidator
 {
     private static readonly string[] AllowedTypes = { "hello", "poll", "result", "cancel" };
-    private static readonly string[] AllowedOutcomes = Enum.GetNames(typeof(BrowserVerificationOutcome));
+    private static readonly string[] AllowedOutcomes = {
+        "Passed", "ConversationError", "GenerationTimeout", "SignInRequired",
+        "ChallengeRequired", "AutomationUnsupported", "Cancelled"
+    };
 
     public static bool IsValidRequest(BrowserBridgeMessage message)
     {
-        if (message == null || message.ProtocolVersion != BrowserConversationProof.CurrentProtocolVersion ||
+        if (message == null || message.ProtocolVersion != BrowserNativeProtocol.ProtocolVersion ||
             !AllowedTypes.Contains(message.Type, StringComparer.Ordinal) || !IsToken(message.RequestId, 64) ||
             !IsBrowser(message.Browser) || !IsVersion(message.ExtensionVersion))
             return false;
