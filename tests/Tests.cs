@@ -1062,6 +1062,8 @@ internal static class Tests
         Equal("Shadowsocks", proxyTypes["节点"], "mihomo exposes runtime leaf kind");
         Equal("Selector", proxyTypes["新型组"], "unknown kind with child choices is classified as non-leaf");
         Equal("Selector", proxyTypes["无类型组"], "missing kind with child choices is classified as non-leaf");
+        Equal(1, CandidateCatalog.Filter(new[] { "节点", "新型组", "无类型组" }, proxyTypes).Count,
+            "runtime group structure reaches candidate filtering");
         client.Select("组", "节点二");
         Equal(86, client.GetDelay("节点 一", "https://www.gstatic.com/generate_204", 5000), "mihomo delay");
         Equal(true, client.IsRuntimeIpv6Enabled(), "mihomo runtime ipv6 query");
