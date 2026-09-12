@@ -34,9 +34,9 @@ The installer only selects nodes in the generated proxy group. It does not edit 
 
 ## Evidence boundaries
 
-The monitor separates entry reachability, login-chain evidence, and account verification. For ChatGPT and Gemini it checks both the application entry and official authentication infrastructure; a challenge page alone is not full compatibility. The optional local verification dialog opens only the official ChatGPT and Gemini pages. After the user signs in and sends one minimal message, the result is bound to the node and an encrypted exit fingerprint for 30 days. The application does not read cookies, accounts, prompts, replies, or browser state.
+The monitor separates entry reachability, login-chain evidence, and account verification. For ChatGPT and Gemini it checks both the application entry and official authentication infrastructure; a challenge page alone is not full compatibility. In v0.6.2, an optional Chrome/Edge browser companion can send a short random-challenge message on the already signed-in official website, check the newly generated reply, and close its test tab. The test conversation remains in your account and is not deleted automatically. Loading the unpacked extension is a one-time manual step; see [browser companion setup](browser-extension/README.md). Background conversation checks are off by default and require explicit consent. You can also run one check without persistent consent. The result is bound to the node and encrypted exit fingerprint for up to 30 days. The extension does not request Cookie or browsing-history permissions, read account identifiers or existing conversations, or store the test prompt/reply body. It does inspect the new reply to verify the challenge.
 
-Anonymous probes and displayed HTTP latency still cannot measure actual model-generation latency or guarantee future account behavior. A performance-only AI switch requires strict probe evidence, the user's account verification, five successful-history observations spanning 30 minutes at 95% or better, a five-sample median at or below 800 ms, no sample or selected-service response above 1500 ms, and jitter at or below 150 ms.
+Anonymous probes and displayed HTTP latency still cannot measure actual model-generation latency or guarantee future account behavior. Browser proof checks the website, not API-key calls. Sign-in prompts, CAPTCHAs, security challenges, and unsupported page layouts are reported separately and are not attributed to the node. Automatic retries after a failed conversation have a six-hour cooldown; a user-triggered retry does not. Performance optimization of an otherwise healthy node is off by default. If explicitly enabled, a performance-only AI switch requires strict probe evidence, fresh conversation proof for the selected AI services, five history observations spanning 30 minutes at 95% success or better, a five-sample median at or below 800 ms, no sample or selected-service response above 1500 ms, and jitter at or below 150 ms.
 
 Steam game traffic and downloads continue to follow the user's existing Clash direct-routing rules.
 
@@ -49,6 +49,7 @@ The application runs locally and uploads no telemetry. Do not post subscription 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 node .\clash\enhancement.test.js
+node .\browser-extension\tests\run.js
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Release.Tests.ps1
 ```
 

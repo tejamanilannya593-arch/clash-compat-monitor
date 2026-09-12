@@ -12,6 +12,8 @@ $testInputs = @($sources) + @((Join-Path $root 'tests\Tests.cs'))
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & "$out\Monitor.Tests.exe"
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
+& node (Join-Path $root 'browser-extension\tests\run.js')
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $browserHostSources = @(
     (Join-Path $root 'src\BrowserNativeProtocol.cs'),
     (Join-Path $root 'src\BrowserHostProgram.cs'),

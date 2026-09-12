@@ -156,7 +156,7 @@ try {
     foreach ($record in $before) {
         if ((Get-FileHash -LiteralPath $record.Path).Hash -ne $record.Hash) { throw 'A protected Clash file changed.' }
     }
-    [pscustomobject]@{Version='0.6.1';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true} | ConvertTo-Json -Compress
+    [pscustomobject]@{Version='0.6.2';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true} | ConvertTo-Json -Compress
 } catch {
     Stop-InstalledMonitor
     Stop-InstalledBrowserHost

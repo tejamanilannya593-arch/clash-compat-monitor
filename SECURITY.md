@@ -14,4 +14,4 @@ The maintainer will acknowledge a complete report through the Security Advisory,
 
 ## Security boundaries
 
-Clash Compatibility Monitor selects an existing leaf node in configured proxy groups. It does not provide proxy nodes, modify subscription contents, upload telemetry, or claim to validate account-level ChatGPT, Gemini, or other signed-in functionality.
+Clash Compatibility Monitor selects an existing leaf node in configured proxy groups. It does not provide proxy nodes, modify subscription contents, or upload telemetry. Optional browser conversation verification is limited to already signed-in ChatGPT and Gemini websites; it is not an API-key check or a guarantee of future availability. The companion requests only native messaging and the two official website origins, not Cookie or history permissions. It reads only the newly generated reply for an exact challenge match and does not retain prompt or reply text. Short test conversations remain in the user's website account.
