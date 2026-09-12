@@ -329,6 +329,7 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
             case ServiceKind.SteamApi: return new Uri("https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/");
             case ServiceKind.Discord: return new Uri("https://discord.com/api/v10/gateway");
             case ServiceKind.Spotify: return new Uri("https://open.spotify.com/");
+            case ServiceKind.ZLibraryWeb: return new Uri("https://zh.z-library.sk/");
             default: return new Uri("https://store.epicgames.com/");
         }
     }

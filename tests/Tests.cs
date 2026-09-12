@@ -47,6 +47,7 @@ internal static class Tests
         BoundedPipeBehavior();
         MihomoPipeIntegration();
         CompatibilityScanning();
+        ZLibraryWebBehavior();
         QualityScoringAndState();
         ThroughputAndTraffic();
         StabilityAndState();
@@ -68,6 +69,22 @@ internal static class Tests
         BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void ZLibraryWebBehavior()
+    {
+        ServiceKind service;
+        Equal(true, Enum.TryParse("ZLibraryWeb", out service), "Z-Library service identity exists");
+        Equal("https://zh.z-library.sk/", HttpServiceProbe.Endpoint(service).AbsoluteUri,
+            "Z-Library uses the chosen HTTPS entrance");
+        Equal(false, UserPreferences.Defaults().RequiredServices.Contains(service),
+            "Z-Library is off by default");
+        var probe = new FakeProbe();
+        var scan = new CompatibilityScanner(new FakeMihomo(), probe, "probe")
+            .ScanSelected(new CandidateNode("selected", 1), new[] { service });
+        Equal(CandidateHealth.Compatible, scan.Health, "selected Z-Library service participates in scanning");
+        Equal(1, probe.Calls.Count, "selected Z-Library sends one lightweight probe");
+        Equal(service, probe.Calls[0], "selected Z-Library probes its own endpoint");
     }
 
     private static void ServiceEvidenceBehavior()
