@@ -4,6 +4,11 @@ $required = @(
     'README.md', 'README.en.md', 'QUICKSTART.md', 'LICENSE', 'Install.cmd', 'Diagnose.cmd', 'package-release.ps1',
     'SECURITY.md', 'CODE_OF_CONDUCT.md',
     'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1',
+    'browser-extension\manifest.json', 'browser-extension\service-worker.js',
+    'browser-extension\content-chatgpt.js', 'browser-extension\content-gemini.js',
+    'browser-extension\adapter-core.js', 'browser-extension\chatgpt-adapter.js',
+    'browser-extension\gemini-adapter.js', 'browser-extension\native-host-template.json',
+    'browser-extension\README.md',
     '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
     '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml',
     'assets\social-preview.png', 'docs\images\service-incident-flow.png', 'docs\release-notes\v0.6.1.md'
@@ -14,6 +19,7 @@ foreach ($relative in $required) {
 }
 $packageScript = Get-Content -LiteralPath (Join-Path $root 'package-release.ps1') -Raw
 $installScript = Get-Content -LiteralPath (Join-Path $root 'scripts\install.ps1') -Raw
+$uninstallScript = Get-Content -LiteralPath (Join-Path $root 'scripts\uninstall.ps1') -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
 $readmeEn = Get-Content -LiteralPath (Join-Path $root 'README.en.md') -Raw -Encoding UTF8
 $quickStart = Get-Content -LiteralPath (Join-Path $root 'QUICKSTART.md') -Raw -Encoding UTF8
@@ -57,6 +63,49 @@ if (!$packageScript.Contains('docs\images') -or !$packageScript.Contains('servic
 if (!$installScript.Contains("Version='0.6.1'")) { throw 'Installer status version is not v0.6.1.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }
+$browserManifest = Get-Content -LiteralPath (Join-Path $root 'browser-extension\manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($browserManifest.manifest_version -ne 3 -or
+    (Compare-Object @($browserManifest.permissions) @('nativeMessaging')) -or
+    (Compare-Object @($browserManifest.host_permissions | Sort-Object) @('https://chatgpt.com/*','https://gemini.google.com/*'))) {
+    throw 'Browser extension permissions are broader than approved.'
+}
+if (!$installScript.Contains('HKCU:\Software\Google\Chrome\NativeMessagingHosts') -or
+    !$installScript.Contains('HKCU:\Software\Microsoft\Edge\NativeMessagingHosts') -or
+    $installScript.Contains('HKLM:')) {
+    throw 'Native host must be registered per current user for Chrome and Edge only.'
+}
+if (!$uninstallScript.Contains('NativeMessagingHosts') -or
+    !$uninstallScript.Contains('Remove-Item -LiteralPath $registration')) {
+    throw 'Uninstaller does not clean up native host registration.'
+}
+if (!$installScript.Contains('Remove-Item -LiteralPath $browserExtensionTarget -Recurse -Force') -or
+    !$installScript.Contains('Remove-Item -LiteralPath $browserHostTarget -Force') -or
+    !$installScript.Contains('Remove-Item -LiteralPath $nativeManifestTarget -Force')) {
+    throw 'Installer rollback may leave a partially installed browser companion.'
+}
+$nativeTemplate = Get-Content -LiteralPath (Join-Path $root 'browser-extension\native-host-template.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($nativeTemplate.name -ne 'com.clashcompatibilitymonitor.browser' -or
+    (Compare-Object @($nativeTemplate.allowed_origins) @('chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg/'))) {
+    throw 'Native host template does not pin the approved extension origin.'
+}
+if ($installScript -match '(?i)Set-Content[^\r\n]*(profiles\.yaml|clash-verge\.yaml)' -or
+    $installScript -match '(?i)Copy-Item[^\r\n]+-Destination[^\r\n]+\$clashRoot') {
+    throw 'Installer may write a protected Clash file.'
+}
+$renderFixture = Join-Path ([IO.Path]::GetTempPath()) ('ccm-native-manifest-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $renderFixture | Out-Null
+try {
+    $renderedManifest = Join-Path $renderFixture 'native-host.json'
+    & (Join-Path $root 'scripts\install.ps1') -SourceBrowserHost (Join-Path $root 'bin\ClashCompatibilityMonitor.BrowserHost.exe') `
+        -RenderNativeHostManifest $renderedManifest | Out-Null
+    $rendered = Get-Content -LiteralPath $renderedManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($rendered.path -ne [IO.Path]::GetFullPath((Join-Path $root 'bin\ClashCompatibilityMonitor.BrowserHost.exe')) -or
+        $rendered.type -ne 'stdio' -or (Compare-Object @($rendered.allowed_origins) @($nativeTemplate.allowed_origins))) {
+        throw 'Native host render-only helper produced an invalid manifest.'
+    }
+} finally {
+    Remove-Item -LiteralPath $renderFixture -Recurse -Force
+}
 if (!$readme.Contains('v0.6.1') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
     !$program.Contains('InstanceActivation.TryOwn') -or !$trayHost.Contains('NotifyIcon')) {
     throw 'README does not describe v0.6.1 tray and intent behavior.'
