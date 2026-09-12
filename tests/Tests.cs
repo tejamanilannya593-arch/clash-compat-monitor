@@ -42,8 +42,11 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.3-preview.6", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.1", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
+        Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
+        Equal(true, RuntimeConfigurationPolicy.Ipv6Action(true).Contains("重新应用增强脚本"),
+            "unexpected runtime IPv6 gets an actionable warning instead of a configuration rewrite");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
         CandidateFiltering();
@@ -953,6 +956,16 @@ internal static class Tests
         Equal(true, candidates.Any(x => x.Name.EndsWith("5x", StringComparison.Ordinal)), "high multiplier is measured not hidden");
         Equal<double?>(null, candidates.First(x => x.Name == "Tokyo-A").Multiplier, "missing multiplier stays unknown");
         Equal(0.5, candidates.First(x => x.Name.Contains("0.5x")).Multiplier.Value, "decimal multiplier retained");
+
+        var runtimeTypes = new Dictionary<string, string>(StringComparer.Ordinal) {
+            { "Tokyo-A", "Shadowsocks" }, { "提示：流量剩余", "Direct" },
+            { "机场自动选择", "Selector" }, { "节点 B | 0.5x", "Vless" }
+        };
+        var typed = CandidateCatalog.Filter(new[] { "Tokyo-A", "提示：流量剩余", "机场自动选择", "节点 B | 0.5x" }, runtimeTypes);
+        Equal(2, typed.Count, "runtime proxy kinds exclude built-in and nested choices without relying on names");
+        Equal("Tokyo-A", typed[0].Name, "typed filtering keeps source order");
+        Equal(1, CandidateCatalog.Filter(new[] { "新协议节点" }, runtimeTypes).Count,
+            "unknown runtime kind remains eligible for newer subscription protocols");
     }
 
     private static void PipeHttpDecoding()
@@ -1025,11 +1038,12 @@ internal static class Tests
                         lock (requests) requests.Add(request);
                         string responseBody = i == 0
                             ? "{\"proxies\":{\"组\":{\"type\":\"Selector\",\"now\":\"节点\",\"all\":[\"节点\",\"节点二\"]}}}"
-                            : i == 2 ? "{\"delay\":86}" : i == 4 ? "{\"ipv6\":true}" : "";
+                            : i == 1 ? "{\"proxies\":{\"节点\":{\"type\":\"Shadowsocks\"},\"说明\":{\"type\":\"Direct\"}}}"
+                            : i == 3 ? "{\"delay\":86}" : i == 4 ? "{\"ipv6\":true}" : "";
                         byte[] payload = Encoding.UTF8.GetBytes(responseBody);
                         string response = i == 0
                             ? "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + payload.Length.ToString("X") + "\r\n" + responseBody + "\r\n0\r\n\r\n"
-                            : (i == 2 || i == 4) ? "HTTP/1.1 200 OK\r\nContent-Length: " + payload.Length + "\r\n\r\n" + responseBody
+                            : (i == 1 || i == 3 || i == 4) ? "HTTP/1.1 200 OK\r\nContent-Length: " + payload.Length + "\r\n\r\n" + responseBody
                             : "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
                         byte[] bytes = Encoding.UTF8.GetBytes(response);
                         stream.Write(bytes, 0, bytes.Length);
@@ -1044,22 +1058,19 @@ internal static class Tests
 
         var client = new MihomoPipeClient(pipeName, "test-secret");
         Equal("节点", client.GetSelected("组"), "pipe selected node");
+        Equal("Shadowsocks", client.GetProxyTypes()["节点"], "mihomo exposes runtime leaf kind");
         client.Select("组", "节点二");
         Equal(86, client.GetDelay("节点 一", "https://www.gstatic.com/generate_204", 5000), "mihomo delay");
-        string configPath = Path.Combine(Path.GetTempPath(), "mihomo-ipv4-" + Guid.NewGuid().ToString("N") + ".yaml");
-        File.WriteAllText(configPath, "ipv6: true\r\ndns:\r\n  ipv6: true\r\n", Encoding.UTF8);
-        Equal(true, client.EnsureIpv4Compatibility(configPath), "mihomo ipv4 hot reload");
         Equal(true, client.IsRuntimeIpv6Enabled(), "mihomo runtime ipv6 query");
         server.Join(5000);
         Equal(null, serverError, "fake pipe server error");
         Equal(5, requests.Count, "pipe request count");
         Equal(true, requests[0].StartsWith("GET /proxies HTTP/1.1\r\n", StringComparison.Ordinal), "pipe get path");
         Equal(true, requests[0].Contains("Authorization: Bearer test-secret"), "pipe auth header");
-        Equal(true, requests[1].StartsWith("PUT /proxies/%E7%BB%84 HTTP/1.1\r\n", StringComparison.Ordinal), "pipe put escaped path");
-        Equal(true, requests[1].Contains("{\"name\":\"节点二\"}"), "pipe put body");
-        Equal(true, requests[2].StartsWith("GET /proxies/%E8%8A%82%E7%82%B9%20%E4%B8%80/delay?", StringComparison.Ordinal), "delay escaped path");
-        Equal(true, requests[3].StartsWith("PUT /configs?force=true HTTP/1.1\r\n", StringComparison.Ordinal), "config reload path");
-        Equal(true, requests[3].Contains("ipv6: false"), "config reload disables ipv6");
+        Equal(true, requests[1].StartsWith("GET /proxies HTTP/1.1\r\n", StringComparison.Ordinal), "runtime kinds query path");
+        Equal(true, requests[2].StartsWith("PUT /proxies/%E7%BB%84 HTTP/1.1\r\n", StringComparison.Ordinal), "pipe put escaped path");
+        Equal(true, requests[2].Contains("{\"name\":\"节点二\"}"), "pipe put body");
+        Equal(true, requests[3].StartsWith("GET /proxies/%E8%8A%82%E7%82%B9%20%E4%B8%80/delay?", StringComparison.Ordinal), "delay escaped path");
         Equal(true, requests[4].StartsWith("GET /configs HTTP/1.1\r\n", StringComparison.Ordinal), "runtime config query path");
     }
 
@@ -1958,7 +1969,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.3-preview.6"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.1"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

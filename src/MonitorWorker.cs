@@ -264,15 +264,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 return MonitorSnapshot.CreateState(MonitorRunState.Degraded, conflict.Reason, clock.UtcNow,
                     clock.UtcNow.Add(config.CycleInterval));
             }
-            bool reloadDetected = mihomo.IsRuntimeIpv6Enabled();
-            if (reloadDetected)
+            string ipv6Action = RuntimeConfigurationPolicy.Ipv6Action(mihomo.IsRuntimeIpv6Enabled());
+            if (ipv6Action != null)
             {
-                var pipeClient = mihomo as MihomoPipeClient;
-                if (pipeClient == null || !pipeClient.EnsureIpv4Compatibility(config.ClashConfigPath))
-                    throw new InvalidOperationException("Could not restore the IPv4 compatibility overlay.");
-                logger.Write("restored IPv4 compatibility overlay after external config reload");
+                logger.Write("runtime IPv6 enabled; waiting for enhancement script reapply");
+                return MonitorSnapshot.CreateState(MonitorRunState.Degraded, ipv6Action, clock.UtcNow,
+                    clock.UtcNow.Add(config.CycleInterval));
             }
-            IList<CandidateNode> candidates = CandidateCatalog.Filter(mihomo.GetChoices(config.SharedGroup));
+            IDictionary<string, string> runtimeTypes = null;
+            var catalogClient = mihomo as MihomoPipeClient;
+            if (catalogClient != null)
+            {
+                try { runtimeTypes = catalogClient.GetProxyTypes(); }
+                catch (IOException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+                catch (TimeoutException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+                catch (ArgumentException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+            }
+            IList<CandidateNode> candidates = CandidateCatalog.Filter(mihomo.GetChoices(config.SharedGroup), runtimeTypes);
             if (candidates.Count == 0)
             {
                 logger.Write("no eligible candidates");
@@ -312,34 +320,6 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             experience.RecordChange(experience.LastNode, current, "检测到外部变更（Clash 手动选择或核心重载）", clock.UtcNow);
             experienceStore.Save(experience, clock.UtcNow);
             Report("正在检测当前节点：" + current, null);
-            bool recoveredAfterReload = false;
-            string recoveryTarget = ReloadRecovery.ChooseTarget(reloadDetected, state, candidates, clock.UtcNow,
-                config.ReloadRecoveryFreshness);
-            if (suppressedServices.Count > 0)
-            {
-                recoveryTarget = null;
-                logger.Write("reload recovery skipped while service circuit is active");
-            }
-            if (!String.IsNullOrEmpty(recoveryTarget) && recoveryTarget != current)
-            {
-                logger.Write("reload recovery live recheck target=" + SafeName(recoveryTarget));
-                CandidateScanResult recoveryScan = scanner.ScanSelected(new CandidateNode(recoveryTarget, null), requiredServices);
-                CheckStop();
-                if (!dryRun && preferences.AutomaticOptimization && (pathHealth == null || pathHealth.CanAutoSwitch) &&
-                    ServiceEvidencePolicy.CanRestoreAfterReload(recoveryScan, experience,
-                        memoryScope, requiredServices, clock.UtcNow) &&
-                    mihomo.GetSelected(config.SharedGroup) == current)
-                {
-                    SelectRecorded(current, recoveryTarget, "配置重载后恢复（已复检）");
-                    current = recoveryTarget;
-                    recoveredAfterReload = true;
-                    logger.Write("restored shared selector to recent verified " + SafeName(recoveryTarget));
-                }
-                else if (dryRun) logger.Write("dry-run would restore shared selector to " + SafeName(recoveryTarget));
-                else logger.Write("reload recovery recheck rejected target=" + SafeName(recoveryTarget) + " health=" + recoveryScan.Health);
-            }
-            else if (reloadDetected && String.IsNullOrEmpty(recoveryTarget))
-                logger.Write("reload recovery skipped because no recent verified candidate is available");
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, servicesToProbe);
             currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
@@ -611,8 +591,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     memoryScope, requiredServices, clock.UtcNow);
             }).ThenByDescending(x => x.Value.Score).FirstOrDefault();
             bool switched = false;
-            string decision = serviceIncidentDecision ??
-                (recoveredAfterReload ? "配置重载后恢复最近稳定节点" : "保持当前节点");
+            string decision = serviceIncidentDecision ?? "保持当前节点";
             if (!trafficIdle && serviceIncidentDecision == null) decision = "检测到较大流量，暂缓速度采样和体验优化切换";
             double? reportedScore = null;
             QualityBreakdown reportedCurrent;

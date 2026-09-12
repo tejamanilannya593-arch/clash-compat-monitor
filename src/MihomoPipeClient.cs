@@ -4,7 +4,6 @@ using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 
 public interface IMihomoClient
@@ -139,6 +138,26 @@ public sealed class MihomoPipeClient : IMihomoClient
         return result;
     }
 
+    public IDictionary<string, string> GetProxyTypes()
+    {
+        PipeHttpResponse response = Request("GET", "/proxies", null);
+        if (response.StatusCode != 200) throw new IOException("Mihomo proxy query failed with HTTP " + response.StatusCode + ".");
+        var root = json.DeserializeObject(response.Body) as Dictionary<string, object>;
+        object proxiesObject;
+        var proxies = root != null && root.TryGetValue("proxies", out proxiesObject)
+            ? proxiesObject as Dictionary<string, object> : null;
+        if (proxies == null) throw new InvalidDataException("Mihomo proxy catalog is missing.");
+        var kinds = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in proxies)
+        {
+            var proxy = entry.Value as Dictionary<string, object>;
+            object kind;
+            if (proxy != null && proxy.TryGetValue("type", out kind) && kind != null)
+                kinds[entry.Key] = Convert.ToString(kind, CultureInfo.InvariantCulture);
+        }
+        return kinds;
+    }
+
     public string GetSelected(string groupName)
     {
         object selected;
@@ -167,20 +186,6 @@ public sealed class MihomoPipeClient : IMihomoClient
         }
         catch (IOException) { return Int32.MaxValue; }
         catch (TimeoutException) { return Int32.MaxValue; }
-    }
-
-    public bool EnsureIpv4Compatibility(string configPath)
-    {
-        string original = File.ReadAllText(configPath, Encoding.UTF8);
-        var top = new Regex(@"(?m)^ipv6:\s*(?:true|false)\s*$");
-        var dns = new Regex(@"(?ms)(^dns:\s*$.*?^\s+)ipv6:\s*(?:true|false)\s*$");
-        if (!top.IsMatch(original) || !dns.IsMatch(original))
-            throw new InvalidDataException("Required IPv6 settings were not found in the generated configuration.");
-        string payload = top.Replace(original, "ipv6: false", 1);
-        payload = dns.Replace(payload, "${1}ipv6: false", 1);
-        string body = json.Serialize(new Dictionary<string, object> { { "path", "" }, { "payload", payload } });
-        PipeHttpResponse response = Request("PUT", "/configs?force=true", body);
-        return response.StatusCode >= 200 && response.StatusCode < 300;
     }
 
     public bool IsRuntimeIpv6Enabled()

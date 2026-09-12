@@ -13,7 +13,7 @@ $required = @(
     '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml',
     'assets\social-preview.png', 'docs\images\service-incident-flow.png',
     'docs\release-notes\v0.6.1.md', 'docs\release-notes\v0.6.2.md',
-    'docs\release-notes\v0.6.3-preview.6.md'
+    'docs\release-notes\v0.7.0-preview.1.md'
 )
 foreach ($relative in $required) {
     $path = Join-Path $root $relative
@@ -28,6 +28,11 @@ $quickStart = Get-Content -LiteralPath (Join-Path $root 'QUICKSTART.md') -Raw -E
 $contributing = Get-Content -LiteralPath (Join-Path $root 'CONTRIBUTING.md') -Raw -Encoding UTF8
 $releaseNotes = Get-Content -LiteralPath (Join-Path $root 'docs\release-notes\v0.6.1.md') -Raw -Encoding UTF8
 $program = Get-Content -LiteralPath (Join-Path $root 'src\Program.cs') -Raw
+$workerSource = Get-Content -LiteralPath (Join-Path $root 'src\MonitorWorker.cs') -Raw
+$mihomoSource = Get-Content -LiteralPath (Join-Path $root 'src\MihomoPipeClient.cs') -Raw
+if ($workerSource.Contains('EnsureIpv4Compatibility') -or $mihomoSource.Contains('PUT", "/configs')) {
+    throw 'Monitor must not reload the complete Mihomo runtime configuration.'
+}
 $monitorCoordinator = Get-Content -LiteralPath (Join-Path $root 'src\MonitorCoordinator.cs') -Raw
 $trayHost = Get-Content -LiteralPath (Join-Path $root 'src\TrayHost.cs') -Raw
 $detailsForm = Get-Content -LiteralPath (Join-Path $root 'src\DetailsForm.cs') -Raw
@@ -51,7 +56,7 @@ try {
 if (!$readme.Contains('docs/images/service-incident-flow.png')) {
     throw 'README does not link the service incident flow image.'
 }
-if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.3-preview.6')) { throw 'Release package version is not v0.6.3-preview.6.' }
+if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.7.0-preview.1')) { throw 'Release package version is not v0.7.0-preview.1.' }
 if (!$packageScript.Contains('ClashCompatibilityMonitor.BrowserHost.exe') -or
     !$packageScript.Contains('browser-extension') -or
     !$packageScript.Contains('native-host-template.json')) {
@@ -68,7 +73,7 @@ if (!$packageScript.Contains($checksumAssignment) -or
 if (!$packageScript.Contains('docs\images') -or !$packageScript.Contains('service-incident-flow.png')) {
     throw 'Release package does not include the README flow image.'
 }
-if (!$installScript.Contains("Version='0.6.3-preview.6'")) { throw 'Installer status version is not v0.6.3-preview.6.' }
+if (!$installScript.Contains("Version='0.7.0-preview.1'")) { throw 'Installer status version is not v0.7.0-preview.1.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }
 $browserManifest = Get-Content -LiteralPath (Join-Path $root 'browser-extension\manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -108,7 +113,7 @@ foreach ($exeName in @('ClashCompatibilityMonitor.exe','ClashCompatibilityMonito
     $exePath = Join-Path $root ('bin\' + $exeName)
     if (!(Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Missing built executable: $exeName" }
     $version = (Get-Item -LiteralPath $exePath).VersionInfo
-    if ($version.FileVersion -ne '0.6.3.0' -or $version.ProductVersion -ne '0.6.3-preview.6') {
+    if ($version.FileVersion -ne '0.7.0.0' -or $version.ProductVersion -ne '0.7.0-preview.1') {
         throw "Incorrect Windows version metadata: $exeName"
     }
 }
@@ -156,7 +161,7 @@ $proofTerms = @(
     ([char[]](0x4e0d,0x8bfb,0x53d6,0x20,0x43,0x6f,0x6f,0x6b,0x69,0x65) -join ''),
     ([char[]](0x7f51,0x9875) -join ''), '6 ', 'API'
 )
-if (!$program.Contains('Version = "0.6.3-preview.6"') -or
+if (!$program.Contains('Version = "0.7.0-preview.1"') -or
     !$buildScript.Contains('browser-extension\tests\run.js') -or
     @($proofTerms | Where-Object { !$proofDocs.Contains($_) }).Count -ne 0) {
     throw 'v0.6.2 browser verification documentation is incomplete.'
@@ -195,10 +200,10 @@ if (!$security.Contains('Security Advisory') -or !$conduct.Contains('Contributor
 }
 $singleNodeSubscription = ([char[]](0x5355,0x8282,0x70B9,0x8BA2,0x9605)) -join ''
 $subscriptionOrder = ([char[]](0x8BA2,0x9605,0x987A,0x5E8F)) -join ''
-$liveRecheck = ([char[]](0x73B0,0x573A,0x590D,0x68C0)) -join ''
+$reloadPause = ([char[]](0x6682,0x505c,0x91cd,0x8f7d,0x540e,0x7684,0x81ea,0x52a8,0x6062,0x590d)) -join ''
 if (!$readme.Contains('proxy-providers') -or !$readme.Contains($singleNodeSubscription) -or
-    !$readme.Contains($subscriptionOrder) -or !$readme.Contains($liveRecheck)) {
-    throw 'README does not describe subscription compatibility and safe reload behavior.'
+    !$readme.Contains($subscriptionOrder) -or !$readme.Contains($reloadPause)) {
+    throw 'README does not describe subscription compatibility and preview reload behavior.'
 }
 $fiveChecks = ([char[]](0x81F3,0x5C11,0x20,0x35,0x20,0x6B21)) -join ''
 $thirtyMinutes = ([char[]](0x8DE8,0x5EA6,0x81F3,0x5C11,0x20,0x33,0x30,0x20,0x5206,0x949F)) -join ''
