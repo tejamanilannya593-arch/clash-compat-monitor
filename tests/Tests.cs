@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Reflection;
 using System.Windows.Forms;
 
 internal static class Tests
@@ -41,7 +42,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.2", MonitorIdentity.Version, "release version");
+        Equal("0.6.3-preview.1", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         CandidateFiltering();
         PipeHttpDecoding();
@@ -50,6 +51,7 @@ internal static class Tests
         CompatibilityScanning();
         ZLibraryWebBehavior();
         ZLibraryChoiceBehavior();
+        DetailsTypographyBehavior();
         QualityScoringAndState();
         ThroughputAndTraffic();
         StabilityAndState();
@@ -160,6 +162,25 @@ internal static class Tests
             if (nested != null) return nested;
         }
         return null;
+    }
+
+    private static void DetailsTypographyBehavior()
+    {
+        using (var form = new DetailsForm(UserPreferences.Defaults(), delegate { },
+            delegate { }, delegate { }, delegate { }, delegate { },
+            delegate { }, delegate { }))
+        {
+            var fields = BindingFlags.Instance | BindingFlags.NonPublic;
+            var times = (Label)typeof(DetailsForm).GetField("nextCheckLabel", fields).GetValue(form);
+            var services = (ListView)typeof(DetailsForm).GetField("serviceList", fields).GetValue(form);
+            Equal("Segoe UI", times.Font.Name, "timestamps use compact Latin digits");
+            Equal("Segoe UI", services.Font.Name, "service latency uses compact Latin digits");
+            using (var graphics = form.CreateGraphics())
+            {
+                Equal((int)Math.Round(270 * graphics.DpiX / 96F), services.Columns[1].Width,
+                    "service status column follows display scaling");
+            }
+        }
     }
 
     private static void ServiceEvidenceBehavior()
@@ -1846,7 +1867,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.2"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.3-preview.1"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

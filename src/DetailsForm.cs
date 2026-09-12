@@ -164,15 +164,18 @@ public sealed class DetailsForm : Form
         browserStatusLabel.Padding = new Padding(0, 0, 0, 5);
         layout.Controls.Add(browserStatusLabel);
         ConfigureText(nextCheckLabel, 9F, FontStyle.Regular, Color.FromArgb(88, 101, 122));
+        nextCheckLabel.Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         layout.Controls.Add(nextCheckLabel);
 
         serviceList.View = View.Details;
+        serviceList.Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         serviceList.FullRowSelect = true;
         serviceList.GridLines = true;
         serviceList.HeaderStyle = ColumnHeaderStyle.Nonclickable;
-        serviceList.Columns.Add("服务", 180);
-        serviceList.Columns.Add("实测状态", 190);
-        serviceList.Columns.Add("说明", 280);
+        Size scaledColumns = ScaleForCurrentDpi(110, 270);
+        serviceList.Columns.Add("服务", scaledColumns.Width);
+        serviceList.Columns.Add("实测状态", scaledColumns.Height);
+        serviceList.Columns.Add("说明", ScaleForCurrentDpi(280, 0).Width);
         serviceList.Dock = DockStyle.Fill;
         serviceList.Margin = new Padding(0, 12, 0, 12);
         layout.Controls.Add(serviceList);

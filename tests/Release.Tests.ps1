@@ -12,7 +12,8 @@ $required = @(
     '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
     '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml',
     'assets\social-preview.png', 'docs\images\service-incident-flow.png',
-    'docs\release-notes\v0.6.1.md', 'docs\release-notes\v0.6.2.md'
+    'docs\release-notes\v0.6.1.md', 'docs\release-notes\v0.6.2.md',
+    'docs\release-notes\v0.6.3-preview.1.md'
 )
 foreach ($relative in $required) {
     $path = Join-Path $root $relative
@@ -50,7 +51,7 @@ try {
 if (!$readme.Contains('docs/images/service-incident-flow.png')) {
     throw 'README does not link the service incident flow image.'
 }
-if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.2')) { throw 'Release package version is not v0.6.2.' }
+if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.3-preview.1')) { throw 'Release package version is not v0.6.3-preview.1.' }
 if (!$packageScript.Contains('ClashCompatibilityMonitor.BrowserHost.exe') -or
     !$packageScript.Contains('browser-extension') -or
     !$packageScript.Contains('native-host-template.json')) {
@@ -67,7 +68,7 @@ if (!$packageScript.Contains($checksumAssignment) -or
 if (!$packageScript.Contains('docs\images') -or !$packageScript.Contains('service-incident-flow.png')) {
     throw 'Release package does not include the README flow image.'
 }
-if (!$installScript.Contains("Version='0.6.2'")) { throw 'Installer status version is not v0.6.2.' }
+if (!$installScript.Contains("Version='0.6.3-preview.1'")) { throw 'Installer status version is not v0.6.3-preview.1.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }
 $browserManifest = Get-Content -LiteralPath (Join-Path $root 'browser-extension\manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -107,7 +108,7 @@ foreach ($exeName in @('ClashCompatibilityMonitor.exe','ClashCompatibilityMonito
     $exePath = Join-Path $root ('bin\' + $exeName)
     if (!(Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Missing built executable: $exeName" }
     $version = (Get-Item -LiteralPath $exePath).VersionInfo
-    if ($version.FileVersion -ne '0.6.2.0' -or $version.ProductVersion -ne '0.6.2') {
+    if ($version.FileVersion -ne '0.6.3.0' -or $version.ProductVersion -ne '0.6.3-preview.1') {
         throw "Incorrect Windows version metadata: $exeName"
     }
 }
@@ -155,7 +156,7 @@ $proofTerms = @(
     ([char[]](0x4e0d,0x8bfb,0x53d6,0x20,0x43,0x6f,0x6f,0x6b,0x69,0x65) -join ''),
     ([char[]](0x7f51,0x9875) -join ''), '6 ', 'API'
 )
-if (!$program.Contains('Version = "0.6.2"') -or
+if (!$program.Contains('Version = "0.6.3-preview.1"') -or
     !$buildScript.Contains('browser-extension\tests\run.js') -or
     @($proofTerms | Where-Object { !$proofDocs.Contains($_) }).Count -ne 0) {
     throw 'v0.6.2 browser verification documentation is incomplete.'
