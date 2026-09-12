@@ -343,6 +343,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, servicesToProbe);
             currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
+            if (!dryRun && FollowGeneralNode(currentScan) && pathHealthChecker != null && runtime.SystemProxy.Length > 0)
+                pathHealth = pathHealthChecker.Check();
             AccountVerificationMemory.RevokeForChangedExit(experience, memoryScope, current,
                 currentScan.ExitFingerprint, clock.UtcNow);
             logger.Write("current check completed elapsed_seconds=" + cycleTimer.Elapsed.TotalSeconds.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) +
@@ -772,6 +774,24 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         RunStatistics.SelectionConfirmed();
         experience.RecordChange(from, to, reason, clock.UtcNow);
         experienceStore.Save(experience, clock.UtcNow);
+        FollowGeneralNode();
+    }
+
+    private bool FollowGeneralNode(CandidateScanResult verifiedScan = null)
+    {
+        if (String.IsNullOrWhiteSpace(config.GeneralGroup)) return false;
+        try
+        {
+            bool changed = verifiedScan == null
+                ? SelectorFollower.Synchronize(mihomo, config.SharedGroup, config.GeneralGroup)
+                : SelectorFollower.SynchronizeVerified(mihomo, config.SharedGroup, config.GeneralGroup, verifiedScan);
+            if (changed) logger.Write("general selector aligned with stable node=" + SafeName(mihomo.GetSelected(config.SharedGroup)));
+            return changed;
+        }
+        catch (IOException ex) { logger.Write("general selector sync skipped " + ex.GetType().Name); }
+        catch (TimeoutException ex) { logger.Write("general selector sync skipped " + ex.GetType().Name); }
+        catch (InvalidOperationException ex) { logger.Write("general selector sync skipped " + ex.GetType().Name); }
+        return false;
     }
 
     private NodeHealthRecord Record(CandidateScanResult result)

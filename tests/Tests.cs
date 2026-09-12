@@ -42,8 +42,10 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.3-preview.3", MonitorIdentity.Version, "release version");
+        Equal("0.6.3-preview.4", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
+        Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
+            "ordinary proxy group follows the stable selector");
         CandidateFiltering();
         PipeHttpDecoding();
         BoundedPipeBehavior();
@@ -56,6 +58,7 @@ internal static class Tests
         ThroughputAndTraffic();
         StabilityAndState();
         RuntimeGuards();
+        SelectorFollowerBehavior();
         ProxyPathHealthBehavior();
         UserPreferenceBehavior();
         BrowserVerificationUiBehavior();
@@ -1238,6 +1241,29 @@ internal static class Tests
         public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
     }
 
+    private sealed class SelectorMihomo : IMihomoClient
+    {
+        private readonly Dictionary<string, string> selected = new Dictionary<string, string> {
+            { "probe", "probe-node" }, { "direct", "DIRECT" }
+        };
+        private readonly string[] generalChoices;
+        public int SelectCalls;
+        public SelectorMihomo(string shared, string general, string[] choices)
+        {
+            selected["shared"] = shared;
+            selected["general"] = general;
+            generalChoices = choices;
+        }
+        public void SetShared(string value) { selected["shared"] = value; }
+        public void SetGeneral(string value) { selected["general"] = value; }
+        public string[] GetChoices(string groupName) { return groupName == "general" ? generalChoices : new string[0]; }
+        public string GetSelected(string groupName) { return selected[groupName]; }
+        public void Select(string groupName, string proxyName) { selected[groupName] = proxyName; SelectCalls++; }
+        public int GetDelay(string proxyName, string url, int timeoutMilliseconds) { return 50; }
+        public bool IsRuntimeIpv6Enabled() { return false; }
+        public bool IsAvailable() { return true; }
+    }
+
     private sealed class FakeMihomo : IMihomoClient
     {
         public string LastSelected;
@@ -1481,6 +1507,41 @@ internal static class Tests
             "both paths failing preserves confirmed emergency failover");
         Equal(false, ProxyPathHealth.Evaluate(true, false, false, true).Mismatch,
             "one healthy ordinary endpoint per path is sufficient");
+    }
+
+    private static void SelectorFollowerBehavior()
+    {
+        var mihomo = new SelectorMihomo("node-a", "subscription notice", new[] { "node-a", "node-b" });
+        Equal(true, SelectorFollower.Synchronize(mihomo, "shared", "general"),
+            "general selector follows verified shared node");
+        Equal("node-a", mihomo.GetSelected("general"), "general selector uses shared node");
+        Equal("probe-node", mihomo.GetSelected("probe"), "isolated probe selector is untouched");
+        Equal("DIRECT", mihomo.GetSelected("direct"), "direct selector is untouched");
+        Equal(1, mihomo.SelectCalls, "one selector update was made");
+        Equal(false, SelectorFollower.Synchronize(mihomo, "shared", "general"),
+            "matching selector does not repeat an update");
+        Equal(1, mihomo.SelectCalls, "matching selector keeps the original update count");
+
+        mihomo.SetShared("node-b");
+        Equal(true, SelectorFollower.Synchronize(mihomo, "shared", "general"),
+            "automatic shared-node change is followed");
+        Equal("node-b", mihomo.GetSelected("general"), "general selector follows changed shared node");
+
+        var unavailable = new SelectorMihomo("node-c", "subscription notice", new[] { "node-a" });
+        Equal(false, SelectorFollower.Synchronize(unavailable, "shared", "general"),
+            "node missing from general choices is not selected");
+        Equal("subscription notice", unavailable.GetSelected("general"),
+            "missing choice preserves the existing selector");
+
+        mihomo.SetGeneral("subscription notice");
+        Equal(false, SelectorFollower.SynchronizeVerified(mihomo, "shared", "general",
+            new CandidateScanResult("node-b", CandidateHealth.Transient, null, "timeout")),
+            "failed shared node is not copied into ordinary routing");
+        Equal("subscription notice", mihomo.GetSelected("general"),
+            "failed node leaves ordinary routing unchanged");
+        Equal(true, SelectorFollower.SynchronizeVerified(mihomo, "shared", "general",
+            new CandidateScanResult("node-b", CandidateHealth.BasicCompatible, null, "entry reachable")),
+            "verified basic-compatible shared node can be followed");
     }
 
     private static void CommandLineBehavior()
@@ -1890,7 +1951,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.3-preview.3"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.3-preview.4"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

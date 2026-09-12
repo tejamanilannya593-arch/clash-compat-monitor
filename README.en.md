@@ -14,7 +14,7 @@ Clash Compatibility Monitor keeps a working node in place, performs conservative
 
 - Discovers actual leaf nodes from `proxies`, `proxy-providers`, and mixed subscription layouts without relying on region names.
 - Checks selected services including ChatGPT, Gemini, Google, GitHub, Steam, Discord, Spotify, and Epic.
-- The local v0.6.3-preview.3 build keeps the optional Z-Library entrance check off by default. Redirects are labeled as unverified website functionality, not usability. Automatic switching pauses when ordinary-site connectivity differs between the isolated probe and system proxy paths; confirmed emergency failover remains available when both paths fail. This is not a formal GitHub release.
+- The local v0.6.3-preview.4 build aligns the ordinary proxy selector with a verified stable node, including after automatic switches. The isolated probe, direct, and reject groups remain unchanged; Clash configuration files are not edited. This improves routing consistency but cannot guarantee website sign-in. The optional web entrance check remains off by default and does not verify sign-in, search, or downloads. This is not a formal GitHub release.
 - Requires five observations spanning at least 30 minutes with a success rate of 95% or higher before a performance-only switch.
 - Keeps two recent standbys, observes every automatic switch, and can safely roll back.
 - Does not modify Clash configuration files, take ownership of subscriptions, inspect browser history, or upload telemetry.

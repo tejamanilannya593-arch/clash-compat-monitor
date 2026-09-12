@@ -6,7 +6,7 @@ using System.Windows.Forms;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.6.3-preview.3";
+    public const string Version = "0.6.3-preview.4";
 }
 
 public static class Program
@@ -123,6 +123,7 @@ public sealed class MonitorConfiguration
     public TimeSpan CycleInterval = TimeSpan.FromSeconds(60);
     public TimeSpan MinimumHold = TimeSpan.FromMinutes(10);
     public string SharedGroup = "🌐 统一稳定节点";
+    public string GeneralGroup = "🚀 节点选择";
     public string ProbeGroup = "🧪 兼容性探测";
     public string ProbeProxy = "http://127.0.0.1:7896";
     public string RootPath;
