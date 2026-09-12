@@ -17,7 +17,8 @@ function Resolve-BrowserHostSource {
     }
     $packagedHost = Join-Path $projectRoot 'ClashCompatibilityMonitor.BrowserHost.exe'
     $builtHost = Join-Path $projectRoot 'bin\ClashCompatibilityMonitor.BrowserHost.exe'
-    return if (Test-Path -LiteralPath $packagedHost -PathType Leaf) { $packagedHost } else { $builtHost }
+    if (Test-Path -LiteralPath $packagedHost -PathType Leaf) { return $packagedHost }
+    return $builtHost
 }
 
 function Write-NativeHostManifest([string]$OutputPath, [string]$HostPath) {

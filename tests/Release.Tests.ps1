@@ -126,6 +126,12 @@ try {
         $rendered.type -ne 'stdio' -or (Compare-Object @($rendered.allowed_origins) @($nativeTemplate.allowed_origins))) {
         throw 'Native host render-only helper produced an invalid manifest.'
     }
+    $defaultManifest = Join-Path $renderFixture 'native-host-default.json'
+    & (Join-Path $root 'scripts\install.ps1') -RenderNativeHostManifest $defaultManifest | Out-Null
+    $defaultRendered = Get-Content -LiteralPath $defaultManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($defaultRendered.path -ne [IO.Path]::GetFullPath((Join-Path $root 'bin\ClashCompatibilityMonitor.BrowserHost.exe'))) {
+        throw 'Installer cannot find the browser host without an explicit source path.'
+    }
 } finally {
     Remove-Item -LiteralPath $renderFixture -Recurse -Force
 }
