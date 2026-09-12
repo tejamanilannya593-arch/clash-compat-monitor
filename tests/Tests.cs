@@ -42,7 +42,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.3-preview.4", MonitorIdentity.Version, "release version");
+        Equal("0.6.3-preview.5", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
@@ -1505,8 +1505,10 @@ internal static class Tests
             "both paths failing is an outage, not a path mismatch");
         Equal(true, ProxyPathHealth.Evaluate(false, false, false, false).CanAutoSwitch,
             "both paths failing preserves confirmed emergency failover");
-        Equal(false, ProxyPathHealth.Evaluate(true, false, false, true).Mismatch,
-            "one healthy ordinary endpoint per path is sufficient");
+        Equal(true, ProxyPathHealth.Evaluate(true, false, false, true).Mismatch,
+            "different reachable sites across paths reveal a routing mismatch");
+        Equal(true, ProxyPathHealth.Evaluate(true, true, true, false).Mismatch,
+            "one failing site on the system path reveals a routing mismatch");
     }
 
     private static void SelectorFollowerBehavior()
@@ -1951,7 +1953,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.3-preview.4"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.3-preview.5"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

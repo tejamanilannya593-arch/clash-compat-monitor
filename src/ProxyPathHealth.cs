@@ -5,21 +5,22 @@ using System.Threading;
 
 public sealed class ProxyPathHealth
 {
-    private ProxyPathHealth(bool probeReachable, bool systemReachable)
+    private ProxyPathHealth(bool probeGoogle, bool probeGithub, bool systemGoogle, bool systemGithub)
     {
-        ProbeReachable = probeReachable;
-        SystemReachable = systemReachable;
+        ProbeReachable = probeGoogle || probeGithub;
+        SystemReachable = systemGoogle || systemGithub;
+        Mismatch = probeGoogle != systemGoogle || probeGithub != systemGithub;
     }
 
     public bool ProbeReachable { get; private set; }
     public bool SystemReachable { get; private set; }
-    public bool Mismatch { get { return ProbeReachable != SystemReachable; } }
+    public bool Mismatch { get; private set; }
     public bool CanAutoSwitch { get { return !Mismatch; } }
 
     public static ProxyPathHealth Evaluate(bool probeGoogle, bool probeGithub,
         bool systemGoogle, bool systemGithub)
     {
-        return new ProxyPathHealth(probeGoogle || probeGithub, systemGoogle || systemGithub);
+        return new ProxyPathHealth(probeGoogle, probeGithub, systemGoogle, systemGithub);
     }
 }
 
@@ -43,8 +44,8 @@ public sealed class ProxyPathHealthChecker : IProxyPathHealthChecker
     {
         bool probeGoogle = CheckEndpoint(probeProxy, "https://www.google.com/generate_204", 204);
         bool systemGoogle = CheckEndpoint(systemProxy, "https://www.google.com/generate_204", 204);
-        bool probeGithub = !probeGoogle && CheckEndpoint(probeProxy, "https://github.com/", 200);
-        bool systemGithub = !systemGoogle && CheckEndpoint(systemProxy, "https://github.com/", 200);
+        bool probeGithub = CheckEndpoint(probeProxy, "https://github.com/", 200);
+        bool systemGithub = CheckEndpoint(systemProxy, "https://github.com/", 200);
         return ProxyPathHealth.Evaluate(probeGoogle, probeGithub, systemGoogle, systemGithub);
     }
 

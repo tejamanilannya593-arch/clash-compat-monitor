@@ -4,4 +4,4 @@ using System.Reflection;
 [assembly: AssemblyProduct("Clash Compatibility Monitor")]
 [assembly: AssemblyVersion("0.6.3.0")]
 [assembly: AssemblyFileVersion("0.6.3.0")]
-[assembly: AssemblyInformationalVersion("0.6.3-preview.4")]
+[assembly: AssemblyInformationalVersion("0.6.3-preview.5")]

@@ -6,7 +6,7 @@ using System.Windows.Forms;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.6.3-preview.4";
+    public const string Version = "0.6.3-preview.5";
 }
 
 public static class Program
