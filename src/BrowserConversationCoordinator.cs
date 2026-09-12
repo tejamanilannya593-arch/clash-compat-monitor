@@ -166,7 +166,9 @@ public sealed class BrowserConversationCoordinator
             if (session == null) return null;
             if (session.ActiveTask != null)
             {
-                if (session.ActiveTask.ExpiresUtc > now) return session.ActiveTask;
+                // A task may create a retained conversation. Never dispatch it twice,
+                // even to a second browser or after the native connection is lost.
+                if (session.ActiveTask.ExpiresUtc > now) return null;
                 completed.Add(session.ActiveTask.TaskId);
                 SetCooldown(session.ActiveTask.Service, now);
                 session.ActiveTask = null;

@@ -100,28 +100,43 @@
 
     const composer = findFirst(page, profile.composer);
     const send = findFirst(page, profile.send);
-    if (!composer || !send || send.disabled) return result("AutomationUnsupported", false, elapsed(), false);
+    if (!composer || !send) return result("AutomationUnsupported", false, elapsed(), false);
 
     const existingReplies = new Set(findAll(page, profile.replies));
-    setComposerText(composer, task.prompt);
-    if (signal.aborted) return result("Cancelled", false, elapsed(), false);
-    send.click();
-    const messageSent = true;
+    const existingUserMessages = new Set(findAll(page, profile.userMessages));
     const maximum = options.maxWaitMilliseconds == null ? DEFAULT_WAIT_MS : options.maxWaitMilliseconds;
     const interval = options.pollIntervalMilliseconds == null ? DEFAULT_POLL_MS : options.pollIntervalMilliseconds;
+    setComposerText(composer, task.prompt);
+    const readyDeadline = elapsed() + Math.min(3000, maximum);
+    while (send.disabled && elapsed() < readyDeadline) {
+      if (signal.aborted) return result("Cancelled", false, elapsed(), false);
+      await wait(interval);
+    }
+    if (signal.aborted) return result("Cancelled", false, elapsed(), false);
+    if (send.disabled) return result("AutomationUnsupported", false, elapsed(), false);
+    send.click();
+    let messageSent = false;
+    const sentDeadline = elapsed() + Math.min(10000, maximum);
 
     while (elapsed() < maximum) {
       if (signal.aborted) return result("Cancelled", messageSent, elapsed(), false);
+      for (const userMessage of findAll(page, profile.userMessages)) {
+        if (!existingUserMessages.has(userMessage) &&
+            normalizeWhitespace(userMessage.textContent) === normalizeWhitespace(task.prompt))
+          messageSent = true;
+      }
       if (findFirst(page, profile.signIn)) return result("SignInRequired", messageSent, elapsed(), false);
       if (findFirst(page, profile.challenge)) return result("ChallengeRequired", messageSent, elapsed(), false);
       if (findFirst(page, profile.errors)) return result("ConversationError", messageSent, elapsed(), false);
       for (const reply of findAll(page, profile.replies)) {
         if (!existingReplies.has(reply) && containsChallenge(reply.textContent, task.challenge))
-          return result("Passed", messageSent, elapsed(), true);
+          return result("Passed", true, elapsed(), true);
       }
+      if (!messageSent && elapsed() >= sentDeadline)
+        return result("AutomationUnsupported", false, elapsed(), false);
       await wait(interval);
     }
-    return result("GenerationTimeout", messageSent, elapsed(), false);
+    return result(messageSent ? "GenerationTimeout" : "AutomationUnsupported", messageSent, elapsed(), false);
   }
 
   return { runConversation, normalizeWhitespace, containsChallenge };

@@ -116,6 +116,19 @@ public static class AccountVerificationMemory
         }
     }
 
+    public static void RevokeBrowserFailure(ExperienceData data, string scope, string node,
+        string exitFingerprint, ServiceKind service, DateTime reportedUtc)
+    {
+        if (data == null || data.AccountVerifications == null || String.IsNullOrWhiteSpace(exitFingerprint)) return;
+        foreach (AccountVerificationRecord record in data.AccountVerifications.Where(x => x != null &&
+            x.Scope == (scope ?? "") && x.Node == (node ?? "") && x.ExitFingerprint == exitFingerprint &&
+            x.Service == service && x.RevokedUtc == DateTime.MinValue && x.VerifiedUtc <= reportedUtc))
+        {
+            record.RevokedUtc = reportedUtc;
+            record.Reason = "browser conversation failure";
+        }
+    }
+
     public static void RevokeForChangedExit(ExperienceData data, string scope, string node,
         string currentExitFingerprint, DateTime now)
     {

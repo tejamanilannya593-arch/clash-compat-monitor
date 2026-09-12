@@ -22,6 +22,7 @@
       "[data-message-author-role='assistant']",
       "article [data-message-author-role='assistant']"
     ],
+    userMessages: ["[data-message-author-role='user']"],
     signIn: [
       "button[data-testid='login-button']",
       "a[href*='/auth/login']",

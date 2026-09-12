@@ -100,7 +100,10 @@
       this.port = null;
       this.requestInFlight = false;
       this.pendingRequestId = null;
-      if (this.active) this.active.resolveTerminal(this.makeResult("Cancelled", false, 0, false));
+      if (this.active) {
+        if (this.active.resolveLoad) this.active.resolveLoad("disconnected");
+        this.active.resolveTerminal(this.makeResult("Cancelled", false, 0, false));
+      }
       this.scheduleReconnect();
     }
 
@@ -169,15 +172,25 @@
       };
       let tab = null;
       let timeoutId = null;
+      let expired = false;
       let resolveTerminal;
       const terminal = new Promise(resolve => { resolveTerminal = resolve; });
+      const sourcePort = this.port;
+      this.active = { task, tabId: null, resolveTerminal, resolveLoad: null };
       try {
         tab = await this.chrome.tabs.create({ url: task.url, active: false });
-        this.active = { task, tabId: tab.id, resolveTerminal, resolveLoad: null };
-        timeoutId = this.setTimer(() => resolveTerminal(
-          this.makeResult("AutomationUnsupported", false, 0, false)), 120000);
-        const loadState = await this.waitForLoad(tab);
-        if (loadState === "loaded") {
+        this.active.tabId = tab.id;
+        if (this.connected && this.port === sourcePort) {
+          timeoutId = this.setTimer(() => {
+            expired = true;
+            if (this.active && this.active.resolveLoad) this.active.resolveLoad("timeout");
+            resolveTerminal(this.makeResult("AutomationUnsupported", false, 0, false));
+          }, 120000);
+        } else {
+          resolveTerminal(this.makeResult("Cancelled", false, 0, false));
+        }
+        const loadState = expired || !this.connected || this.port !== sourcePort ? "cancelled" : await this.waitForLoad(tab);
+        if (loadState === "loaded" && !expired && this.connected && this.port === sourcePort) {
           try {
             await this.chrome.tabs.sendMessage(tab.id, { type: "ccm-run", task });
           } catch (_) {
@@ -185,7 +198,7 @@
           }
         }
         const result = await terminal;
-        this.sendNative("result", {
+        if (this.connected && this.port === sourcePort) this.sendNative("result", {
           TaskId: task.taskId,
           Service: task.service,
           Challenge: task.challenge,
@@ -194,7 +207,7 @@
           ElapsedMilliseconds: Math.round(result.elapsedMilliseconds)
         });
       } catch (_) {
-        this.sendNative("result", {
+        if (this.connected && this.port === sourcePort) this.sendNative("result", {
           TaskId: task.taskId,
           Service: task.service,
           Challenge: task.challenge,

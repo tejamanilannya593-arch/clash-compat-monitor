@@ -25,7 +25,7 @@ public interface IAccountVerificationRunner : IMonitorCycleRunner
     bool RecordBrowserConversationProof(string node, string exitFingerprint,
         ServiceKind service, DateTime verifiedUtc, int protocolVersion);
     void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc);
-    void ReportBrowserConversationFailure(string node, ServiceKind service,
+    void ReportBrowserConversationFailure(string node, string exitFingerprint, ServiceKind service,
         BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc);
 }
 
@@ -217,7 +217,7 @@ public sealed class MonitorCoordinator : IDisposable
         if (result.Outcome == BrowserVerificationOutcome.Passed)
             QueueBrowserProof(current.ActualNode, current.ExitFingerprint, result.Service, now);
         else if (BrowserConversationCoordinator.IsRollbackEligible(result))
-            QueueBrowserFailure(current.ActualNode, result.Service, result.Outcome,
+            QueueBrowserFailure(current.ActualNode, current.ExitFingerprint, result.Service, result.Outcome,
                 result.MessageSent, now);
         browserWake.Set();
         return BrowserResponse("ack", request.RequestId, null);
@@ -407,11 +407,11 @@ public sealed class MonitorCoordinator : IDisposable
         RequestCheck();
     }
 
-    private void QueueBrowserFailure(string node, ServiceKind service,
+    private void QueueBrowserFailure(string node, string exitFingerprint, ServiceKind service,
         BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc)
     {
         lock (accountCommandGate)
-            accountCommands.Add(value => value.ReportBrowserConversationFailure(node, service,
+            accountCommands.Add(value => value.ReportBrowserConversationFailure(node, exitFingerprint, service,
                 outcome, messageSent, reportedUtc));
         RequestCheck();
     }
@@ -442,12 +442,19 @@ public sealed class MonitorCoordinator : IDisposable
 
     private void PublishBrowserStatus(BrowserVerificationStatus status, string detail)
     {
+        MonitorSnapshot value;
         lock (browserStatusGate)
         {
             browserStatus = status;
             browserStatusDetail = detail ?? "";
+            lock (snapshotGate)
+            {
+                value = latest.WithBrowserStatus(status, browserStatusDetail);
+                latest = value;
+            }
         }
-        Publish(Latest.WithBrowserStatus(status, detail), false);
+        Action<MonitorSnapshot> changed = SnapshotChanged;
+        if (changed != null) changed(value);
     }
 
     private static BrowserBridgeMessage BrowserTaskResponse(BrowserBridgeMessage request,

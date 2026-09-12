@@ -23,6 +23,11 @@
       "message-content",
       ".response-container-content"
     ],
+    userMessages: [
+      "user-query",
+      "[data-test-id='user-query']",
+      ".user-query"
+    ],
     signIn: [
       "a[href*='accounts.google.com']",
       "button[data-test-id='sign-in-button']"

@@ -62,6 +62,8 @@ function fakePage(profile, config = {}) {
   const page = new FakeDocument();
   const replies = (config.existingReplies || []).map(text => new FakeElement(text));
   page.set(profile.replies[0], replies);
+  const userMessages = [];
+  page.set(profile.userMessages[0], userMessages);
   const composer = new FakeElement();
   const send = new FakeElement();
   if (!config.missingComposer) page.set(profile.composer[0], composer);
@@ -69,6 +71,7 @@ function fakePage(profile, config = {}) {
   if (config.signIn) page.set(profile.signIn[0], new FakeElement("Sign in"));
   if (config.captcha) page.set(profile.challenge[0], new FakeElement("Verify"));
   send.onClick = () => {
+    if (!config.noUserEcho) userMessages.push(new FakeElement(composer.value || composer.textContent));
     for (const text of config.newReplies || []) replies.push(new FakeElement(text));
     if (config.errorAfterSend) page.set(profile.errors[0], new FakeElement("Service failed"));
   };
@@ -184,6 +187,25 @@ async function flush() {
     const result = await runGeminiAdapter(fixture.page, task(), fastOptions());
     assert.strictEqual(result.outcome, "Passed");
     assertSafeShape(result);
+  });
+
+  await test("disabled empty composer becomes sendable after input", async () => {
+    const fixture = fakePage(CHATGPT_PROFILE, { newReplies: ["CCM-A7F2"] });
+    fixture.send.disabled = true;
+    const originalDispatch = fixture.composer.dispatchEvent.bind(fixture.composer);
+    fixture.composer.dispatchEvent = event => {
+      if (event.type === "input") fixture.send.disabled = false;
+      return originalDispatch(event);
+    };
+    const result = await runChatGptAdapter(fixture.page, task(), fastOptions());
+    assert.strictEqual(result.outcome, "Passed");
+  });
+
+  await test("click without visible sent message cannot trigger node rollback", async () => {
+    const fixture = fakePage(CHATGPT_PROFILE, { noUserEcho: true });
+    const result = await runChatGptAdapter(fixture.page, task(), fastOptions());
+    assert.strictEqual(result.outcome, "AutomationUnsupported");
+    assert.strictEqual(result.messageSent, false);
   });
 
   await test("pre-existing challenge cannot pass", async () => {
@@ -345,6 +367,48 @@ async function flush() {
     await flush();
     const unsupported = fake.port.posted.find(value => value.Type === "result");
     assert.strictEqual(unsupported.Outcome, "AutomationUnsupported");
+    assert(fake.removed.includes(10));
+  });
+
+  await test("page load timeout closes the created tab", async () => {
+    const fake = fakeChrome();
+    const worker = new BrowserVerificationWorker(fake.chrome, {
+      browser: "Chrome", extensionVersion: "0.6.2",
+      setTimeout: fake.setTimeout, clearTimeout: fake.clearTimeout
+    });
+    worker.start();
+    fake.port.onMessage.emit({ Type: "ready", ProtocolVersion: 1, RequestId: fake.port.posted[0].RequestId });
+    const run = nativeRun("ChatGPT", "abcd11");
+    run.RequestId = fake.port.posted.filter(value => value.Type === "poll").pop().RequestId;
+    fake.port.onMessage.emit(run);
+    await flush();
+    assert.strictEqual(fake.created.length, 1);
+    fake.timers.find(value => value.delay === 120000).callback();
+    await flush();
+    assert(fake.removed.includes(10));
+    assert.strictEqual(fake.port.posted.find(value => value.Type === "result").Outcome, "AutomationUnsupported");
+  });
+
+  await test("disconnect during tab creation cannot run a stale task", async () => {
+    const fake = fakeChrome();
+    const originalCreate = fake.chrome.tabs.create;
+    let finishCreate;
+    fake.chrome.tabs.create = () => new Promise(resolve => { finishCreate = resolve; });
+    const worker = new BrowserVerificationWorker(fake.chrome, {
+      browser: "Chrome", extensionVersion: "0.6.2",
+      setTimeout: fake.setTimeout, clearTimeout: fake.clearTimeout
+    });
+    worker.start();
+    fake.port.onMessage.emit({ Type: "ready", ProtocolVersion: 1, RequestId: fake.port.posted[0].RequestId });
+    const run = nativeRun("ChatGPT", "abcd22");
+    run.RequestId = fake.port.posted.filter(value => value.Type === "poll").pop().RequestId;
+    fake.port.onMessage.emit(run);
+    fake.port.onDisconnect.emit();
+    finishCreate(await originalCreate({ url: run.Url, active: false }));
+    await flush();
+    fake.complete(10);
+    await flush();
+    assert.strictEqual(fake.sent.length, 0);
     assert(fake.removed.includes(10));
   });
 

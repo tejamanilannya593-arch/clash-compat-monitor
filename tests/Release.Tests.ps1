@@ -27,6 +27,7 @@ $quickStart = Get-Content -LiteralPath (Join-Path $root 'QUICKSTART.md') -Raw -E
 $contributing = Get-Content -LiteralPath (Join-Path $root 'CONTRIBUTING.md') -Raw -Encoding UTF8
 $releaseNotes = Get-Content -LiteralPath (Join-Path $root 'docs\release-notes\v0.6.1.md') -Raw -Encoding UTF8
 $program = Get-Content -LiteralPath (Join-Path $root 'src\Program.cs') -Raw
+$monitorCoordinator = Get-Content -LiteralPath (Join-Path $root 'src\MonitorCoordinator.cs') -Raw
 $trayHost = Get-Content -LiteralPath (Join-Path $root 'src\TrayHost.cs') -Raw
 $detailsForm = Get-Content -LiteralPath (Join-Path $root 'src\DetailsForm.cs') -Raw
 $buildScript = Get-Content -LiteralPath (Join-Path $root 'build.ps1') -Raw
@@ -84,10 +85,18 @@ if (!$uninstallScript.Contains('NativeMessagingHosts') -or
     !$uninstallScript.Contains('Remove-Item -LiteralPath $registration')) {
     throw 'Uninstaller does not clean up native host registration.'
 }
+if (!$uninstallScript.Contains('EndsWith($monitorSuffix') -or
+    !$uninstallScript.Contains('EndsWith($browserHostSuffix')) {
+    throw 'Uninstaller may leave virtualized app processes running.'
+}
 if (!$installScript.Contains('Remove-Item -LiteralPath $browserExtensionTarget -Recurse -Force') -or
     !$installScript.Contains('Remove-Item -LiteralPath $browserHostTarget -Force') -or
     !$installScript.Contains('Remove-Item -LiteralPath $nativeManifestTarget -Force')) {
     throw 'Installer rollback may leave a partially installed browser companion.'
+}
+if (!$installScript.Contains('Copy-Item -LiteralPath $oldFolder -Destination $installRoot -Recurse -Force') -or
+    !$installScript.Contains('Copy-Item -LiteralPath $oldShortcut -Destination $shortcutPath -Force')) {
+    throw 'Installer rollback does not restore prior state and startup shortcut.'
 }
 $nativeTemplate = Get-Content -LiteralPath (Join-Path $root 'browser-extension\native-host-template.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($nativeTemplate.name -ne 'com.clashcompatibilitymonitor.browser' -or
@@ -123,6 +132,12 @@ try {
 if (!$readme.Contains('v0.6.2') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
     !$program.Contains('InstanceActivation.TryOwn') -or !$trayHost.Contains('NotifyIcon')) {
     throw 'README does not describe v0.6.2 tray and intent behavior.'
+}
+if (!$trayHost.Contains('Path.Combine(Application.StartupPath, "browser-extension", "README.md")')) {
+    throw 'Installed browser setup action does not open the packaged companion guide.'
+}
+if ($monitorCoordinator.Contains('Publish(Latest.WithBrowserStatus')) {
+    throw 'Browser status can overwrite a newer network snapshot.'
 }
 $proofDocs = $readme + $quickStart
 $proofTerms = @(

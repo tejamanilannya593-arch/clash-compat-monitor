@@ -271,12 +271,50 @@ internal static class Tests
             BrowserConversationProof.CurrentProtocolVersion),
             "worker persists freshly revalidated browser conversation proof");
         int beforeRollbackRecheck = workerProbe.Calls.Count;
-        worker.ReportBrowserConversationFailure("node", ServiceKind.Gemini,
+        worker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
             BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
         Equal(true, workerProbe.Calls.Count > beforeRollbackRecheck,
             "browser failure performs fresh old-node service recheck");
         Equal("old-node", workerMihomo.GetSelected("shared"),
             "browser failure rechecks old node before safe rollback");
+
+        string staleRoot = Path.Combine(Path.GetTempPath(), "browser-stale-" + Guid.NewGuid().ToString("N"));
+        var staleData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        staleData.Assurance.Begin("old-node", "node", 100, true, false, now);
+        new ExperienceStore(Path.Combine(staleRoot, "state", "experience.json")).Save(staleData, now);
+        var staleMihomo = new VerificationMihomo("node", new[] { "node", "old-node" });
+        var staleProbe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        var staleWorker = new MonitorWorker(new MonitorConfiguration { RootPath = staleRoot, SharedGroup = "shared", ProbeGroup = "probe" },
+            staleMihomo, staleProbe, new BoundedLogger(Path.Combine(staleRoot, "logs", "monitor.log"), 1024 * 1024),
+            new FakeClock { UtcNow = now.AddMinutes(11) }, new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
+        staleWorker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
+        Equal("node", staleMihomo.GetSelected("shared"),
+            "delayed browser failure cannot use an expired rollback window");
+        staleWorker.ReportServiceFailure("node", ServiceKind.Gemini, now.AddMinutes(2));
+        Equal("node", staleMihomo.GetSelected("shared"),
+            "delayed manual failure cannot use an expired rollback window");
+
+        string driftRoot = Path.Combine(Path.GetTempPath(), "browser-exit-drift-" + Guid.NewGuid().ToString("N"));
+        var driftData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        driftData.Assurance.Begin("old-node", "node", 100, true, false, now);
+        AccountVerificationMemory.MarkBrowserConversation(driftData, "scope", "node", "changed-exit",
+            ServiceKind.Gemini, now.AddMinutes(1), BrowserConversationProof.CurrentProtocolVersion);
+        new ExperienceStore(Path.Combine(driftRoot, "state", "experience.json")).Save(driftData, now);
+        var driftMihomo = new VerificationMihomo("node", new[] { "node", "old-node" });
+        var driftWorker = new MonitorWorker(new MonitorConfiguration { RootPath = driftRoot, SharedGroup = "shared", ProbeGroup = "probe" },
+            driftMihomo, new FakeProbe { DefaultResult = ProbeResult.Success(100) },
+            new BoundedLogger(Path.Combine(driftRoot, "logs", "monitor.log"), 1024 * 1024),
+            new FakeClock { UtcNow = now.AddMinutes(2) }, new FakeExitIdentityProbe(new ExitIdentity("changed-exit", "JP", "ok")));
+        driftWorker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
+        Equal("node", driftMihomo.GetSelected("shared"),
+            "changed exit cannot use a stale browser failure for rollback");
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(
+            new ExperienceStore(Path.Combine(driftRoot, "state", "experience.json")).Load(),
+            "scope", "node", "changed-exit", ServiceKind.Gemini, now.AddMinutes(2),
+            BrowserConversationProof.CurrentProtocolVersion),
+            "old exit failure cannot revoke new exit conversation proof");
     }
 
     private static void BrowserConversationCoordinatorBehavior()
@@ -309,6 +347,10 @@ internal static class Tests
         BrowserVerificationTask first = coordinator.Poll("Chrome", now);
         Equal(ServiceKind.ChatGPT, first.Service, "chatgpt browser verification runs first");
         Equal("CCM-A7F2", first.Challenge, "browser verification uses generated challenge");
+        Equal(null, coordinator.Poll("Edge", now.AddSeconds(1)),
+            "another browser cannot receive an active conversation task");
+        Equal(null, coordinator.Poll("Chrome", now.AddSeconds(1)),
+            "active conversation task is dispatched only once");
         var passed = new BrowserVerificationResult {
             TaskId = first.TaskId,
             Service = first.Service,
@@ -1695,7 +1737,7 @@ internal static class Tests
             Interlocked.Increment(ref failureCount);
         }
 
-        public void ReportBrowserConversationFailure(string node, ServiceKind service,
+        public void ReportBrowserConversationFailure(string node, string exitFingerprint, ServiceKind service,
             BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc)
         {
             Interlocked.Increment(ref failureCount);

@@ -52,6 +52,8 @@ $browserHostTarget = Join-Path $installRoot 'ClashCompatibilityMonitor.BrowserHo
 $browserExtensionSource = Join-Path $projectRoot 'browser-extension'
 $browserExtensionTarget = Join-Path $installRoot 'browser-extension'
 $nativeManifestTarget = Join-Path $installRoot 'browser-native-host.json'
+$startup = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+$shortcutPath = Join-Path $startup 'Clash Compatibility Monitor.lnk'
 if ([IO.Path]::GetFullPath($browserExtensionSource) -eq [IO.Path]::GetFullPath($browserExtensionTarget)) {
     throw 'Install source and destination must be different.'
 }
@@ -84,7 +86,10 @@ $browserHostSuffix = '\ClashCompatibilityMonitor\ClashCompatibilityMonitor.Brows
 if ((Test-Path -LiteralPath $target -PathType Leaf -ErrorAction SilentlyContinue) -or
     (Test-Path -LiteralPath $browserHostTarget -PathType Leaf -ErrorAction SilentlyContinue) -or
     (Test-Path -LiteralPath $nativeManifestTarget -PathType Leaf -ErrorAction SilentlyContinue) -or
-    (Test-Path -LiteralPath $browserExtensionTarget -PathType Container -ErrorAction SilentlyContinue)) {
+    (Test-Path -LiteralPath $browserExtensionTarget -PathType Container -ErrorAction SilentlyContinue) -or
+    (Test-Path -LiteralPath (Join-Path $installRoot 'state') -PathType Container -ErrorAction SilentlyContinue) -or
+    (Test-Path -LiteralPath (Join-Path $installRoot 'logs') -PathType Container -ErrorAction SilentlyContinue) -or
+    (Test-Path -LiteralPath $shortcutPath -PathType Leaf -ErrorAction SilentlyContinue)) {
     $backup = Join-Path $installRoot ('upgrade-backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $backup | Out-Null
     if (Test-Path -LiteralPath $target -PathType Leaf) { Copy-Item -LiteralPath $target -Destination (Join-Path $backup 'ClashCompatibilityMonitor.exe') }
@@ -94,6 +99,9 @@ if ((Test-Path -LiteralPath $target -PathType Leaf -ErrorAction SilentlyContinue
     foreach ($folder in @('state','logs')) {
         $existing = Join-Path $installRoot $folder
         if (Test-Path -LiteralPath $existing) { Copy-Item -LiteralPath $existing -Destination (Join-Path $backup $folder) -Recurse }
+    }
+    if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+        Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $backup 'startup.lnk')
     }
 }
 
@@ -141,8 +149,6 @@ try {
     if ($hostCheck.ExitCode -ne 0) { throw 'Browser native host self-test failed.' }
     $check = Start-Process -FilePath $target -WorkingDirectory $installRoot -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru
     if ($check.ExitCode -ne 0) { throw 'Cannot connect to the Mihomo core. Start Clash Verge Rev and verify the enhancement groups are present, then retry. The previous program will be restored if available.' }
-    $startup = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
-    $shortcutPath = Join-Path $startup 'Clash Compatibility Monitor.lnk'
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $target
@@ -179,6 +185,23 @@ try {
     }
     if (Test-Path -LiteralPath $target -PathType Leaf) {
         Remove-Item -LiteralPath $target -Force
+    }
+    foreach ($folder in @('state','logs')) {
+        $existing = Join-Path $installRoot $folder
+        if (Test-Path -LiteralPath $existing -PathType Container) {
+            Remove-Item -LiteralPath $existing -Recurse -Force
+        }
+        $oldFolder = if ($backup) { Join-Path $backup $folder } else { $null }
+        if ($oldFolder -and (Test-Path -LiteralPath $oldFolder -PathType Container)) {
+            Copy-Item -LiteralPath $oldFolder -Destination $installRoot -Recurse -Force
+        }
+    }
+    if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+        Remove-Item -LiteralPath $shortcutPath -Force
+    }
+    $oldShortcut = if ($backup) { Join-Path $backup 'startup.lnk' } else { $null }
+    if ($oldShortcut -and (Test-Path -LiteralPath $oldShortcut -PathType Leaf)) {
+        Copy-Item -LiteralPath $oldShortcut -Destination $shortcutPath -Force
     }
     if ($backup) {
         $oldMonitor = Join-Path $backup 'ClashCompatibilityMonitor.exe'

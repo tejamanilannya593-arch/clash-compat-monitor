@@ -128,10 +128,10 @@ public sealed class TrayHost : ApplicationContext
 
     private void OpenBrowserSetupDocumentation()
     {
-        string path = Path.Combine(Application.StartupPath, "QUICKSTART.md");
+        string path = Path.Combine(Application.StartupPath, "browser-extension", "README.md");
         if (!File.Exists(path))
         {
-            MessageBox.Show("未找到本地 QUICKSTART.md，请重新安装完整发布包。", "节点守护",
+            MessageBox.Show("未找到本地浏览器伴侣说明，请重新安装完整发布包。", "节点守护",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }

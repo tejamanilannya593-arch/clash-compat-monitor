@@ -156,7 +156,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         ConnectionAssurance assurance = experience.Assurance;
         string current = mihomo.GetSelected(config.SharedGroup);
         if (String.Equals(current, node, StringComparison.Ordinal) && assurance != null &&
-            assurance.CanUserFeedbackRollback(current, reportedUtc) && assurance.Previous != current &&
+            assurance.CanUserFeedbackRollback(current, clock.UtcNow) && assurance.Previous != current &&
             mihomo.GetChoices(config.SharedGroup).Contains(assurance.Previous, StringComparer.Ordinal))
         {
             string previous = assurance.Previous;
@@ -166,12 +166,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             try
             {
                 CandidateScanResult verified = scanner.ScanSelected(new CandidateNode(previous, null), lastPreferences.RequiredServices);
-                if (ServiceEvidencePolicy.CanEmergencySwitch(verified) && mihomo.GetSelected(config.SharedGroup) == current)
+                if (ServiceEvidencePolicy.CanEmergencySwitch(verified) && mihomo.GetSelected(config.SharedGroup) == current &&
+                    assurance.CanUserFeedbackRollback(current, clock.UtcNow))
                 {
                     SelectRecorded(current, previous, "用户反馈 AI 服务失败，旧节点复检通过，自动回退");
                     previousSelectedNode = current;
                     assurance.Target = null;
-                    assurance.HoldUntilUtc = reportedUtc.AddMinutes(30);
+                    assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
                     controller.RecordSwitch();
                     logger.Write("user feedback rollback node=" + SafeName(previous));
                 }
@@ -185,18 +186,19 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         experienceStore.Save(experience, reportedUtc);
     }
 
-    public void ReportBrowserConversationFailure(string node, ServiceKind service,
+    public void ReportBrowserConversationFailure(string node, string exitFingerprint, ServiceKind service,
         BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc)
     {
         if (service != ServiceKind.ChatGPT && service != ServiceKind.Gemini) return;
-        AccountVerificationMemory.Revoke(experience, experience.ActiveScope, node, service,
-            reportedUtc, "browser conversation failure");
+        AccountVerificationMemory.RevokeBrowserFailure(experience, experience.ActiveScope, node,
+            exitFingerprint, service, reportedUtc);
         logger.Write("browser conversation failure node=" + SafeName(node) + " service=" + service +
             " outcome=" + outcome + " message_sent=" + messageSent.ToString().ToLowerInvariant());
         ConnectionAssurance assurance = experience.Assurance;
         string current = mihomo.GetSelected(config.SharedGroup);
-        if (String.Equals(current, node, StringComparison.Ordinal) && assurance != null &&
-            assurance.ShouldRecheckPreviousAfterBrowserResult(current, outcome, messageSent, reportedUtc) &&
+        if (String.Equals(current, node, StringComparison.Ordinal) &&
+            !String.IsNullOrWhiteSpace(exitFingerprint) && assurance != null &&
+            assurance.ShouldRecheckPreviousAfterBrowserResult(current, outcome, messageSent, clock.UtcNow) &&
             assurance.Previous != current &&
             mihomo.GetChoices(config.SharedGroup).Contains(assurance.Previous, StringComparer.Ordinal))
         {
@@ -206,17 +208,28 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             cycleTimer = Stopwatch.StartNew();
             try
             {
-                CandidateScanResult verified = scanner.ScanSelected(new CandidateNode(previous, null),
-                    lastPreferences.RequiredServices);
-                if (ServiceEvidencePolicy.CanEmergencySwitch(verified) &&
-                    mihomo.GetSelected(config.SharedGroup) == current)
+                CandidateScanResult currentCheck = scanner.ScanSelected(new CandidateNode(current, null),
+                    new[] { service });
+                if (String.Equals(currentCheck.ExitFingerprint, exitFingerprint, StringComparison.Ordinal))
                 {
-                    SelectRecorded(current, previous, "浏览器真实对话失败，旧节点复检通过，自动回退");
-                    previousSelectedNode = current;
-                    assurance.Target = null;
-                    assurance.HoldUntilUtc = reportedUtc.AddMinutes(30);
-                    controller.RecordSwitch();
-                    logger.Write("browser proof rollback node=" + SafeName(previous));
+                    CandidateScanResult verified = scanner.ScanSelected(new CandidateNode(previous, null),
+                        lastPreferences.RequiredServices);
+                    if (ServiceEvidencePolicy.CanEmergencySwitch(verified))
+                    {
+                        CandidateScanResult currentAfter = scanner.ScanSelected(new CandidateNode(current, null),
+                            new[] { service });
+                        if (String.Equals(currentAfter.ExitFingerprint, exitFingerprint, StringComparison.Ordinal) &&
+                            mihomo.GetSelected(config.SharedGroup) == current &&
+                            assurance.ShouldRecheckPreviousAfterBrowserResult(current, outcome, messageSent, clock.UtcNow))
+                        {
+                            SelectRecorded(current, previous, "浏览器真实对话失败，旧节点复检通过，自动回退");
+                            previousSelectedNode = current;
+                            assurance.Target = null;
+                            assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
+                            controller.RecordSwitch();
+                            logger.Write("browser proof rollback node=" + SafeName(previous));
+                        }
+                    }
                 }
             }
             finally
