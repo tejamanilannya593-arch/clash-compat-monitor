@@ -207,6 +207,8 @@ public sealed class MonitorPresentation
     public static string ServiceText(ServiceMeasurement service)
     {
         if (service.Evidence == ProbeFailureKind.Unverified) return "待验证";
+        if (service.Service == ServiceKind.ZLibraryWeb && service.Evidence == ProbeFailureKind.Partial)
+            return "网站功能未验证" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "");
         if (service.Evidence == ProbeFailureKind.Partial)
             return "仅确认可达" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "");
         if (service.Evidence == ProbeFailureKind.Region) return "地区受限";

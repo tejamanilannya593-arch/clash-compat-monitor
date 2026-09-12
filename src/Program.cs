@@ -6,7 +6,7 @@ using System.Windows.Forms;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.6.3-preview.1";
+    public const string Version = "0.6.3-preview.3";
 }
 
 public static class Program
@@ -39,7 +39,8 @@ public static class Program
                     {
                         var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
                             Path.Combine(config.RootPath, "state", "identity.key"));
-                        var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock(), exitProbe);
+                        var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock(), exitProbe,
+                            new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"));
                         worker.RunOnce(options.DryRun, new UserPreferenceStore(config.PreferencesPath).Load());
                     }
                 }
@@ -58,7 +59,8 @@ public static class Program
                 {
                     var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
                         Path.Combine(config.RootPath, "state", "identity.key"));
-                    var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe);
+                    var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe,
+                        new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"));
                     using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
                     using (var browserBridge = new BrowserBridgeServer(BrowserPipeIdentity.ForCurrentUser(),
                         coordinator.HandleBrowserMessage))

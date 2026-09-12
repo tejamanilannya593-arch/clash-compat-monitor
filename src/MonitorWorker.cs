@@ -47,6 +47,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly IClock clock;
     private readonly FailoverController controller;
     private readonly TrafficGuard trafficGuard;
+    private readonly IProxyPathHealthChecker pathHealthChecker;
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
     private int accountCommandRunning;
@@ -72,7 +73,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     }
 
     public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock,
-        IExitIdentityProbe exitIdentityProbe = null)
+        IExitIdentityProbe exitIdentityProbe = null, IProxyPathHealthChecker pathHealthChecker = null)
     {
         this.config = config;
         this.mihomo = mihomo;
@@ -80,6 +81,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         scanner.ShouldStop = StopRequired;
         this.logger = logger;
         this.clock = clock;
+        this.pathHealthChecker = pathHealthChecker;
         experienceStore = new ExperienceStore(Path.Combine(config.RootPath, "state", "experience.json"));
         experience = experienceStore.Load();
         if (experience.Assurance == null || experience.Assurance.Standbys == null) experience.Assurance = new ConnectionAssurance();
@@ -254,7 +256,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             cycleTimer = Stopwatch.StartNew();
             lastPreferences = preferences;
             Report("正在检查 Clash 连接与运行环境", null);
-            ConflictResult conflict = new ConflictDetector().Evaluate(RuntimeInspector.Capture(mihomo));
+            RuntimeSnapshot runtime = RuntimeInspector.Capture(mihomo);
+            ConflictResult conflict = new ConflictDetector().Evaluate(runtime);
             if (conflict.Paused)
             {
                 logger.Write("paused-conflict " + conflict.Reason);
@@ -296,6 +299,15 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             var qualityStore = new QualityStateStore(config.QualityStatePath);
             List<QualitySample> qualityHistory = qualityStore.Load();
             string current = mihomo.GetSelected(config.SharedGroup);
+            ProxyPathHealth pathHealth = null;
+            if (pathHealthChecker != null && runtime.SystemProxy.Length > 0)
+            {
+                mihomo.Select(config.ProbeGroup, current);
+                pathHealth = pathHealthChecker.Check();
+                if (pathHealth.Mismatch)
+                    logger.Write("proxy path mismatch probe=" + pathHealth.ProbeReachable +
+                        " system=" + pathHealth.SystemReachable + "; automatic switching paused");
+            }
             string cycleStartNode = current;
             experience.RecordChange(experience.LastNode, current, "检测到外部变更（Clash 手动选择或核心重载）", clock.UtcNow);
             experienceStore.Save(experience, clock.UtcNow);
@@ -313,7 +325,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 logger.Write("reload recovery live recheck target=" + SafeName(recoveryTarget));
                 CandidateScanResult recoveryScan = scanner.ScanSelected(new CandidateNode(recoveryTarget, null), requiredServices);
                 CheckStop();
-                if (!dryRun && preferences.AutomaticOptimization &&
+                if (!dryRun && preferences.AutomaticOptimization && (pathHealth == null || pathHealth.CanAutoSwitch) &&
                     ServiceEvidencePolicy.CanRestoreAfterReload(recoveryScan, experience,
                         memoryScope, requiredServices, clock.UtcNow) &&
                     mihomo.GetSelected(config.SharedGroup) == current)
@@ -417,7 +429,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 {
                     bool rollback = assurance.NeedsRollback(currentScan);
                     assuranceDecision = "切换后观察：第 " + assurance.VerificationCount + " 次复检";
-                    if (rollback && !dryRun)
+                    if (rollback && !dryRun && (pathHealth == null || pathHealth.CanAutoSwitch))
                     {
                         var old = candidates.FirstOrDefault(x => x.Name == assurance.Previous);
                         CandidateScanResult oldScan = old == null ? null : scanner.ScanSelected(old, servicesToProbe);
@@ -653,7 +665,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 decision = reason;
                 if (currentCompatible && clock.UtcNow < assurance.HoldUntilUtc) { shouldSwitch = false; decision = "处于切换观察后的稳定期，保持连接"; }
                 if (currentCompatible && !trafficIdle) { shouldSwitch = false; decision = "检测到较大流量，保持当前节点"; }
-                if (shouldSwitch && !dryRun && SwitchModePolicy.AllowsAutomaticSwitch(currentCompatible, preferences.AutomaticOptimization))
+                if (shouldSwitch && !dryRun && (pathHealth == null || pathHealth.CanAutoSwitch) && SwitchModePolicy.AllowsAutomaticSwitch(currentCompatible, preferences.AutomaticOptimization))
                 {
                     DateTime verifiedUtc;
                     CandidateScanResult finalScan;
@@ -672,7 +684,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     if (!shouldSwitch) decision = "目标节点复检未通过，保留当前连接";
                 }
                 CheckStop();
-                if (shouldSwitch && !dryRun && SwitchModePolicy.AllowsAutomaticSwitch(currentCompatible, preferences.AutomaticOptimization) &&
+                if (shouldSwitch && !dryRun && (pathHealth == null || pathHealth.CanAutoSwitch) && SwitchModePolicy.AllowsAutomaticSwitch(currentCompatible, preferences.AutomaticOptimization) &&
                     String.Equals(mihomo.GetSelected(config.SharedGroup), current, StringComparison.Ordinal))
                 {
                     bool provisional = !ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan,
@@ -690,6 +702,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
             }
             if (dryRun) logger.Write("dry-run quality evaluation completed; shared selector unchanged");
+            if (pathHealth != null && pathHealth.Mismatch)
+                decision = "检测路径异常：兼容性探测与系统代理连通结果不一致，暂停自动切换";
             else if (!switched && currentScan.Health == CandidateHealth.BasicCompatible && serviceIncidentDecision == null)
             {
                 decision = "current entry reachable but login unverified";
@@ -722,6 +736,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             {
                 CandidateHealth status = actualScan.Health;
                 string detail = actualScan.Detail;
+                if (pathHealth != null && pathHealth.Mismatch)
+                    detail += "; 检测路径异常：探测入口=" + (pathHealth.ProbeReachable ? "可用" : "失败") +
+                        "，系统代理入口=" + (pathHealth.SystemReachable ? "可用" : "失败");
                 bool hasAiRequirement = requiredServices.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini);
                 if (hasAiRequirement && status == CandidateHealth.Compatible)
                     detail += ServiceEvidencePolicy.CanQualitySwitch(actualScan, experience, memoryScope,
@@ -733,9 +750,11 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             qualityStore.Save(qualityHistory);
             string selectionSummary = experience.SelectionSummary(actual, firstCompletedCycle && actual == cycleStartNode && !switched);
             firstCompletedCycle = false;
-            return MonitorSnapshot.CreateRunning(actual, actualScan, reportedScore, decision, clock.UtcNow,
+            MonitorSnapshot completed = MonitorSnapshot.CreateRunning(actual, actualScan, reportedScore, decision, clock.UtcNow,
                 clock.UtcNow.Add(nextInterval)).WithAccountVerification(experience, memoryScope, clock.UtcNow)
                 .WithSelectionReason(selectionSummary);
+            return pathHealth != null && pathHealth.Mismatch
+                ? completed.WithState(MonitorRunState.Degraded, decision, clock.UtcNow.Add(nextInterval)) : completed;
         }
         finally
         {

@@ -42,7 +42,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.3-preview.1", MonitorIdentity.Version, "release version");
+        Equal("0.6.3-preview.3", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         CandidateFiltering();
         PipeHttpDecoding();
@@ -56,6 +56,7 @@ internal static class Tests
         ThroughputAndTraffic();
         StabilityAndState();
         RuntimeGuards();
+        ProxyPathHealthBehavior();
         UserPreferenceBehavior();
         BrowserVerificationUiBehavior();
         MonitorCoordinatorBehavior();
@@ -121,6 +122,10 @@ internal static class Tests
         Equal("入口可达 · 123 ms",
             MonitorPresentation.ServiceText(new ServiceMeasurement(service, true, 123, "ok")),
             "Z-Library status does not claim login or downloads");
+        Equal("网站功能未验证 · 123 ms",
+            MonitorPresentation.ServiceText(new ServiceMeasurement(service, true, 123,
+                "入口发生跳转，未验证网站功能", ProbeFailureKind.Partial)),
+            "redirect is not presented as usable web access");
     }
 
     private static void ZLibraryChoiceBehavior()
@@ -1460,6 +1465,24 @@ internal static class Tests
         Equal(true, new FileInfo(logPath).Length <= 1024, "bounded log size");
     }
 
+    private static void ProxyPathHealthBehavior()
+    {
+        Equal(false, ProxyPathHealth.Evaluate(true, true, true, true).Mismatch,
+            "both proxy paths healthy allow normal decisions");
+        Equal(true, ProxyPathHealth.Evaluate(false, false, true, true).Mismatch,
+            "probe path failing while system path works pauses decisions");
+        Equal(false, ProxyPathHealth.Evaluate(false, false, true, true).CanAutoSwitch,
+            "path mismatch blocks automatic switching");
+        Equal(true, ProxyPathHealth.Evaluate(true, true, false, false).Mismatch,
+            "system path failing while probe path works pauses decisions");
+        Equal(false, ProxyPathHealth.Evaluate(false, false, false, false).Mismatch,
+            "both paths failing is an outage, not a path mismatch");
+        Equal(true, ProxyPathHealth.Evaluate(false, false, false, false).CanAutoSwitch,
+            "both paths failing preserves confirmed emergency failover");
+        Equal(false, ProxyPathHealth.Evaluate(true, false, false, true).Mismatch,
+            "one healthy ordinary endpoint per path is sufficient");
+    }
+
     private static void CommandLineBehavior()
     {
         var options = MonitorOptions.Parse(new[] { "--dry-run", "--once" });
@@ -1867,7 +1890,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.3-preview.1"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.3-preview.3"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
