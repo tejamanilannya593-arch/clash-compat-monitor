@@ -19,6 +19,21 @@ public sealed class FailoverDecision
     public string Reason { get; private set; }
 }
 
+public static class SwitchModePolicy
+{
+    public const string ConservativeHoldReason = "current usable; conservative mode holds";
+
+    public static bool AllowsAutomaticSwitch(bool currentCompatible, bool performanceOptimization)
+    {
+        return !currentCompatible || performanceOptimization;
+    }
+
+    public static bool ShouldEvaluateQuality(bool currentCompatible, bool performanceOptimization)
+    {
+        return currentCompatible && performanceOptimization;
+    }
+}
+
 public sealed class FailoverController
 {
     private readonly IClock clock;

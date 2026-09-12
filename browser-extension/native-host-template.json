@@ -1,0 +1,9 @@
+{
+  "name": "com.clashcompatibilitymonitor.browser",
+  "description": "Clash Compatibility Monitor browser conversation verification host",
+  "path": "__HOST_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg/"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Clash Compatibility Monitor Browser Companion",
+  "description": "Performs opt-in ChatGPT and Gemini conversation checks for Clash Compatibility Monitor.",
+  "version": "0.6.2",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy+zsf3Gia62jqE11xaIRPhIXUiXn9TXa0XKfL9sHUha1uzEtrqSaGfzSj6sdtxTwa81pG6QtTJ3niE+s3v5mO4ZEMiji9y4ZOXsgSeDWEgMRDfUs5UNdDwYGf6PjrB2/8XVjkKaWvJkmkazJ91wIqEOwoBnDlp+SCzeIwFCySh+AvVqMGnFbNq4nJhGGXA1tnCMGIq/f2zgF0lbgS/7yYTyPy+s2cWWNDNWdmHtE9v6YnBZ060sjaQcfmlJsmjliyGGrizmwTkT2yuDyQlFSYvFOb5zHkmByHxZSQ2u1YWk+tDqX5NmHMhEo4fC81l8eFIN/sPYsTBvf6IhUAO2zrQIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["adapter-core.js", "chatgpt-adapter.js", "content-chatgpt.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["adapter-core.js", "gemini-adapter.js", "content-gemini.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

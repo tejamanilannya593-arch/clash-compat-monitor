@@ -13,6 +13,8 @@ public sealed class AccountVerificationRecord
     public DateTime RevokedUtc { get; set; }
     public string Reason { get; set; }
     public int EvidenceRuleVersion { get; set; }
+    public AccountVerificationMethod Method { get; set; }
+    public int ProtocolVersion { get; set; }
 }
 
 public static class AccountVerificationMemory
@@ -38,8 +40,51 @@ public static class AccountVerificationMemory
             VerifiedUtc = now,
             RevokedUtc = DateTime.MinValue,
             Reason = passed ? "account-verified" : "account-verification-failed",
-            EvidenceRuleVersion = ruleVersion
+            EvidenceRuleVersion = ruleVersion,
+            Method = AccountVerificationMethod.LegacyManual,
+            ProtocolVersion = 0
         });
+    }
+
+    public static void MarkBrowserConversation(ExperienceData data, string scope, string node,
+        string exitFingerprint, ServiceKind service, DateTime now, int protocolVersion)
+    {
+        if (data == null) throw new ArgumentNullException("data");
+        if (!IsAccountService(service)) throw new ArgumentException("Only AI account services can be verified.", "service");
+        if (data.AccountVerifications == null) data.AccountVerifications = new List<AccountVerificationRecord>();
+
+        data.AccountVerifications.RemoveAll(x => x != null && x.Scope == scope && x.Node == node && x.Service == service);
+        data.AccountVerifications.Add(new AccountVerificationRecord
+        {
+            Scope = scope ?? "",
+            Node = node ?? "",
+            ExitFingerprint = exitFingerprint ?? "",
+            Service = service,
+            Passed = true,
+            VerifiedUtc = now,
+            RevokedUtc = DateTime.MinValue,
+            Reason = "browser-conversation-verified",
+            EvidenceRuleVersion = CurrentRuleVersion,
+            Method = AccountVerificationMethod.BrowserConversation,
+            ProtocolVersion = protocolVersion
+        });
+    }
+
+    public static bool IsBrowserConversationValid(ExperienceData data, string scope, string node,
+        string exitFingerprint, ServiceKind service, DateTime now, int protocolVersion)
+    {
+        return FindBrowserConversationValid(data, scope, node, exitFingerprint,
+            service, now, protocolVersion) != null;
+    }
+
+    public static AccountVerificationRecord FindBrowserConversationValid(ExperienceData data,
+        string scope, string node, string exitFingerprint, ServiceKind service, DateTime now,
+        int protocolVersion)
+    {
+        AccountVerificationRecord record = FindValid(data, scope, node, exitFingerprint,
+            service, now, CurrentRuleVersion);
+        return record != null && record.Method == AccountVerificationMethod.BrowserConversation &&
+            record.ProtocolVersion == protocolVersion ? record : null;
     }
 
     public static bool IsValid(ExperienceData data, string scope, string node, string exitFingerprint,
@@ -68,6 +113,19 @@ public static class AccountVerificationMemory
         {
             record.RevokedUtc = now;
             record.Reason = reason ?? "revoked";
+        }
+    }
+
+    public static void RevokeBrowserFailure(ExperienceData data, string scope, string node,
+        string exitFingerprint, ServiceKind service, DateTime reportedUtc)
+    {
+        if (data == null || data.AccountVerifications == null || String.IsNullOrWhiteSpace(exitFingerprint)) return;
+        foreach (AccountVerificationRecord record in data.AccountVerifications.Where(x => x != null &&
+            x.Scope == (scope ?? "") && x.Node == (node ?? "") && x.ExitFingerprint == exitFingerprint &&
+            x.Service == service && x.RevokedUtc == DateTime.MinValue && x.VerifiedUtc <= reportedUtc))
+        {
+            record.RevokedUtc = reportedUtc;
+            record.Reason = "browser conversation failure";
         }
     }
 

@@ -40,7 +40,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.1", MonitorIdentity.Version, "release version");
+        Equal("0.6.2", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         CandidateFiltering();
         PipeHttpDecoding();
@@ -52,8 +52,9 @@ internal static class Tests
         StabilityAndState();
         RuntimeGuards();
         UserPreferenceBehavior();
-        AccountVerificationUiBehavior();
+        BrowserVerificationUiBehavior();
         MonitorCoordinatorBehavior();
+        BrowserCoordinatorIntegrationBehavior();
         InstanceActivationBehavior();
         CommandLineBehavior();
         StatusReporting();
@@ -62,6 +63,9 @@ internal static class Tests
         ServiceEvidenceBehavior();
         LoginChainEvidenceBehavior();
         AccountVerificationBehavior();
+        BrowserConversationCoordinatorBehavior();
+        BrowserNativeProtocolBehavior();
+        BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
     }
@@ -175,6 +179,20 @@ internal static class Tests
         Equal(true, AccountVerificationMemory.IsValid(data, "scope", "node", "fingerprint",
             ServiceKind.ChatGPT, now.AddDays(29), AccountVerificationMemory.CurrentRuleVersion),
             "account proof valid for same exit before thirty days");
+        Equal(false, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), BrowserConversationProof.CurrentProtocolVersion),
+            "legacy manual proof cannot authorize browser proof");
+        AccountVerificationMemory.MarkBrowserConversation(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now, BrowserConversationProof.CurrentProtocolVersion);
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(29), BrowserConversationProof.CurrentProtocolVersion),
+            "browser proof valid for same exit before thirty days");
+        Equal(false, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(30), BrowserConversationProof.CurrentProtocolVersion),
+            "browser proof expires at thirty days");
+        Equal(false, AccountVerificationMemory.IsBrowserConversationValid(data, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), BrowserConversationProof.CurrentProtocolVersion + 1),
+            "browser proof invalid after protocol upgrade");
         Equal(false, AccountVerificationMemory.IsValid(data, "scope", "node", "changed",
             ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
             "account proof invalid after exit change");
@@ -193,8 +211,8 @@ internal static class Tests
         Equal(false, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
             "quality switch waits for every selected AI account proof");
-        AccountVerificationMemory.Mark(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
-            true, now, AccountVerificationMemory.CurrentRuleVersion);
+        AccountVerificationMemory.MarkBrowserConversation(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
+            now, BrowserConversationProof.CurrentProtocolVersion);
         Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
             "quality switch accepts current exit after both AI proofs");
@@ -212,6 +230,9 @@ internal static class Tests
         var store = new ExperienceStore(path);
         store.Save(data, now);
         ExperienceData loaded = store.Load();
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(loaded, "scope", "node", "fingerprint",
+            ServiceKind.ChatGPT, now.AddDays(1), BrowserConversationProof.CurrentProtocolVersion),
+            "browser proof method survives restart");
         Equal(true, AccountVerificationMemory.IsValid(loaded, "scope", "node", "fingerprint",
             ServiceKind.ChatGPT, now.AddDays(1), AccountVerificationMemory.CurrentRuleVersion),
             "account proof survives restart");
@@ -225,22 +246,340 @@ internal static class Tests
 
         string workerRoot = Path.Combine(Path.GetTempPath(), "account-worker-" + Guid.NewGuid().ToString("N"));
         var workerData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        workerData.Assurance.Begin("old-node", "node", 100, true, false, now);
         var workerStore = new ExperienceStore(Path.Combine(workerRoot, "state", "experience.json"));
         workerStore.Save(workerData, now);
         var workerConfig = new MonitorConfiguration { RootPath = workerRoot, SharedGroup = "shared", ProbeGroup = "probe" };
-        var workerMihomo = new VerificationMihomo("node", new[] { "node" });
+        var workerMihomo = new VerificationMihomo("node", new[] { "node", "old-node" });
+        var workerProbe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
         var worker = new MonitorWorker(workerConfig, workerMihomo,
-            new FakeProbe { DefaultResult = ProbeResult.Success(100) },
+            workerProbe,
             new BoundedLogger(Path.Combine(workerRoot, "logs", "monitor.log"), 1024 * 1024),
             new FakeClock { UtcNow = now },
             new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
-        Equal(false, worker.RecordAccountVerification("node", "stale-exit",
-            new[] { ServiceKind.ChatGPT }, now), "worker rejects account proof after exit changed");
-        Equal(true, worker.RecordAccountVerification("node", "fresh-exit",
-            new[] { ServiceKind.ChatGPT }, now), "worker accepts proof after fresh login-chain and exit check");
-        Equal(true, AccountVerificationMemory.IsValid(workerStore.Load(), "scope", "node", "fresh-exit",
-            ServiceKind.ChatGPT, now, AccountVerificationMemory.CurrentRuleVersion),
-            "worker persists freshly revalidated account proof");
+        Equal(false, worker.RecordBrowserConversationProof("node", "stale-exit", ServiceKind.Gemini,
+            now, BrowserConversationProof.CurrentProtocolVersion),
+            "worker rejects browser proof after exit changed");
+        Equal(false, worker.RecordBrowserConversationProof("node", "fresh-exit", ServiceKind.Gemini,
+            now, BrowserConversationProof.CurrentProtocolVersion + 1),
+            "worker rejects browser proof from unknown protocol");
+        Equal(true, worker.RecordBrowserConversationProof("node", "fresh-exit", ServiceKind.Gemini,
+            now, BrowserConversationProof.CurrentProtocolVersion),
+            "worker accepts browser proof after fresh login-chain and exit check");
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(workerStore.Load(), "scope",
+            "node", "fresh-exit", ServiceKind.Gemini, now,
+            BrowserConversationProof.CurrentProtocolVersion),
+            "worker persists freshly revalidated browser conversation proof");
+        int beforeRollbackRecheck = workerProbe.Calls.Count;
+        worker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
+        Equal(true, workerProbe.Calls.Count > beforeRollbackRecheck,
+            "browser failure performs fresh old-node service recheck");
+        Equal("old-node", workerMihomo.GetSelected("shared"),
+            "browser failure rechecks old node before safe rollback");
+
+        string staleRoot = Path.Combine(Path.GetTempPath(), "browser-stale-" + Guid.NewGuid().ToString("N"));
+        var staleData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        staleData.Assurance.Begin("old-node", "node", 100, true, false, now);
+        new ExperienceStore(Path.Combine(staleRoot, "state", "experience.json")).Save(staleData, now);
+        var staleMihomo = new VerificationMihomo("node", new[] { "node", "old-node" });
+        var staleProbe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        var staleWorker = new MonitorWorker(new MonitorConfiguration { RootPath = staleRoot, SharedGroup = "shared", ProbeGroup = "probe" },
+            staleMihomo, staleProbe, new BoundedLogger(Path.Combine(staleRoot, "logs", "monitor.log"), 1024 * 1024),
+            new FakeClock { UtcNow = now.AddMinutes(11) }, new FakeExitIdentityProbe(new ExitIdentity("fresh-exit", "JP", "ok")));
+        staleWorker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
+        Equal("node", staleMihomo.GetSelected("shared"),
+            "delayed browser failure cannot use an expired rollback window");
+        staleWorker.ReportServiceFailure("node", ServiceKind.Gemini, now.AddMinutes(2));
+        Equal("node", staleMihomo.GetSelected("shared"),
+            "delayed manual failure cannot use an expired rollback window");
+
+        string driftRoot = Path.Combine(Path.GetTempPath(), "browser-exit-drift-" + Guid.NewGuid().ToString("N"));
+        var driftData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
+        driftData.Assurance.Begin("old-node", "node", 100, true, false, now);
+        AccountVerificationMemory.MarkBrowserConversation(driftData, "scope", "node", "changed-exit",
+            ServiceKind.Gemini, now.AddMinutes(1), BrowserConversationProof.CurrentProtocolVersion);
+        new ExperienceStore(Path.Combine(driftRoot, "state", "experience.json")).Save(driftData, now);
+        var driftMihomo = new VerificationMihomo("node", new[] { "node", "old-node" });
+        var driftWorker = new MonitorWorker(new MonitorConfiguration { RootPath = driftRoot, SharedGroup = "shared", ProbeGroup = "probe" },
+            driftMihomo, new FakeProbe { DefaultResult = ProbeResult.Success(100) },
+            new BoundedLogger(Path.Combine(driftRoot, "logs", "monitor.log"), 1024 * 1024),
+            new FakeClock { UtcNow = now.AddMinutes(2) }, new FakeExitIdentityProbe(new ExitIdentity("changed-exit", "JP", "ok")));
+        driftWorker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
+        Equal("node", driftMihomo.GetSelected("shared"),
+            "changed exit cannot use a stale browser failure for rollback");
+        Equal(true, AccountVerificationMemory.IsBrowserConversationValid(
+            new ExperienceStore(Path.Combine(driftRoot, "state", "experience.json")).Load(),
+            "scope", "node", "changed-exit", ServiceKind.Gemini, now.AddMinutes(2),
+            BrowserConversationProof.CurrentProtocolVersion),
+            "old exit failure cannot revoke new exit conversation proof");
+    }
+
+    private static void BrowserConversationCoordinatorBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 11, 3, 0, 0, DateTimeKind.Utc);
+        var clock = new FakeClock { UtcNow = now };
+        var strict = new CandidateScanResult("node", CandidateHealth.Compatible, null, "ok", 200, 2,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(100) },
+                { ServiceKind.Gemini, ProbeResult.Success(100) }
+            }, "exit", "JP");
+        MonitorSnapshot snapshot = MonitorSnapshot.CreateRunning("node", strict, null, "ok", now, now.AddMinutes(1));
+        var coordinator = new BrowserConversationCoordinator(clock, new FixedChallengeSource("CCM-A7F2"));
+
+        Equal(BrowserVerificationStart.CompanionOffline,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "browser verification requires online companion");
+        coordinator.ObserveCompanion("Chrome", now);
+        Equal(BrowserVerificationStart.ConsentRequired,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, false),
+            "automatic browser verification requires consent");
+        coordinator.SetConsent(true);
+        Equal(BrowserVerificationStart.Started,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, false),
+            "online consented companion starts verification");
+        Equal(BrowserVerificationStart.Busy,
+            coordinator.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "only one browser verification session runs");
+
+        BrowserVerificationTask first = coordinator.Poll("Chrome", now);
+        Equal(ServiceKind.ChatGPT, first.Service, "chatgpt browser verification runs first");
+        Equal("CCM-A7F2", first.Challenge, "browser verification uses generated challenge");
+        Equal(null, coordinator.Poll("Edge", now.AddSeconds(1)),
+            "another browser cannot receive an active conversation task");
+        Equal(null, coordinator.Poll("Chrome", now.AddSeconds(1)),
+            "active conversation task is dispatched only once");
+        var passed = new BrowserVerificationResult {
+            TaskId = first.TaskId,
+            Service = first.Service,
+            Challenge = first.Challenge,
+            Outcome = BrowserVerificationOutcome.Passed,
+            MessageSent = true,
+            ElapsedMilliseconds = 1234
+        };
+        Equal(BrowserVerificationAcceptance.Accepted,
+            coordinator.Accept(passed, snapshot, now.AddSeconds(2)),
+            "fresh matching browser result accepted");
+        Equal(BrowserVerificationAcceptance.Replayed,
+            coordinator.Accept(passed, snapshot, now.AddSeconds(3)),
+            "browser result replay rejected");
+        BrowserVerificationTask second = coordinator.Poll("Chrome", now.AddSeconds(3));
+        Equal(ServiceKind.Gemini, second.Service, "gemini browser verification runs second");
+
+        var changed = new CandidateScanResult("node", CandidateHealth.Compatible, null, "ok", 200, 2,
+            strict.ServiceResults, "changed-exit", "JP");
+        MonitorSnapshot changedSnapshot = MonitorSnapshot.CreateRunning("node", changed, null, "ok", now, now.AddMinutes(1));
+        var drifted = new BrowserVerificationResult {
+            TaskId = second.TaskId,
+            Service = second.Service,
+            Challenge = second.Challenge,
+            Outcome = BrowserVerificationOutcome.Passed,
+            MessageSent = true
+        };
+        Equal(BrowserVerificationAcceptance.Drifted,
+            coordinator.Accept(drifted, changedSnapshot, now.AddSeconds(4)),
+            "browser result rejected after exit drift");
+
+        var expiry = new BrowserConversationCoordinator(clock, new FixedChallengeSource("CCM-B8E3"));
+        expiry.ObserveCompanion("Edge", now);
+        Equal(BrowserVerificationStart.Started,
+            expiry.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "user initiated browser verification does not require persistent consent");
+        BrowserVerificationTask expiring = expiry.Poll("Edge", now);
+        var late = new BrowserVerificationResult {
+            TaskId = expiring.TaskId,
+            Service = expiring.Service,
+            Challenge = expiring.Challenge,
+            Outcome = BrowserVerificationOutcome.Passed,
+            MessageSent = true
+        };
+        Equal(BrowserVerificationAcceptance.Expired,
+            expiry.Accept(late, snapshot, now.AddMinutes(5)),
+            "browser task expires at five minutes");
+
+        var cooldown = new BrowserConversationCoordinator(clock, new FixedChallengeSource("CCM-C9D4"));
+        cooldown.SetConsent(true);
+        cooldown.ObserveCompanion("Chrome", now);
+        Equal(BrowserVerificationStart.Started,
+            cooldown.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, false),
+            "automatic browser verification starts before failure cooldown");
+        BrowserVerificationTask failing = cooldown.Poll("Chrome", now);
+        var failure = new BrowserVerificationResult {
+            TaskId = failing.TaskId,
+            Service = failing.Service,
+            Challenge = failing.Challenge,
+            Outcome = BrowserVerificationOutcome.GenerationTimeout,
+            MessageSent = true
+        };
+        Equal(BrowserVerificationAcceptance.Accepted,
+            cooldown.Accept(failure, snapshot, now.AddMinutes(1)),
+            "sent generation timeout accepted as browser outcome");
+        Equal(BrowserVerificationStart.NoEligibleServices,
+            cooldown.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, false),
+            "automatic browser failure has six hour cooldown");
+        Equal(BrowserVerificationStart.Started,
+            cooldown.StartCurrent(snapshot, new[] { ServiceKind.ChatGPT }, true),
+            "user retry bypasses automatic browser cooldown");
+    }
+
+    private sealed class FixedChallengeSource : IChallengeSource
+    {
+        private readonly string value;
+        public FixedChallengeSource(string value) { this.value = value; }
+        public string Create() { return value; }
+    }
+
+    private static void BrowserNativeProtocolBehavior()
+    {
+        Equal(BrowserConversationProof.CurrentProtocolVersion, BrowserNativeProtocol.ProtocolVersion,
+            "browser proof and transport protocol versions stay aligned");
+        var message = new BrowserBridgeMessage {
+            Type = "result",
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = "request-1",
+            Browser = "Chrome",
+            ExtensionVersion = "0.6.2",
+            TaskId = "0123456789abcdef0123456789abcdef",
+            Service = "ChatGPT",
+            Challenge = "CCM-A7F2",
+            Outcome = "Passed",
+            MessageSent = true,
+            ElapsedMilliseconds = 1234
+        };
+        var framed = new MemoryStream();
+        BrowserNativeProtocol.Write(framed, message);
+        byte[] bytes = framed.ToArray();
+        Equal(true, bytes.Length > 4, "native message has length prefix and json body");
+        Equal(bytes.Length - 4, BitConverter.ToInt32(bytes, 0), "native message uses little endian payload length");
+
+        BrowserBridgeMessage roundTrip = BrowserNativeProtocol.Read(new FragmentedReadStream(bytes));
+        Equal("result", roundTrip.Type, "native frame round trips across short reads");
+        Equal("CCM-A7F2", roundTrip.Challenge, "native frame preserves challenge");
+        Equal(true, BrowserMessageValidator.IsValidRequest(roundTrip), "valid native result request accepted");
+        Equal(null, BrowserNativeProtocol.Read(new MemoryStream()), "clean native stream eof is allowed");
+
+        Throws<EndOfStreamException>(() => BrowserNativeProtocol.Read(new MemoryStream(new byte[] { 1, 0 })),
+            "partial native length prefix rejected");
+        Throws<InvalidDataException>(() => BrowserNativeProtocol.Read(
+            new MemoryStream(new byte[] { 1, 0, 1, 0 })), "oversized native frame rejected");
+        Throws<InvalidDataException>(() => BrowserNativeProtocol.Read(
+            new MemoryStream(new byte[] { 1, 0, 0, 0, (byte)'{' })), "invalid native json rejected");
+
+        Equal(true, BrowserOriginPolicy.IsAllowed("chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg/"),
+            "pinned extension origin accepted");
+        Equal(false, BrowserOriginPolicy.IsAllowed("chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg.evil/"),
+            "lookalike extension origin rejected");
+        Equal(false, BrowserOriginPolicy.IsAllowed("https://chatgpt.com/"),
+            "web page origin rejected by native host");
+
+        message.RequestId = new string('x', 65);
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "oversized request id rejected");
+        message.RequestId = "request-1";
+        message.Outcome = "EverythingFine";
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "unknown result outcome rejected");
+        message.Outcome = "Passed";
+        message.Service = "Google";
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "non-ai browser service rejected");
+        message.Service = "ChatGPT";
+        message.Challenge = new string('z', 81);
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "oversized challenge rejected");
+        message.Challenge = "CCM-测试";
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "non-ascii challenge rejected");
+        message.Challenge = "CCM-A7F2";
+        message.Url = new string('u', 2049);
+        Equal(false, BrowserMessageValidator.IsValidRequest(message), "oversized result url rejected");
+
+        var poll = new BrowserBridgeMessage {
+            Type = "poll",
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = "poll-1",
+            Browser = "Edge",
+            ExtensionVersion = "0.6.2"
+        };
+        Equal(true, BrowserMessageValidator.IsValidRequest(poll), "valid native poll accepted");
+        poll.ProtocolVersion++;
+        Equal(false, BrowserMessageValidator.IsValidRequest(poll), "unknown native protocol version rejected");
+        poll.ProtocolVersion--;
+        poll.Type = "arbitrary";
+        Equal(false, BrowserMessageValidator.IsValidRequest(poll), "unknown native message type rejected");
+    }
+
+    private sealed class FragmentedReadStream : MemoryStream
+    {
+        public FragmentedReadStream(byte[] bytes) : base(bytes) { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            return base.Read(buffer, offset, Math.Min(count, 1));
+        }
+    }
+
+    private static void BrowserBridgeBehavior()
+    {
+        string derived = BrowserPipeIdentity.ForCurrentUser();
+        Equal(false, derived.IndexOf(Environment.UserName, StringComparison.OrdinalIgnoreCase) >= 0,
+            "browser pipe name hides username");
+
+        string pipe = "ccm-browser-test-" + Guid.NewGuid().ToString("N");
+        int handled = 0;
+        using (var server = new BrowserBridgeServer(pipe, request => {
+            Interlocked.Increment(ref handled);
+            return new BrowserBridgeMessage {
+                Type = request.Type == "poll" ? "idle" : request.Type == "result" ? "ack" : "ready",
+                ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+                RequestId = request.RequestId
+            };
+        }))
+        {
+            server.Start();
+            BrowserBridgeMessage ready = BrowserHostBridge.RoundTrip(pipe,
+                ValidBrowserRequest("hello", "bridge-hello"), TimeSpan.FromSeconds(2));
+            Equal("ready", ready.Type, "host bridges hello request response");
+            BrowserBridgeMessage idle = BrowserHostBridge.RoundTrip(pipe,
+                ValidBrowserRequest("poll", "bridge-poll"), TimeSpan.FromSeconds(2));
+            Equal("idle", idle.Type, "host bridges long poll response");
+
+            var result = ValidBrowserRequest("result", "bridge-result");
+            result.TaskId = "0123456789abcdef0123456789abcdef";
+            result.Service = "Gemini";
+            result.Challenge = "CCM-B8E3";
+            result.Outcome = "Passed";
+            result.MessageSent = true;
+            result.ElapsedMilliseconds = 1800;
+            Equal("ack", BrowserHostBridge.RoundTrip(pipe, result, TimeSpan.FromSeconds(2)).Type,
+                "host bridges browser result");
+
+            BrowserBridgeMessage malformed = ValidBrowserRequest("unknown", "bridge-invalid");
+            Equal("error", BrowserHostBridge.RoundTrip(pipe, malformed, TimeSpan.FromSeconds(2)).Type,
+                "bridge rejects malformed request");
+            Equal(3, handled, "malformed bridge request never reaches monitor handler");
+
+            using (var abandoned = new NamedPipeClientStream(".", pipe, PipeDirection.InOut))
+                abandoned.Connect(2000);
+            Equal("ready", BrowserHostBridge.RoundTrip(pipe,
+                ValidBrowserRequest("hello", "bridge-after-disconnect"), TimeSpan.FromSeconds(2)).Type,
+                "bridge survives clean client disconnect");
+            Equal(null, server.LastError, "clean bridge disconnect is not a server error");
+        }
+
+        BrowserBridgeMessage unavailable = BrowserHostBridge.RoundTrip(
+            "ccm-browser-missing-" + Guid.NewGuid().ToString("N"),
+            ValidBrowserRequest("hello", "bridge-missing"), TimeSpan.FromMilliseconds(100));
+        Equal("unavailable", unavailable.Type, "native host reports monitor unavailable");
+        Equal("bridge-missing", unavailable.RequestId, "unavailable response retains request correlation");
+    }
+
+    private static BrowserBridgeMessage ValidBrowserRequest(string type, string requestId)
+    {
+        return new BrowserBridgeMessage {
+            Type = type,
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = requestId,
+            Browser = "Chrome",
+            ExtensionVersion = "0.6.2"
+        };
     }
 
     private static void AssuranceBehavior()
@@ -270,6 +609,36 @@ internal static class Tests
         Equal(true, policy.CanUserFeedbackRollback("b", now.AddMinutes(1)), "recent active switch permits feedback rollback");
         Equal(false, policy.CanUserFeedbackRollback("manual", now.AddMinutes(1)), "manual node cannot use stale rollback origin");
         Equal(false, policy.CanUserFeedbackRollback("b", now.AddMinutes(11)), "expired switch transaction cannot use rollback origin");
+        Equal(true, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2)),
+            "sent conversation error rechecks old node");
+        Equal(true, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.GenerationTimeout, true, now.AddMinutes(2)),
+            "sent generation timeout rechecks old node");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.Passed, true, now.AddMinutes(2)),
+            "successful browser verification never rolls back");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.SignInRequired, false, now.AddMinutes(2)),
+            "sign in state is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.AutomationUnsupported, false, now.AddMinutes(2)),
+            "unsupported automation is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ChallengeRequired, false, now.AddMinutes(2)),
+            "browser challenge is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.Cancelled, false, now.AddMinutes(2)),
+            "cancelled browser verification is not node failure");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ConversationError, false, now.AddMinutes(2)),
+            "unsent conversation error cannot trigger rollback");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("manual",
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2)),
+            "manual selection cannot use stale browser rollback origin");
+        Equal(false, policy.ShouldRecheckPreviousAfterBrowserResult("b",
+            BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(11)),
+            "stale switch cannot use browser rollback origin");
         policy.Begin("a", "b", 100, true);
         var slow = new CandidateScanResult("b", CandidateHealth.Compatible, null, "ok", 200, 1);
         Equal(false, policy.NeedsRollback(slow), "one slow response does not roll back");
@@ -678,16 +1047,16 @@ internal static class Tests
         Equal(2, snapshot.Services.Count, "snapshot retains service evidence");
         MonitorPresentation view = MonitorPresentation.From(snapshot);
         Equal("部分服务待验证", view.StateText, "login-ready AI scan waits for account verification");
-        Equal("登录链路正常 · 75 ms · 账号待实测",
+        Equal("网络链路兼容 · 真实对话待验证 · 75 ms",
             MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
             "AI service distinguishes login chain from account proof");
         var accountData = new ExperienceData();
-        AccountVerificationMemory.Mark(accountData, "scope", "selected", "selected-fp",
-            ServiceKind.ChatGPT, true, snapshotTime, AccountVerificationMemory.CurrentRuleVersion);
+        AccountVerificationMemory.MarkBrowserConversation(accountData, "scope", "selected", "selected-fp",
+            ServiceKind.ChatGPT, snapshotTime, BrowserConversationProof.CurrentProtocolVersion);
         snapshot = snapshot.WithAccountVerification(accountData, "scope", snapshotTime);
         view = MonitorPresentation.From(snapshot);
         Equal("运行正常", view.StateText, "account-verified AI scan is running normally");
-        Equal("账号实测通过 · 75 ms · 有效至 10-08",
+        Equal("真实对话已验证 · 75 ms · 有效至 10-08",
             MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
             "AI service shows account verification evidence");
         Equal("selected", view.NodeText, "presentation leaf node");
@@ -845,6 +1214,13 @@ internal static class Tests
     {
         var clock = new FakeClock { UtcNow = new DateTime(2026, 9, 6, 0, 0, 0, DateTimeKind.Utc) };
         var controller = new FailoverController(clock, TimeSpan.FromMinutes(10));
+        Equal(true, SwitchModePolicy.AllowsAutomaticSwitch(false, false), "fault failover remains enabled in conservative mode");
+        Equal(false, SwitchModePolicy.AllowsAutomaticSwitch(true, false), "healthy current holds in conservative mode");
+        Equal(true, SwitchModePolicy.AllowsAutomaticSwitch(true, true), "advanced mode may optimize healthy current");
+        Equal(false, SwitchModePolicy.ShouldEvaluateQuality(true, false),
+            "conservative mode skips quality comparison for usable current");
+        Equal("current usable; conservative mode holds", SwitchModePolicy.ConservativeHoldReason,
+            "conservative mode has stable decision reason");
         Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred HTTP response threshold");
         Equal("优秀", QualityPolicy.LatencyBand(500), "excellent latency band boundary");
         Equal("良好", QualityPolicy.LatencyBand(800), "good latency band boundary");
@@ -1014,12 +1390,19 @@ internal static class Tests
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
+        Equal(false, defaults.AutomaticOptimization, "performance optimization defaults off");
+        Equal(false, defaults.BrowserConversationVerification, "browser proof defaults off");
         defaults.FirstRunComplete = true;
         defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub };
+        defaults.AutomaticOptimization = true;
+        defaults.BrowserConversationVerification = true;
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
         Equal(2, loaded.RequiredServices.Count, "service selection persisted");
+        Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
+        Equal(true, loaded.BrowserConversationVerification, "browser proof consent persisted");
+        Equal(true, File.ReadAllText(path).Contains("version=2"), "preference schema upgraded");
         File.WriteAllText(path, "broken", Encoding.UTF8);
         Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
@@ -1032,6 +1415,8 @@ internal static class Tests
         var migrationStore = new UserPreferenceStore(migrationPath);
         UserPreferences migrated = migrationStore.Load();
         Equal("ChatGPT,GitHub", String.Join(",", migrated.RequiredServices), "legacy jmcomic preference ignored");
+        Equal(false, migrated.AutomaticOptimization, "v1 optimization migrates to conservative mode");
+        Equal(false, migrated.BrowserConversationVerification, "v1 browser proof requires consent");
         Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
             "legacy jmcomic preference is migration not corruption");
         migrationStore.Save(migrated);
@@ -1109,54 +1494,139 @@ internal static class Tests
             Equal(true, SpinWait.SpinUntil(() => coordinator.Latest.State == MonitorRunState.Running, 1000), "coordinator recovers after restore exception");
         }
 
-        var accountRunner = new AccountVerificationCycleRunner();
-        using (var coordinator = new MonitorCoordinator(accountRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+    }
+
+    private static void BrowserVerificationUiBehavior()
+    {
+        Equal("自动实测当前节点", BrowserVerificationForm.ActionText(true, true),
+            "online companion action");
+        Equal("请先安装或打开浏览器伴侣", BrowserVerificationForm.ActionText(false, true),
+            "offline companion action");
+        Equal("请先完成当前节点检测", BrowserVerificationForm.ActionText(true, false),
+            "missing current evidence action");
+        Equal(false, BrowserVerificationForm.CanStart(false, true, true),
+            "persistent browser verification requires consent");
+        Equal(true, BrowserVerificationForm.CanStart(true, true, true),
+            "consented online current node can start");
+        Equal(true, BrowserVerificationForm.CanStartOnce(true, true),
+            "one-time browser verification does not persist consent");
+        Equal(false, BrowserVerificationForm.CanStartOnce(false, true),
+            "one-time browser verification still needs companion");
+    }
+
+    private static void BrowserCoordinatorIntegrationBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 11, 4, 0, 0, DateTimeKind.Utc);
+        var clock = new FakeClock { UtcNow = now };
+        var runner = new BrowserVerificationCycleRunner(now);
+        using (var coordinator = new MonitorCoordinator(runner, TimeSpan.FromHours(1),
+            TimeSpan.FromSeconds(2), false, clock, new FixedChallengeSource("CCM-D1E5"),
+            TimeSpan.FromMilliseconds(5)))
         {
+            coordinator.UpdatePreferences(new UserPreferences {
+                FirstRunComplete = true,
+                AutomaticOptimization = false,
+                BrowserConversationVerification = false,
+                RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini }
+            });
             coordinator.Start();
-            Equal(true, accountRunner.WaitForRunCount(1, 1000), "account runner initial cycle");
-            coordinator.RequestAccountVerification("node", "fingerprint",
-                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, new DateTime(2026, 9, 11, 0, 0, 0, DateTimeKind.Utc));
-            Equal(true, SpinWait.SpinUntil(() => accountRunner.VerificationCount == 1, 1000),
-                "account verification command reaches runner once");
-            Equal(true, accountRunner.WaitForRunCount(2, 1000), "account verification requests follow-up scan");
-            Equal("fingerprint", accountRunner.LastFingerprint, "account command preserves exit fingerprint");
-            coordinator.ReportServiceFailure("node", ServiceKind.ChatGPT,
-                new DateTime(2026, 9, 11, 0, 1, 0, DateTimeKind.Utc));
-            Equal(true, SpinWait.SpinUntil(() => accountRunner.FailureCount == 1, 1000),
-                "negative account feedback reaches runner once");
-            Equal(true, accountRunner.WaitForRunCount(3, 1000), "negative feedback requests follow-up scan");
+            Equal(true, runner.WaitForRunCount(1, 1000), "browser integration initial network scan");
+
+            BrowserBridgeMessage ready = coordinator.HandleBrowserMessage(
+                ValidBrowserRequest("hello", "coordinator-hello"));
+            Equal("ready", ready.Type, "companion hello accepted");
+            Equal(BrowserVerificationStatus.Ready, coordinator.Latest.BrowserStatus,
+                "companion status published without changing network evidence");
+            Equal(BrowserVerificationStart.Started, coordinator.StartBrowserVerification(true),
+                "user starts automatic browser conversation verification");
+
+            BrowserBridgeMessage run = coordinator.HandleBrowserMessage(
+                ValidBrowserRequest("poll", "coordinator-poll-chatgpt"));
+            Equal("run", run.Type, "browser poll returns frozen task");
+            Equal("browser-node", run.Node, "browser task freezes current node");
+            Equal("CCM-D1E5", run.Challenge, "browser task carries fresh challenge");
+            Equal("https://chatgpt.com/", run.Url, "chatgpt task uses exact official url");
+
+            BrowserBridgeMessage passed = BrowserResultRequest(run, "Passed", true);
+            Equal("ack", coordinator.HandleBrowserMessage(passed).Type,
+                "fresh matching browser pass is acknowledged");
+            Equal(true, SpinWait.SpinUntil(() => runner.BrowserProofCount == 1, 1000),
+                "passed browser result reaches proof runner once");
+            Equal(ServiceKind.ChatGPT, runner.LastProofService,
+                "passed browser result retains service identity");
+            Equal(BrowserConversationProof.CurrentProtocolVersion, runner.LastProtocolVersion,
+                "passed browser result retains protocol version");
+            Equal(0, runner.FailureCount, "passed browser result is not failure");
+
+            BrowserBridgeMessage gemini = coordinator.HandleBrowserMessage(
+                ValidBrowserRequest("poll", "coordinator-poll-gemini"));
+            Equal("Gemini", gemini.Service, "browser verification proceeds sequentially to gemini");
+            BrowserBridgeMessage signIn = BrowserResultRequest(gemini, "SignInRequired", false);
+            Equal("ack", coordinator.HandleBrowserMessage(signIn).Type,
+                "sign-in-required result is acknowledged");
+            Thread.Sleep(50);
+            Equal(0, runner.FailureCount, "sign-in requirement is not attributed to node failure");
+            Equal(BrowserVerificationStatus.SignInRequired, coordinator.Latest.BrowserStatus,
+                "sign-in requirement is visible in monitor status");
         }
 
-        var sessionRunner = new AccountVerificationCycleRunner();
-        using (var coordinator = new MonitorCoordinator(sessionRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        var driftRunner = new BrowserVerificationCycleRunner(now);
+        using (var coordinator = new MonitorCoordinator(driftRunner, TimeSpan.FromHours(1),
+            TimeSpan.FromSeconds(2), false, clock, new FixedChallengeSource("CCM-E2F6"),
+            TimeSpan.FromMilliseconds(5)))
         {
             coordinator.Start();
-            Equal(true, sessionRunner.WaitForRunCount(1, 1000), "verification session initial cycle");
-            AccountVerificationSession session = coordinator.BeginAccountVerification();
-            Equal("session-node", session.Node, "verification session freezes current node");
-            Equal("session-fingerprint", session.ExitFingerprint, "verification session freezes current exit");
-            int before = sessionRunner.RunCount;
-            Thread.Sleep(80);
-            Equal(before, sessionRunner.RunCount, "verification session pauses automatic cycles");
-            coordinator.CompleteAccountVerification(session,
-                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, null, DateTime.UtcNow);
-            Equal(true, SpinWait.SpinUntil(() => sessionRunner.VerificationCount == 1, 1000),
-                "verification session records captured evidence once");
-            Equal("session-node", sessionRunner.LastNode, "verification result cannot drift to a newer snapshot node");
-            Equal("session-fingerprint", sessionRunner.LastFingerprint, "verification result cannot drift to a newer exit");
+            Equal(true, driftRunner.WaitForRunCount(1, 1000), "browser drift initial scan");
+            coordinator.HandleBrowserMessage(ValidBrowserRequest("hello", "drift-hello"));
+            Equal(BrowserVerificationStart.Started, coordinator.StartBrowserVerification(true),
+                "browser drift session starts");
+            BrowserBridgeMessage run = coordinator.HandleBrowserMessage(
+                ValidBrowserRequest("poll", "drift-poll"));
+            driftRunner.Node = "externally-changed-node";
+            coordinator.RequestCheck();
+            Equal(true, driftRunner.WaitForRunCount(2, 1000), "new network snapshot published before browser result");
+            Equal("error", coordinator.HandleBrowserMessage(BrowserResultRequest(run, "Passed", true)).Type,
+                "browser proof rejects node and exit drift");
+            Equal(0, driftRunner.BrowserProofCount, "drifted browser proof never reaches runner");
+            Equal("externally-changed-node", coordinator.Latest.ActualNode,
+                "stale browser event cannot overwrite newer network evidence");
+            Equal(BrowserVerificationStart.Started, coordinator.StartBrowserVerification(true),
+                "drift aborts old browser session so a fresh one can start");
+        }
+
+        var failureRunner = new BrowserVerificationCycleRunner(now);
+        using (var coordinator = new MonitorCoordinator(failureRunner, TimeSpan.FromHours(1),
+            TimeSpan.FromSeconds(2), false, clock, new FixedChallengeSource("CCM-F3A7"),
+            TimeSpan.FromMilliseconds(5)))
+        {
+            coordinator.Start();
+            Equal(true, failureRunner.WaitForRunCount(1, 1000), "browser failure initial scan");
+            coordinator.HandleBrowserMessage(ValidBrowserRequest("hello", "failure-hello"));
+            coordinator.StartBrowserVerification(true);
+            BrowserBridgeMessage run = coordinator.HandleBrowserMessage(
+                ValidBrowserRequest("poll", "failure-poll"));
+            coordinator.HandleBrowserMessage(BrowserResultRequest(run, "ConversationError", true));
+            Equal(true, SpinWait.SpinUntil(() => failureRunner.FailureCount == 1, 1000),
+                "sent conversation error reaches failure handling once");
         }
     }
 
-    private static void AccountVerificationUiBehavior()
+    private static BrowserBridgeMessage BrowserResultRequest(BrowserBridgeMessage task,
+        string outcome, bool messageSent)
     {
-        Equal(AccountVerificationSelection.ChatGPT | AccountVerificationSelection.Gemini,
-            AccountVerificationForm.SelectedServices(true, true), "verification selects both AI services");
-        Equal(AccountVerificationSelection.ChatGPT,
-            AccountVerificationForm.SelectedServices(true, false), "verification selects ChatGPT only");
-        Equal(AccountVerificationSelection.Gemini,
-            AccountVerificationForm.SelectedServices(false, true), "verification selects Gemini only");
-        Equal(AccountVerificationSelection.None,
-            AccountVerificationForm.SelectedServices(false, false), "verification cancel selects no service");
+        return new BrowserBridgeMessage {
+            Type = "result",
+            ProtocolVersion = BrowserConversationProof.CurrentProtocolVersion,
+            RequestId = "result-" + task.TaskId.Substring(0, 8),
+            Browser = "Chrome",
+            ExtensionVersion = "0.6.2",
+            TaskId = task.TaskId,
+            Service = task.Service,
+            Challenge = task.Challenge,
+            Outcome = outcome,
+            MessageSent = messageSent,
+            ElapsedMilliseconds = 1200
+        };
     }
 
     private sealed class ThrowingRestoreRunner : IRestorableCycleRunner
@@ -1222,36 +1692,57 @@ internal static class Tests
         }
     }
 
-    private sealed class AccountVerificationCycleRunner : IAccountVerificationRunner
+    private sealed class BrowserVerificationCycleRunner : IAccountVerificationRunner
     {
+        private readonly DateTime now;
         private int runCount;
-        private int verificationCount;
+        private int browserProofCount;
         private int failureCount;
-        public int VerificationCount { get { return Volatile.Read(ref verificationCount); } }
+
+        public BrowserVerificationCycleRunner(DateTime now)
+        {
+            this.now = now;
+            Node = "browser-node";
+        }
+
+        public string Node { get; set; }
+        public int BrowserProofCount { get { return Volatile.Read(ref browserProofCount); } }
         public int FailureCount { get { return Volatile.Read(ref failureCount); } }
-        public int RunCount { get { return Volatile.Read(ref runCount); } }
-        public string LastNode { get; private set; }
-        public string LastFingerprint { get; private set; }
+        public ServiceKind LastProofService { get; private set; }
+        public int LastProtocolVersion { get; private set; }
+
         public MonitorSnapshot Run(UserPreferences preferences)
         {
             Interlocked.Increment(ref runCount);
-            return MonitorSnapshot.CreateRunning("session-node",
-                new CandidateScanResult("session-node", CandidateHealth.Compatible, null, "ok", 100, 1,
-                    new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(100) } },
-                    "session-fingerprint", "JP"), null, "完成", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1));
+            return MonitorSnapshot.CreateRunning(Node,
+                new CandidateScanResult(Node, CandidateHealth.Compatible, null, "ok", 100, 2,
+                    new Dictionary<ServiceKind, ProbeResult> {
+                        { ServiceKind.ChatGPT, ProbeResult.Success(50) },
+                        { ServiceKind.Gemini, ProbeResult.Success(50) }
+                    }, Node == "browser-node" ? "browser-exit" : "changed-exit", "JP"),
+                null, "完成", now, now.AddMinutes(1));
         }
-        public bool RecordAccountVerification(string node, string exitFingerprint,
-            IEnumerable<ServiceKind> services, DateTime verifiedUtc)
+
+        public bool RecordBrowserConversationProof(string node, string exitFingerprint,
+            ServiceKind service, DateTime verifiedUtc, int protocolVersion)
         {
-            LastNode = node;
-            LastFingerprint = exitFingerprint;
-            Interlocked.Increment(ref verificationCount);
+            LastProofService = service;
+            LastProtocolVersion = protocolVersion;
+            Interlocked.Increment(ref browserProofCount);
             return true;
         }
+
         public void ReportServiceFailure(string node, ServiceKind service, DateTime reportedUtc)
         {
             Interlocked.Increment(ref failureCount);
         }
+
+        public void ReportBrowserConversationFailure(string node, string exitFingerprint, ServiceKind service,
+            BrowserVerificationOutcome outcome, bool messageSent, DateTime reportedUtc)
+        {
+            Interlocked.Increment(ref failureCount);
+        }
+
         public bool WaitForRunCount(int expected, int milliseconds)
         {
             return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
@@ -1263,7 +1754,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.1"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.2"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
@@ -1271,6 +1762,9 @@ internal static class Tests
         Equal(true, StatusReport.Format(now, "日本 J1", CandidateHealth.Compatible, 88,
             "保持当前节点", "ok").Contains("检测状态：登录链路及后台服务探测通过"),
             "status does not mislabel anonymous login-chain evidence as account proof");
+        Equal("当前节点可用，保守模式不进行性能寻优",
+            StatusReport.DecisionText(SwitchModePolicy.ConservativeHoldReason),
+            "status explains conservative hold reason");
 
         string translated = StatusReport.Format(now, "新加坡 S1", CandidateHealth.BasicCompatible, 74.8,
             "quality difference below threshold", "AI 登录待确认");
@@ -1282,7 +1776,7 @@ internal static class Tests
         Equal("当前节点最近 3 次中位响应未超过 800 ms，保持当前节点", StatusReport.DecisionText("current response not persistently slow"), "status explains latency hysteresis");
         Equal("候选节点最近 5 次延迟未达到中位数不超过 800 ms、单次不超过 1500 ms 的标准", StatusReport.DecisionText("target response history not preferred"), "status explains robust candidate latency gate");
         Equal("候选节点存在超过 1500 ms 的服务响应", StatusReport.DecisionText("target service response exceeds limit"), "status explains per-service latency gate");
-        Equal("候选节点尚未完成所选 AI 服务的账号实测，不进行性能切换", StatusReport.DecisionText("target requires account verification"), "status explains account proof gate");
-        Equal("当前节点故障，临时切换到登录链路已通过但尚未账号实测的节点", StatusReport.DecisionText("provisional emergency failover"), "status explains provisional emergency target");
+        Equal("候选节点尚未完成所选 AI 服务的真实对话验证，不进行性能切换", StatusReport.DecisionText("target requires account verification"), "status explains account proof gate");
+        Equal("当前节点故障，临时切换到网络链路已通过但尚未完成真实对话验证的节点", StatusReport.DecisionText("provisional emergency failover"), "status explains provisional emergency target");
     }
 }

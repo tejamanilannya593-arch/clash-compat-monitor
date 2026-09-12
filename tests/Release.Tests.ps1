@@ -4,9 +4,15 @@ $required = @(
     'README.md', 'README.en.md', 'QUICKSTART.md', 'LICENSE', 'Install.cmd', 'Diagnose.cmd', 'package-release.ps1',
     'SECURITY.md', 'CODE_OF_CONDUCT.md',
     'scripts\install.ps1', 'scripts\upgrade.ps1', 'scripts\uninstall.ps1', 'scripts\diagnose.ps1',
+    'browser-extension\manifest.json', 'browser-extension\service-worker.js',
+    'browser-extension\content-chatgpt.js', 'browser-extension\content-gemini.js',
+    'browser-extension\adapter-core.js', 'browser-extension\chatgpt-adapter.js',
+    'browser-extension\gemini-adapter.js', 'browser-extension\native-host-template.json',
+    'browser-extension\README.md',
     '.github\ISSUE_TEMPLATE\config.yml', '.github\ISSUE_TEMPLATE\compatibility.yml',
     '.github\ISSUE_TEMPLATE\feature.yml', '.github\dependabot.yml', '.github\workflows\codeql.yml',
-    'assets\social-preview.png', 'docs\images\service-incident-flow.png', 'docs\release-notes\v0.6.1.md'
+    'assets\social-preview.png', 'docs\images\service-incident-flow.png',
+    'docs\release-notes\v0.6.1.md', 'docs\release-notes\v0.6.2.md'
 )
 foreach ($relative in $required) {
     $path = Join-Path $root $relative
@@ -14,12 +20,14 @@ foreach ($relative in $required) {
 }
 $packageScript = Get-Content -LiteralPath (Join-Path $root 'package-release.ps1') -Raw
 $installScript = Get-Content -LiteralPath (Join-Path $root 'scripts\install.ps1') -Raw
+$uninstallScript = Get-Content -LiteralPath (Join-Path $root 'scripts\uninstall.ps1') -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw -Encoding UTF8
 $readmeEn = Get-Content -LiteralPath (Join-Path $root 'README.en.md') -Raw -Encoding UTF8
 $quickStart = Get-Content -LiteralPath (Join-Path $root 'QUICKSTART.md') -Raw -Encoding UTF8
 $contributing = Get-Content -LiteralPath (Join-Path $root 'CONTRIBUTING.md') -Raw -Encoding UTF8
 $releaseNotes = Get-Content -LiteralPath (Join-Path $root 'docs\release-notes\v0.6.1.md') -Raw -Encoding UTF8
 $program = Get-Content -LiteralPath (Join-Path $root 'src\Program.cs') -Raw
+$monitorCoordinator = Get-Content -LiteralPath (Join-Path $root 'src\MonitorCoordinator.cs') -Raw
 $trayHost = Get-Content -LiteralPath (Join-Path $root 'src\TrayHost.cs') -Raw
 $detailsForm = Get-Content -LiteralPath (Join-Path $root 'src\DetailsForm.cs') -Raw
 $buildScript = Get-Content -LiteralPath (Join-Path $root 'build.ps1') -Raw
@@ -42,7 +50,12 @@ try {
 if (!$readme.Contains('docs/images/service-incident-flow.png')) {
     throw 'README does not link the service incident flow image.'
 }
-if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.1')) { throw 'Release package version is not v0.6.1.' }
+if (!$packageScript.Contains('ClashCompatibilityMonitor-v0.6.2')) { throw 'Release package version is not v0.6.2.' }
+if (!$packageScript.Contains('ClashCompatibilityMonitor.BrowserHost.exe') -or
+    !$packageScript.Contains('browser-extension') -or
+    !$packageScript.Contains('native-host-template.json')) {
+    throw 'Release package is missing the browser companion.'
+}
 $checksumAssignment = '$checksumFile = $zip + ''.sha256'''
 $checksumFormat = '$archiveHash + ''  '' + (Split-Path -Leaf $zip)'
 if (!$packageScript.Contains($checksumAssignment) -or
@@ -54,12 +67,98 @@ if (!$packageScript.Contains($checksumAssignment) -or
 if (!$packageScript.Contains('docs\images') -or !$packageScript.Contains('service-incident-flow.png')) {
     throw 'Release package does not include the README flow image.'
 }
-if (!$installScript.Contains("Version='0.6.1'")) { throw 'Installer status version is not v0.6.1.' }
+if (!$installScript.Contains("Version='0.6.2'")) { throw 'Installer status version is not v0.6.2.' }
 if (!$installScript.Contains('EndsWith($monitorSuffix')) { throw 'Installer does not stop virtualized monitor paths.' }
 if (!$installScript.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer does not run preflight diagnostics.' }
-if (!$readme.Contains('v0.6.1') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
+$browserManifest = Get-Content -LiteralPath (Join-Path $root 'browser-extension\manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($browserManifest.manifest_version -ne 3 -or $browserManifest.version -ne '0.6.2' -or
+    (Compare-Object @($browserManifest.permissions) @('nativeMessaging')) -or
+    (Compare-Object @($browserManifest.host_permissions | Sort-Object) @('https://chatgpt.com/*','https://gemini.google.com/*'))) {
+    throw 'Browser extension permissions are broader than approved.'
+}
+if (!$installScript.Contains('HKCU:\Software\Google\Chrome\NativeMessagingHosts') -or
+    !$installScript.Contains('HKCU:\Software\Microsoft\Edge\NativeMessagingHosts') -or
+    $installScript.Contains('HKLM:')) {
+    throw 'Native host must be registered per current user for Chrome and Edge only.'
+}
+if (!$uninstallScript.Contains('NativeMessagingHosts') -or
+    !$uninstallScript.Contains('Remove-Item -LiteralPath $registration')) {
+    throw 'Uninstaller does not clean up native host registration.'
+}
+if (!$uninstallScript.Contains('EndsWith($monitorSuffix') -or
+    !$uninstallScript.Contains('EndsWith($browserHostSuffix')) {
+    throw 'Uninstaller may leave virtualized app processes running.'
+}
+if (!$installScript.Contains('Remove-Item -LiteralPath $browserExtensionTarget -Recurse -Force') -or
+    !$installScript.Contains('Remove-Item -LiteralPath $browserHostTarget -Force') -or
+    !$installScript.Contains('Remove-Item -LiteralPath $nativeManifestTarget -Force')) {
+    throw 'Installer rollback may leave a partially installed browser companion.'
+}
+if (!$installScript.Contains('Copy-Item -LiteralPath $oldFolder -Destination $installRoot -Recurse -Force') -or
+    !$installScript.Contains('Copy-Item -LiteralPath $oldShortcut -Destination $shortcutPath -Force')) {
+    throw 'Installer rollback does not restore prior state and startup shortcut.'
+}
+$nativeTemplate = Get-Content -LiteralPath (Join-Path $root 'browser-extension\native-host-template.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($nativeTemplate.name -ne 'com.clashcompatibilitymonitor.browser' -or
+    (Compare-Object @($nativeTemplate.allowed_origins) @('chrome-extension://micoadiomajggfdfbnhjbpkbccjoldlg/'))) {
+    throw 'Native host template does not pin the approved extension origin.'
+}
+foreach ($exeName in @('ClashCompatibilityMonitor.exe','ClashCompatibilityMonitor.BrowserHost.exe')) {
+    $exePath = Join-Path $root ('bin\' + $exeName)
+    if (!(Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Missing built executable: $exeName" }
+    $version = (Get-Item -LiteralPath $exePath).VersionInfo
+    if ($version.FileVersion -ne '0.6.2.0' -or $version.ProductVersion -ne '0.6.2') {
+        throw "Incorrect Windows version metadata: $exeName"
+    }
+}
+if ($installScript -match '(?i)Set-Content[^\r\n]*(profiles\.yaml|clash-verge\.yaml)' -or
+    $installScript -match '(?i)Copy-Item[^\r\n]+-Destination[^\r\n]+\$clashRoot') {
+    throw 'Installer may write a protected Clash file.'
+}
+$renderFixture = Join-Path ([IO.Path]::GetTempPath()) ('ccm-native-manifest-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $renderFixture | Out-Null
+try {
+    $renderedManifest = Join-Path $renderFixture 'native-host.json'
+    & (Join-Path $root 'scripts\install.ps1') -SourceBrowserHost (Join-Path $root 'bin\ClashCompatibilityMonitor.BrowserHost.exe') `
+        -RenderNativeHostManifest $renderedManifest | Out-Null
+    $rendered = Get-Content -LiteralPath $renderedManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($rendered.path -ne [IO.Path]::GetFullPath((Join-Path $root 'bin\ClashCompatibilityMonitor.BrowserHost.exe')) -or
+        $rendered.type -ne 'stdio' -or (Compare-Object @($rendered.allowed_origins) @($nativeTemplate.allowed_origins))) {
+        throw 'Native host render-only helper produced an invalid manifest.'
+    }
+    $defaultManifest = Join-Path $renderFixture 'native-host-default.json'
+    & (Join-Path $root 'scripts\install.ps1') -RenderNativeHostManifest $defaultManifest | Out-Null
+    $defaultRendered = Get-Content -LiteralPath $defaultManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($defaultRendered.path -ne [IO.Path]::GetFullPath((Join-Path $root 'bin\ClashCompatibilityMonitor.BrowserHost.exe'))) {
+        throw 'Installer cannot find the browser host without an explicit source path.'
+    }
+} finally {
+    Remove-Item -LiteralPath $renderFixture -Recurse -Force
+}
+if (!$readme.Contains('v0.6.2') -or !$readme.Contains('HTTP') -or !$readme.Contains('preferences.state') -or
     !$program.Contains('InstanceActivation.TryOwn') -or !$trayHost.Contains('NotifyIcon')) {
-    throw 'README does not describe v0.6.1 tray and intent behavior.'
+    throw 'README does not describe v0.6.2 tray and intent behavior.'
+}
+if (!$trayHost.Contains('Path.Combine(Application.StartupPath, "browser-extension", "README.md")')) {
+    throw 'Installed browser setup action does not open the packaged companion guide.'
+}
+if ($monitorCoordinator.Contains('Publish(Latest.WithBrowserStatus')) {
+    throw 'Browser status can overwrite a newer network snapshot.'
+}
+$proofDocs = $readme + $quickStart
+$proofTerms = @(
+    ([char[]](0x81ea,0x52a8,0x53d1,0x9001) -join ''),
+    ([char[]](0x81ea,0x52a8,0x5224,0x65ad) -join ''),
+    ([char[]](0x81ea,0x52a8,0x5173,0x95ed) -join ''),
+    ([char[]](0x6d4b,0x8bd5,0x5bf9,0x8bdd,0x4f1a,0x4fdd,0x7559) -join ''),
+    ([char[]](0x9ed8,0x8ba4,0x5173,0x95ed) -join ''),
+    ([char[]](0x4e0d,0x8bfb,0x53d6,0x20,0x43,0x6f,0x6f,0x6b,0x69,0x65) -join ''),
+    ([char[]](0x7f51,0x9875) -join ''), '6 ', 'API'
+)
+if (!$program.Contains('Version = "0.6.2"') -or
+    !$buildScript.Contains('browser-extension\tests\run.js') -or
+    @($proofTerms | Where-Object { !$proofDocs.Contains($_) }).Count -ne 0) {
+    throw 'v0.6.2 browser verification documentation is incomplete.'
 }
 $stabilityFirst = ([char[]](0x7A33,0x5B9A,0x4F18,0x5148,0x7684,0x20,0x43,0x6C,0x61,0x73,0x68,0x2F,0x4D,0x69,0x68,0x6F,0x6D,0x6F,0x20,0x57,0x69,0x6E,0x64,0x6F,0x77,0x73,0x20,0x8282,0x70B9,0x5B88,0x62A4,0x7A0B,0x5E8F)) -join ''
 $doesNotModify = ([char[]](0x4E0D,0x4FEE,0x6539,0x20,0x43,0x6C,0x61,0x73,0x68,0x20,0x914D,0x7F6E,0x6587,0x4EF6)) -join ''

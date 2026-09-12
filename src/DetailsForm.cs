@@ -10,18 +10,19 @@ public sealed class DetailsForm : Form
     private readonly Action requestCheck;
     private readonly Action<bool> setPaused;
     private readonly Action restorePrevious;
-    private readonly Func<AccountVerificationSession> beginAccountVerification;
-    private readonly Action<AccountVerificationSession, IEnumerable<ServiceKind>, ServiceKind?, DateTime> completeAccountVerification;
-    private readonly Action<AccountVerificationSession> cancelAccountVerification;
+    private readonly Action startBrowserVerification;
     private readonly Action<string, ServiceKind, DateTime> reportServiceFailure;
     private readonly Action exitApplication;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
     private readonly List<ServiceChoice> choices = new List<ServiceChoice>();
+    private readonly CheckBox performanceOptimization = new CheckBox();
+    private readonly CheckBox browserConversationVerification = new CheckBox();
     private readonly Label stateLabel = HeadingLabel();
     private readonly Label nodeLabel = new Label();
     private readonly Label decisionLabel = new Label();
     private readonly Label responseLabel = new Label();
+    private readonly Label browserStatusLabel = new Label();
     private readonly Label selectionLabel = new Label();
     private readonly Label nextCheckLabel = new Label();
     private readonly ListView serviceList = new ListView();
@@ -31,18 +32,14 @@ public sealed class DetailsForm : Form
 
     public DetailsForm(UserPreferences preferences, Action<UserPreferences> savePreferences,
         Action requestCheck, Action<bool> setPaused, Action restorePrevious,
-        Func<AccountVerificationSession> beginAccountVerification,
-        Action<AccountVerificationSession, IEnumerable<ServiceKind>, ServiceKind?, DateTime> completeAccountVerification,
-        Action<AccountVerificationSession> cancelAccountVerification,
+        Action startBrowserVerification,
         Action<string, ServiceKind, DateTime> reportServiceFailure, Action exitApplication)
     {
         this.savePreferences = savePreferences;
         this.requestCheck = requestCheck;
         this.setPaused = setPaused;
         this.restorePrevious = restorePrevious;
-        this.beginAccountVerification = beginAccountVerification;
-        this.completeAccountVerification = completeAccountVerification;
-        this.cancelAccountVerification = cancelAccountVerification;
+        this.startBrowserVerification = startBrowserVerification;
         this.reportServiceFailure = reportServiceFailure;
         this.exitApplication = exitApplication;
 
@@ -89,7 +86,17 @@ public sealed class DetailsForm : Form
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);
-        var save = new Button { Text = "保存并开始自动优化", AutoSize = true, Height = 38,
+        performanceOptimization.Text = "当前节点可用时允许性能寻优（高级）";
+        performanceOptimization.AutoSize = true;
+        performanceOptimization.Checked = preferences.AutomaticOptimization;
+        performanceOptimization.Margin = new Padding(0, 12, 0, 0);
+        layout.Controls.Add(performanceOptimization);
+        browserConversationVerification.Text = "允许浏览器伴侣自动进行真实对话验证（会发送并保留测试对话）";
+        browserConversationVerification.AutoSize = true;
+        browserConversationVerification.Checked = preferences.BrowserConversationVerification;
+        browserConversationVerification.Margin = new Padding(0, 7, 0, 0);
+        layout.Controls.Add(browserConversationVerification);
+        var save = new Button { Text = "保存设置并开始守护", AutoSize = true, Height = 38,
             Padding = new Padding(14, 4, 14, 4), BackColor = Color.FromArgb(45, 120, 240), ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 16, 0, 0) };
         save.FlatAppearance.BorderSize = 0;
@@ -115,7 +122,10 @@ public sealed class DetailsForm : Form
             MessageBox.Show(this, "请至少选择一个服务。", "节点守护", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        savePreferences(new UserPreferences { FirstRunComplete = true, AutomaticOptimization = true, RequiredServices = selected });
+        savePreferences(new UserPreferences { FirstRunComplete = true,
+            AutomaticOptimization = performanceOptimization.Checked,
+            BrowserConversationVerification = browserConversationVerification.Checked,
+            RequiredServices = selected });
         ShowSettings(false);
     }
 
@@ -123,7 +133,8 @@ public sealed class DetailsForm : Form
     {
         statusPanel.Dock = DockStyle.Fill;
         statusPanel.Padding = new Padding(28);
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 10 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 11 };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -148,6 +159,9 @@ public sealed class DetailsForm : Form
         ConfigureText(responseLabel, 9F, FontStyle.Bold, Color.FromArgb(45, 120, 90));
         responseLabel.Padding = new Padding(0, 0, 0, 5);
         layout.Controls.Add(responseLabel);
+        ConfigureText(browserStatusLabel, 9F, FontStyle.Regular, Color.FromArgb(74, 102, 143));
+        browserStatusLabel.Padding = new Padding(0, 0, 0, 5);
+        layout.Controls.Add(browserStatusLabel);
         ConfigureText(nextCheckLabel, 9F, FontStyle.Regular, Color.FromArgb(88, 101, 122));
         layout.Controls.Add(nextCheckLabel);
 
@@ -164,16 +178,16 @@ public sealed class DetailsForm : Form
 
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
         buttons.Controls.Add(ActionButton("立即复检", delegate { requestCheck(); }));
-        pauseButton.Text = "暂停自动优化";
+        pauseButton.Text = "暂停节点守护";
         pauseButton.AutoSize = true;
         pauseButton.Click += delegate {
             paused = !paused;
             setPaused(paused);
-            pauseButton.Text = paused ? "恢复自动优化" : "暂停自动优化";
+            pauseButton.Text = paused ? "恢复节点守护" : "暂停节点守护";
         };
         buttons.Controls.Add(pauseButton);
         buttons.Controls.Add(ActionButton("恢复上一个节点", delegate { restorePrevious(); }));
-        buttons.Controls.Add(ActionButton("验证当前节点的 AI 服务", delegate { VerifyCurrentNode(); }));
+        buttons.Controls.Add(ActionButton("自动实测当前节点", delegate { startBrowserVerification(); }));
         buttons.Controls.Add(ActionButton("当前节点 ChatGPT 不可用", delegate { ReportCurrentFailure(ServiceKind.ChatGPT); }));
         buttons.Controls.Add(ActionButton("当前节点 Gemini 不可用", delegate { ReportCurrentFailure(ServiceKind.Gemini); }));
         buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
@@ -194,11 +208,13 @@ public sealed class DetailsForm : Form
         nodeLabel.Text = view.NodeText;
         decisionLabel.Text = view.DecisionText;
         responseLabel.Text = view.ResponseText;
+        browserStatusLabel.Text = String.IsNullOrWhiteSpace(snapshot.BrowserStatusDetail)
+            ? "浏览器伴侣：尚未连接" : "浏览器伴侣：" + snapshot.BrowserStatusDetail;
         selectionLabel.Text = String.IsNullOrWhiteSpace(snapshot.SelectionReason) ? "" : "当前节点来源：" + snapshot.SelectionReason;
         nextCheckLabel.Text = "最近检测：" + (snapshot.CheckedUtc == DateTime.MinValue ? "尚未完成" : snapshot.CheckedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss")) +
             (snapshot.NextCheckUtc == DateTime.MaxValue ? "" : " · 下次检查：" + snapshot.NextCheckUtc.ToLocalTime().ToString("HH:mm:ss"));
         paused = snapshot.State == MonitorRunState.Paused;
-        pauseButton.Text = paused ? "恢复自动优化" : "暂停自动优化";
+        pauseButton.Text = paused ? "恢复节点守护" : "暂停节点守护";
         serviceList.BeginUpdate();
         serviceList.Items.Clear();
         foreach (ServiceMeasurement service in snapshot.Services)
@@ -209,37 +225,6 @@ public sealed class DetailsForm : Form
             serviceList.Items.Add(item);
         }
         serviceList.EndUpdate();
-    }
-
-    private void VerifyCurrentNode()
-    {
-        if (latestSnapshot == null || String.IsNullOrWhiteSpace(latestSnapshot.ActualNode) ||
-            String.IsNullOrWhiteSpace(latestSnapshot.ExitFingerprint))
-        {
-            MessageBox.Show(this, "请先完成一次当前节点检测，以确认实际出口。", "节点守护",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-        AccountVerificationSession session = beginAccountVerification();
-        if (session == null || String.IsNullOrWhiteSpace(session.Node) || String.IsNullOrWhiteSpace(session.ExitFingerprint))
-        {
-            cancelAccountVerification(session);
-            MessageBox.Show(this, "当前节点或实际出口已经变化，请重新检测后再验证。", "节点守护",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-        try
-        {
-            using (var form = new AccountVerificationForm(session.Node))
-            {
-                if (form.ShowDialog(this) != DialogResult.OK) return;
-                completeAccountVerification(session,
-                    AccountVerificationForm.Services(form.VerifiedSelection).ToList(),
-                    form.FailedService, DateTime.UtcNow);
-                session = null;
-            }
-        }
-        finally { if (session != null) cancelAccountVerification(session); }
     }
 
     private void ReportCurrentFailure(ServiceKind service)

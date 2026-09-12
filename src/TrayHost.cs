@@ -2,6 +2,8 @@ using System;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Linq;
+using System.IO;
+using System.Diagnostics;
 
 public sealed class TrayHost : ApplicationContext
 {
@@ -24,7 +26,7 @@ public sealed class TrayHost : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add("打开详情", null, delegate { ShowDetails(); });
         menu.Items.Add("立即复检", null, delegate { coordinator.RequestCheck(); });
-        menu.Items.Add("验证当前节点的 AI 服务", null, delegate { ShowAccountVerification(); });
+        menu.Items.Add("自动实测当前节点", null, delegate { ShowBrowserVerification(); });
         menu.Items.Add("当前节点 ChatGPT 不可用", null, delegate { ReportCurrentFailure(ServiceKind.ChatGPT); });
         menu.Items.Add("当前节点 Gemini 不可用", null, delegate { ReportCurrentFailure(ServiceKind.Gemini); });
         menu.Items.Add("暂停自动优化", null, delegate { coordinator.SetPaused(true); });
@@ -60,8 +62,7 @@ public sealed class TrayHost : ApplicationContext
         {
             details = new DetailsForm(preferences, SavePreferences, coordinator.RequestCheck,
                 coordinator.SetPaused, coordinator.RequestRestorePrevious,
-                coordinator.BeginAccountVerification, coordinator.CompleteAccountVerification,
-                coordinator.CancelAccountVerification, coordinator.ReportServiceFailure, ExitThread);
+                ShowBrowserVerification, coordinator.ReportServiceFailure, ExitThread);
             details.FormClosed += delegate { details = null; MemoryTrimmer.TrimIdleWorkingSet(); };
         }
         details.UpdateSnapshot(coordinator.Latest);
@@ -70,29 +71,76 @@ public sealed class TrayHost : ApplicationContext
         details.Activate();
     }
 
-    private void ShowAccountVerification()
+    private void ShowBrowserVerification()
     {
-        AccountVerificationSession session = coordinator.BeginAccountVerification();
-        if (session == null || String.IsNullOrWhiteSpace(session.Node) ||
-            String.IsNullOrWhiteSpace(session.ExitFingerprint))
+        MonitorSnapshot snapshot = coordinator.Latest;
+        bool currentReady = snapshot != null && !String.IsNullOrWhiteSpace(snapshot.ActualNode) &&
+            !String.IsNullOrWhiteSpace(snapshot.ExitFingerprint);
+        var aiServices = preferences.RequiredServices.Where(x =>
+            x == ServiceKind.ChatGPT || x == ServiceKind.Gemini).ToList();
+        using (var form = new BrowserVerificationForm(snapshot == null ? "" : snapshot.ActualNode,
+            aiServices, coordinator.IsBrowserCompanionOnline, coordinator.BrowserCompanionDescription,
+            preferences.BrowserConversationVerification, currentReady && aiServices.Count > 0))
         {
-            coordinator.CancelAccountVerification(session);
-            tray.ShowBalloonTip(4000, "节点守护", "请先完成一次当前节点检测，以确认实际出口。", ToolTipIcon.Info);
-            coordinator.RequestCheck();
+            if (form.ShowDialog() != DialogResult.OK) return;
+            if (form.Choice == BrowserVerificationChoice.OpenSetup)
+            {
+                OpenBrowserSetupDocumentation();
+                return;
+            }
+            if (form.Choice == BrowserVerificationChoice.Revoke)
+            {
+                SaveBrowserConsent(false);
+                coordinator.RevokeBrowserVerificationConsent();
+                tray.ShowBalloonTip(3500, "节点守护", "已撤销浏览器自动实测授权。", ToolTipIcon.Info);
+                return;
+            }
+            if (form.Choice == BrowserVerificationChoice.EnableAndStart) SaveBrowserConsent(true);
+            if (form.Choice == BrowserVerificationChoice.EnableAndStart ||
+                form.Choice == BrowserVerificationChoice.StartOnce)
+                ShowBrowserStartResult(coordinator.StartBrowserVerification(true));
+        }
+    }
+
+    private void ShowBrowserStartResult(BrowserVerificationStart result)
+    {
+        string message;
+        if (result == BrowserVerificationStart.Started) message = "已开始自动实测，完成后会自动关闭测试标签页。";
+        else if (result == BrowserVerificationStart.CompanionOffline)
+        {
+            OpenBrowserSetupDocumentation();
             return;
         }
-        try
+        else if (result == BrowserVerificationStart.Busy) message = "已有一项自动实测正在进行。";
+        else message = "当前没有可自动实测的 AI 服务，请先完成节点检测。";
+        tray.ShowBalloonTip(4000, "节点守护", message, ToolTipIcon.Info);
+    }
+
+    private void SaveBrowserConsent(bool enabled)
+    {
+        SavePreferences(new UserPreferences {
+            FirstRunComplete = preferences.FirstRunComplete,
+            AutomaticOptimization = preferences.AutomaticOptimization,
+            BrowserConversationVerification = enabled,
+            RequiredServices = new System.Collections.Generic.List<ServiceKind>(preferences.RequiredServices)
+        });
+    }
+
+    private void OpenBrowserSetupDocumentation()
+    {
+        string path = Path.Combine(Application.StartupPath, "browser-extension", "README.md");
+        if (!File.Exists(path))
         {
-            using (var form = new AccountVerificationForm(session.Node))
-            {
-                if (form.ShowDialog() != DialogResult.OK) return;
-                coordinator.CompleteAccountVerification(session,
-                    AccountVerificationForm.Services(form.VerifiedSelection).ToList(),
-                    form.FailedService, DateTime.UtcNow);
-                session = null;
-            }
+            MessageBox.Show("未找到本地浏览器伴侣说明，请重新安装完整发布包。", "节点守护",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
         }
-        finally { if (session != null) coordinator.CancelAccountVerification(session); }
+        try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+        catch (Exception ex)
+        {
+            MessageBox.Show("无法打开本地安装说明：" + ex.Message, "节点守护",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private void ReportCurrentFailure(ServiceKind service)
