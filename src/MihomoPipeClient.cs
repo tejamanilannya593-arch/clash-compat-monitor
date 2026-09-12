@@ -152,7 +152,10 @@ public sealed class MihomoPipeClient : IMihomoClient
         {
             var proxy = entry.Value as Dictionary<string, object>;
             object kind;
-            if (proxy != null && proxy.TryGetValue("type", out kind) && kind != null)
+            object choices;
+            if (proxy != null && proxy.TryGetValue("all", out choices) && choices is object[])
+                kinds[entry.Key] = "Selector";
+            else if (proxy != null && proxy.TryGetValue("type", out kind) && kind != null)
                 kinds[entry.Key] = Convert.ToString(kind, CultureInfo.InvariantCulture);
         }
         return kinds;

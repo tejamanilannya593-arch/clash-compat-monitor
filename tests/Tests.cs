@@ -1038,7 +1038,7 @@ internal static class Tests
                         lock (requests) requests.Add(request);
                         string responseBody = i == 0
                             ? "{\"proxies\":{\"组\":{\"type\":\"Selector\",\"now\":\"节点\",\"all\":[\"节点\",\"节点二\"]}}}"
-                            : i == 1 ? "{\"proxies\":{\"节点\":{\"type\":\"Shadowsocks\"},\"说明\":{\"type\":\"Direct\"}}}"
+                            : i == 1 ? "{\"proxies\":{\"节点\":{\"type\":\"Shadowsocks\"},\"说明\":{\"type\":\"Direct\"},\"新型组\":{\"type\":\"FutureGroup\",\"all\":[\"节点\"]},\"无类型组\":{\"all\":[\"节点\"]}}}"
                             : i == 3 ? "{\"delay\":86}" : i == 4 ? "{\"ipv6\":true}" : "";
                         byte[] payload = Encoding.UTF8.GetBytes(responseBody);
                         string response = i == 0
@@ -1058,7 +1058,10 @@ internal static class Tests
 
         var client = new MihomoPipeClient(pipeName, "test-secret");
         Equal("节点", client.GetSelected("组"), "pipe selected node");
-        Equal("Shadowsocks", client.GetProxyTypes()["节点"], "mihomo exposes runtime leaf kind");
+        var proxyTypes = client.GetProxyTypes();
+        Equal("Shadowsocks", proxyTypes["节点"], "mihomo exposes runtime leaf kind");
+        Equal("Selector", proxyTypes["新型组"], "unknown kind with child choices is classified as non-leaf");
+        Equal("Selector", proxyTypes["无类型组"], "missing kind with child choices is classified as non-leaf");
         client.Select("组", "节点二");
         Equal(86, client.GetDelay("节点 一", "https://www.gstatic.com/generate_204", 5000), "mihomo delay");
         Equal(true, client.IsRuntimeIpv6Enabled(), "mihomo runtime ipv6 query");
