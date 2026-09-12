@@ -86,6 +86,7 @@ public sealed class DetailsForm : Form
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);
+        AddChoice(layout, "Z-Library 网页", new[] { ServiceKind.ZLibraryWeb }, preferences);
         performanceOptimization.Text = "当前节点可用时允许性能寻优（高级）";
         performanceOptimization.AutoSize = true;
         performanceOptimization.Checked = preferences.AutomaticOptimization;

@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Forms;
 
 internal static class Tests
 {
@@ -48,6 +49,7 @@ internal static class Tests
         MihomoPipeIntegration();
         CompatibilityScanning();
         ZLibraryWebBehavior();
+        ZLibraryChoiceBehavior();
         QualityScoringAndState();
         ThroughputAndTraffic();
         StabilityAndState();
@@ -117,6 +119,47 @@ internal static class Tests
         Equal("入口可达 · 123 ms",
             MonitorPresentation.ServiceText(new ServiceMeasurement(service, true, 123, "ok")),
             "Z-Library status does not claim login or downloads");
+    }
+
+    private static void ZLibraryChoiceBehavior()
+    {
+        var defaults = UserPreferences.Defaults();
+        using (var form = new DetailsForm(defaults, delegate { }, delegate { }, delegate { },
+            delegate { }, delegate { }, delegate { }, delegate { }))
+        {
+            CheckBox choice = FindCheckBox(form, "Z-Library 网页");
+            Equal(true, choice != null, "Z-Library appears as an optional service");
+            if (choice != null) Equal(false, choice.Checked, "Z-Library checkbox starts unchecked");
+        }
+        defaults.RequiredServices.Add(ServiceKind.ZLibraryWeb);
+        using (var form = new DetailsForm(defaults, delegate { }, delegate { }, delegate { },
+            delegate { }, delegate { }, delegate { }, delegate { }))
+        {
+            CheckBox choice = FindCheckBox(form, "Z-Library 网页");
+            Equal(true, choice != null && choice.Checked, "saved Z-Library choice appears checked");
+        }
+        string directory = Path.Combine(Path.GetTempPath(), "monitor-zlibrary-choice-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var store = new UserPreferenceStore(Path.Combine(directory, "preferences.state"));
+            store.Save(defaults);
+            Equal(true, store.Load().RequiredServices.Contains(ServiceKind.ZLibraryWeb),
+                "Z-Library choice persists across restart");
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    private static CheckBox FindCheckBox(Control parent, string title)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            var checkBox = child as CheckBox;
+            if (checkBox != null && checkBox.Text == title) return checkBox;
+            var nested = FindCheckBox(child, title);
+            if (nested != null) return nested;
+        }
+        return null;
     }
 
     private static void ServiceEvidenceBehavior()

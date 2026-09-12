@@ -14,6 +14,7 @@ Clash Compatibility Monitor keeps a working node in place, performs conservative
 
 - Discovers actual leaf nodes from `proxies`, `proxy-providers`, and mixed subscription layouts without relying on region names.
 - Checks selected services including ChatGPT, Gemini, Google, GitHub, Steam, Discord, Spotify, and Epic.
+- The development branch adds an optional Z-Library web entrance check at the user-specified `https://zh.z-library.sk/`. It is off by default and measures only HTTP reachability and latency, not sign-in, search, or downloads. It does not discover alternate mirrors.
 - Requires five observations spanning at least 30 minutes with a success rate of 95% or higher before a performance-only switch.
 - Keeps two recent standbys, observes every automatic switch, and can safely roll back.
 - Does not modify Clash configuration files, take ownership of subscriptions, inspect browser history, or upload telemetry.
