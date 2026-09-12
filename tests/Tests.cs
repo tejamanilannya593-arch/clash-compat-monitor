@@ -85,6 +85,38 @@ internal static class Tests
         Equal(CandidateHealth.Compatible, scan.Health, "selected Z-Library service participates in scanning");
         Equal(1, probe.Calls.Count, "selected Z-Library sends one lightweight probe");
         Equal(service, probe.Calls[0], "selected Z-Library probes its own endpoint");
+        Equal(ProbeFailureKind.None,
+            HttpServiceProbe.EvaluateResponse(service, 200, "<html>library entrance</html>", null, 123).FailureKind,
+            "Z-Library HTTP 200 is entrance evidence");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateResponse(service, 200, "<html>cf-chl</html>", null, 123).FailureKind,
+            "Z-Library challenge is reachability only");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateResponse(service, 200, "<html>captcha</html>", null, 123).FailureKind,
+            "Z-Library captcha is reachability only");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateResponse(service, 200, "<html>sign in to continue</html>", null, 123).FailureKind,
+            "Z-Library login challenge is reachability only");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateResponse(service, 403, "", null, 123, true).FailureKind,
+            "Z-Library HTTP 403 challenge header is reachability only");
+        Equal(ProbeFailureKind.Partial,
+            HttpServiceProbe.EvaluateResponse(service, 302, "", new Uri("https://unrelated.example/"), 123).FailureKind,
+            "Z-Library cross-site redirect is not a success");
+        Equal(ProbeFailureKind.Region,
+            HttpServiceProbe.EvaluateResponse(service, 200, "not available in your region", null, 123).FailureKind,
+            "Z-Library explicit region block fails");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateResponse(service, 403, "forbidden", null, 123).FailureKind,
+            "Z-Library plain HTTP 403 fails");
+        Equal(ProbeFailureKind.Service,
+            HttpServiceProbe.EvaluateResponse(service, 500, "error", null, 123).FailureKind,
+            "Z-Library server error fails");
+        Equal("Z-Library 网页", MonitorPresentation.ServiceLabel(service),
+            "Z-Library has its own service label");
+        Equal("入口可达 · 123 ms",
+            MonitorPresentation.ServiceText(new ServiceMeasurement(service, true, 123, "ok")),
+            "Z-Library status does not claim login or downloads");
     }
 
     private static void ServiceEvidenceBehavior()

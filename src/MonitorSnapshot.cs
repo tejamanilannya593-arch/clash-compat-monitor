@@ -211,6 +211,8 @@ public sealed class MonitorPresentation
             return "仅确认可达" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "");
         if (service.Evidence == ProbeFailureKind.Region) return "地区受限";
         if (service.Evidence == ProbeFailureKind.Transient) return "连接异常";
+        if (service.Service == ServiceKind.ZLibraryWeb && service.Available && service.Evidence == ProbeFailureKind.None)
+            return "入口可达" + (service.Milliseconds > 0 ? " · " + service.Milliseconds + " ms" : "");
         if ((service.Service == ServiceKind.ChatGPT || service.Service == ServiceKind.Gemini) &&
             service.Available && service.Evidence == ProbeFailureKind.None)
             return service.AccountVerified
@@ -234,6 +236,7 @@ public sealed class MonitorPresentation
             case ServiceKind.SteamApi: return "Steam API";
             case ServiceKind.Discord: return "Discord";
             case ServiceKind.Spotify: return "Spotify";
+            case ServiceKind.ZLibraryWeb: return "Z-Library 网页";
             default: return "Epic";
         }
     }

@@ -185,6 +185,13 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
                         return ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                     case ServiceKind.Discord:
                         return status == 200 && body.IndexOf("url", StringComparison.OrdinalIgnoreCase) >= 0 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("gateway unavailable", elapsed);
+                    case ServiceKind.ZLibraryWeb:
+                        if ((status == 200 || status == 403) && (challengeHeader || IsZLibraryChallengeResponse(body)))
+                            return ProbeResult.Partial("验证页可达，未验证网站功能", elapsed);
+                        if (status == 200) return ProbeResult.Success(elapsed);
+                        if (status >= 300 && status < 400)
+                            return ProbeResult.Partial("入口发生跳转，未验证网站功能", elapsed);
+                        return ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                     default:
                         return status >= 200 && status < 400 ? ProbeResult.Success(elapsed) : ProbeResult.ServiceFailure("unexpected HTTP " + status, elapsed);
                 }
@@ -347,6 +354,16 @@ public sealed class HttpServiceProbe : IServiceProbe, IDisposable
         return body.IndexOf("challenge-platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
             body.IndexOf("cf-chl", StringComparison.OrdinalIgnoreCase) >= 0 ||
             body.IndexOf("just a moment", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool IsZLibraryChallengeResponse(string body)
+    {
+        if (IsChallengeResponse(body)) return true;
+        if (String.IsNullOrEmpty(body)) return false;
+        return body.IndexOf("captcha", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            body.IndexOf("verify you are human", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            body.IndexOf("sign in to continue", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            body.IndexOf("log in to continue", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     public void Dispose() { client.Dispose(); }
