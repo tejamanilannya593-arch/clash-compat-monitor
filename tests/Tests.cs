@@ -42,7 +42,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.6.3-preview.5", MonitorIdentity.Version, "release version");
+        Equal("0.6.3-preview.6", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
@@ -1509,6 +1509,11 @@ internal static class Tests
             "different reachable sites across paths reveal a routing mismatch");
         Equal(true, ProxyPathHealth.Evaluate(true, true, true, false).Mismatch,
             "one failing site on the system path reveals a routing mismatch");
+        Equal("Google：探测入口可用、系统代理入口失败；GitHub：探测入口失败、系统代理入口可用",
+            ProxyPathHealth.Evaluate(true, false, false, true).MismatchDetail,
+            "path mismatch identifies each affected site and route");
+        Equal("", ProxyPathHealth.Evaluate(true, true, true, true).MismatchDetail,
+            "matching routes do not report a mismatch detail");
     }
 
     private static void SelectorFollowerBehavior()
@@ -1953,7 +1958,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.6.3-preview.5"), "status shows version");
+        Equal(true, report.Contains("版本：0.6.3-preview.6"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

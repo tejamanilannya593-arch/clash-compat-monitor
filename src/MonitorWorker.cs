@@ -739,8 +739,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 CandidateHealth status = actualScan.Health;
                 string detail = actualScan.Detail;
                 if (pathHealth != null && pathHealth.Mismatch)
-                    detail += "; 检测路径异常：探测入口=" + (pathHealth.ProbeReachable ? "可用" : "失败") +
-                        "，系统代理入口=" + (pathHealth.SystemReachable ? "可用" : "失败");
+                    detail += "; 检测路径异常：" + pathHealth.MismatchDetail;
                 bool hasAiRequirement = requiredServices.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini);
                 if (hasAiRequirement && status == CandidateHealth.Compatible)
                     detail += ServiceEvidencePolicy.CanQualitySwitch(actualScan, experience, memoryScope,

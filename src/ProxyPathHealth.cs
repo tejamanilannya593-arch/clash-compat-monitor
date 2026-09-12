@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -10,17 +11,27 @@ public sealed class ProxyPathHealth
         ProbeReachable = probeGoogle || probeGithub;
         SystemReachable = systemGoogle || systemGithub;
         Mismatch = probeGoogle != systemGoogle || probeGithub != systemGithub;
+        var differences = new List<string>();
+        if (probeGoogle != systemGoogle) differences.Add(Describe("Google", probeGoogle, systemGoogle));
+        if (probeGithub != systemGithub) differences.Add(Describe("GitHub", probeGithub, systemGithub));
+        MismatchDetail = String.Join("；", differences);
     }
 
     public bool ProbeReachable { get; private set; }
     public bool SystemReachable { get; private set; }
     public bool Mismatch { get; private set; }
+    public string MismatchDetail { get; private set; }
     public bool CanAutoSwitch { get { return !Mismatch; } }
 
     public static ProxyPathHealth Evaluate(bool probeGoogle, bool probeGithub,
         bool systemGoogle, bool systemGithub)
     {
         return new ProxyPathHealth(probeGoogle, probeGithub, systemGoogle, systemGithub);
+    }
+
+    private static string Describe(string site, bool probe, bool system)
+    {
+        return site + "：探测入口" + (probe ? "可用" : "失败") + "、系统代理入口" + (system ? "可用" : "失败");
     }
 }
 
