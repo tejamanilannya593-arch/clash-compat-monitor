@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
@@ -135,7 +136,7 @@ public static class ChatGptSupportedRegions
          "TH TL TG TO TT TN TR TM TV UG UA AE GB US UY UZ VU VN WF YE ZM ZW")
         .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries), StringComparer.OrdinalIgnoreCase);
 
-    public static IEnumerable<string> AllCodes { get { return Codes; } }
+    public static IEnumerable<string> AllCodes { get { return Codes.ToArray(); } }
 
     public static bool Contains(string countryCode)
     {

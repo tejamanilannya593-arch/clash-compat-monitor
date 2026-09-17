@@ -269,9 +269,12 @@ internal static class Tests
         Equal(true, ChatGptSupportedRegions.Contains("SG"), "Singapore is in dated ChatGPT support snapshot");
         Equal(true, ChatGptSupportedRegions.Contains("TW"), "Taiwan is in dated ChatGPT support snapshot");
         Equal(false, ChatGptSupportedRegions.Contains(""), "unknown exit is not assumed supported");
+        Equal(false, Object.ReferenceEquals(ChatGptSupportedRegions.AllCodes, ChatGptSupportedRegions.AllCodes),
+            "ChatGPT supported-region enumeration returns defensive copies");
         Equal(true, AiRegionPolicy.SupportsBoth("JP"), "Japan is in the ChatGPT and Gemini intersection");
         Equal(true, AiRegionPolicy.SupportsBoth("SG"), "Singapore is in the ChatGPT and Gemini intersection");
         Equal(true, AiRegionPolicy.SupportsBoth("TW"), "Taiwan is in the ChatGPT and Gemini intersection");
+        Equal(false, AiRegionPolicy.SupportsBoth("AF"), "Afghanistan is excluded because Gemini web does not support it");
         Equal(false, AiRegionPolicy.SupportsBoth("HK"), "Hong Kong is excluded because ChatGPT does not officially support it");
         Equal(false, AiRegionPolicy.SupportsBoth("CN"), "mainland China is excluded from the shared consumer-web intersection");
         Equal(false, AiRegionPolicy.SupportsBoth(""), "unknown exit is never assumed supported");
