@@ -87,40 +87,56 @@ internal static class Tests
     {
         DateTime now = new DateTime(2026, 9, 17, 10, 0, 0, DateTimeKind.Utc);
         var cache = new RegionEligibilityCache();
-        cache.Remember("scope-a", "node-a", "exit-a", "JP", now);
+        string exitA = 1L.ToString("X64");
+        string exitB = 2L.ToString("X64");
+        cache.Remember("scope-a", "node-a", exitA, "JP", now);
         string countryCode;
         bool supported;
-        Equal(true, cache.TryGet("scope-a", "node-a", now, out countryCode, out supported),
+        Equal(true, cache.TryGet("scope-a", "node-a", exitA, now, out countryCode, out supported),
             "fresh matching exit is cached");
         Equal("JP", countryCode, "cached country is returned");
         Equal(true, supported, "fresh Japan exit remains eligible");
-        Equal(false, cache.TryGet("scope-b", "node-a", now, out countryCode, out supported),
+        Equal(false, cache.TryGet("scope-a", "node-a", exitB, now, out countryCode, out supported),
+            "different actual exit fingerprint invalidates region cache");
+        Equal(false, cache.TryGet("scope-a", "node-a", "", now, out countryCode, out supported),
+            "unknown actual exit cannot use a cached eligibility decision");
+        Equal(false, cache.TryGet("scope-b", "node-a", exitA, now, out countryCode, out supported),
             "subscription scope change invalidates region cache");
-        Equal(false, cache.TryGet("scope-a", "node-a", now.AddHours(24), out countryCode, out supported),
+        Equal(false, cache.TryGet("scope-a", "node-a", exitA, now.AddHours(24), out countryCode, out supported),
             "region cache expires exactly at 24 hours");
 
-        cache.Remember("scope-a", "node-hk", "exit-hk", "HK", now);
-        Equal(true, cache.TryGet("scope-a", "node-hk", now, out countryCode, out supported),
+        string exitHk = 3L.ToString("X64");
+        cache.Remember("scope-a", "node-hk", exitHk, "HK", now);
+        Equal(true, cache.TryGet("scope-a", "node-hk", exitHk, now, out countryCode, out supported),
             "unsupported exit result is cached");
         Equal(false, supported, "cached Hong Kong exit remains ineligible");
 
         cache.Records.Add(new RegionEligibilityRecord {
-            Scope = "scope-a", Node = "old-policy", ExitFingerprint = "exit-old",
+            Scope = "scope-a", Node = "old-policy", ExitFingerprint = 4L.ToString("X64"),
             CountryCode = "JP", PolicyVersion = "old-policy", CheckedUtc = now
         });
-        Equal(false, cache.TryGet("scope-a", "old-policy", now, out countryCode, out supported),
+        Equal(false, cache.TryGet("scope-a", "old-policy", 4L.ToString("X64"), now,
+            out countryCode, out supported),
             "policy version change invalidates region cache");
 
-        cache.Remember("scope-a", "node-a", "exit-new", "SG", now.AddMinutes(1));
+        string exitNew = 5L.ToString("X64");
+        cache.Remember("scope-a", "node-a", exitNew, "SG", now.AddMinutes(1));
         Equal(1, cache.Records.Count(x => x.Scope == "scope-a" && x.Node == "node-a"),
             "remember replaces an older matching scope and node");
-        Equal(true, cache.TryGet("scope-a", "node-a", now.AddMinutes(1), out countryCode, out supported),
+        Equal(true, cache.TryGet("scope-a", "node-a", exitNew, now.AddMinutes(1),
+            out countryCode, out supported),
             "replacement record is readable");
         Equal("SG", countryCode, "replacement record returns its new country");
+        Throws<ArgumentException>(() => cache.Remember("scope-a", "raw-ip", "198.51.100.24", "JP", now),
+            "region cache rejects a raw IP as an exit fingerprint");
+        Throws<ArgumentException>(() => cache.Remember("scope-a", "bad-hash", new string('G', 64), "JP", now),
+            "region cache rejects a non-hex exit fingerprint");
+        Throws<ArgumentException>(() => cache.Remember("scope-a", "lower-hash", new string('a', 64), "JP", now),
+            "region cache rejects a lowercase exit fingerprint");
 
         var bounded = new RegionEligibilityCache();
         for (int i = 0; i < 300; i++)
-            bounded.Remember("scope", "node-" + i, "fingerprint-" + i, "JP", now.AddMinutes(i));
+            bounded.Remember("scope", "node-" + i, ((long)i + 10).ToString("X64"), "JP", now.AddMinutes(i));
         Equal(256, bounded.Records.Count, "region cache is bounded to 256 newest records");
         Equal("node-299", bounded.Records[0].Node, "region cache keeps newest record first");
         Equal(false, bounded.Records.Any(x => x.Node == "node-43"), "region cache prunes older records");
@@ -138,11 +154,17 @@ internal static class Tests
             for (int i = 0; i < 300; i++)
             {
                 persisted.Records.Add(new RegionEligibilityRecord {
-                    Scope = "scope-save", Node = "saved-node-" + i, ExitFingerprint = "saved-fingerprint-" + i,
+                    Scope = "scope-save", Node = "saved-node-" + i,
+                    ExitFingerprint = ((long)i + 1000).ToString("X64"),
                     CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate,
                     CheckedUtc = now.AddMinutes(-i - 1)
                 });
             }
+            persisted.Records.Add(new RegionEligibilityRecord {
+                Scope = "scope-save", Node = "malicious-raw-ip", ExitFingerprint = rawIp,
+                CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate,
+                CheckedUtc = now.AddMinutes(-2)
+            });
             var store = new RegionEligibilityStore(path);
             store.Save(persisted);
             byte[] serialized = File.ReadAllBytes(path);
@@ -154,11 +176,43 @@ internal static class Tests
                 .Deserialize<RegionEligibilityCache>(savedText).Records.Count,
                 "region store bounds serialized records to 256");
             RegionEligibilityCache loaded = store.Load();
-            Equal(true, loaded.TryGet("scope-save", "node-save", now, out countryCode, out supported),
+            Equal(true, loaded.TryGet("scope-save", "node-save", identity.Fingerprint, now,
+                out countryCode, out supported),
                 "region cache survives save and load");
             Equal("JP", countryCode, "round-trip preserves country code");
             Equal(identity.Fingerprint, loaded.Records[0].ExitFingerprint,
                 "round-trip preserves only the hashed exit fingerprint");
+
+            var hostile = new RegionEligibilityCache();
+            hostile.Records.Add(new RegionEligibilityRecord {
+                Scope = "scope-hostile", Node = "valid", ExitFingerprint = 6000L.ToString("X64"),
+                CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate, CheckedUtc = DateTime.UtcNow
+            });
+            hostile.Records.Add(new RegionEligibilityRecord {
+                Scope = "scope-hostile", Node = "raw", ExitFingerprint = rawIp,
+                CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate, CheckedUtc = DateTime.UtcNow
+            });
+            hostile.Records.Add(new RegionEligibilityRecord {
+                Scope = new string('s', 257), Node = "oversized", ExitFingerprint = 6001L.ToString("X64"),
+                CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate, CheckedUtc = DateTime.UtcNow
+            });
+            hostile.Records.Add(new RegionEligibilityRecord {
+                Scope = "scope-hostile", Node = new string('n', 513), ExitFingerprint = 6003L.ToString("X64"),
+                CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate, CheckedUtc = DateTime.UtcNow
+            });
+            hostile.Records.Add(new RegionEligibilityRecord {
+                Scope = "scope-hostile", Node = "oversized-policy", ExitFingerprint = 6004L.ToString("X64"),
+                CountryCode = "JP", PolicyVersion = new string('p', 33), CheckedUtc = DateTime.UtcNow
+            });
+            hostile.Records.Add(new RegionEligibilityRecord {
+                Scope = "scope-hostile", Node = "future", ExitFingerprint = 6002L.ToString("X64"),
+                CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate,
+                CheckedUtc = DateTime.UtcNow.AddMinutes(6)
+            });
+            File.WriteAllText(path, new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(hostile));
+            RegionEligibilityCache sanitized = store.Load();
+            Equal(1, sanitized.Records.Count, "region store filters hostile and implausible records on load");
+            Equal("valid", sanitized.Records[0].Node, "region store retains only a valid loaded record");
 
             File.WriteAllText(path, "{broken json");
             RegionEligibilityCache recovered = store.Load();
@@ -166,8 +220,76 @@ internal static class Tests
             Equal(1, Directory.GetFiles(directory, "region-eligibility.json.corrupt-*").Length,
                 "corrupt region cache is archived");
             Equal(false, File.Exists(path), "corrupt source file is moved aside");
+            File.WriteAllText(path, "{broken again");
+            Equal(0, store.Load().Records.Count, "a second corrupt region cache also recovers empty");
+            Equal(2, Directory.GetFiles(directory, "region-eligibility.json.corrupt-*").Length,
+                "rapid corrupt recoveries use collision-resistant archive names");
+            Equal(false, File.Exists(path), "second corrupt source file is also moved aside");
+
+            string oversizedPath = Path.Combine(directory, "oversized.json");
+            File.WriteAllText(oversizedPath, new string('x', 1024 * 1024 + 1));
+            Equal(0, new RegionEligibilityStore(oversizedPath).Load().Records.Count,
+                "oversized region cache is rejected before deserialization");
+            Equal(false, File.Exists(oversizedPath), "oversized region cache source is archived");
+
+            string concurrentPath = Path.Combine(directory, "region-concurrent.json");
+            var concurrentErrors = new List<Exception>();
+            var startConcurrent = new ManualResetEventSlim(false);
+            Task[] concurrentTasks = Enumerable.Range(0, 8).Select(worker => Task.Run(() => {
+                var concurrentStore = new RegionEligibilityStore(worker % 2 == 0
+                    ? concurrentPath : Path.Combine(directory, ".", "region-concurrent.json"));
+                startConcurrent.Wait();
+                for (int iteration = 0; iteration < 80; iteration++)
+                {
+                    try
+                    {
+                        var concurrentCache = new RegionEligibilityCache();
+                        concurrentCache.Remember("scope-concurrent", "node-" + worker,
+                            ((long)worker + 8000).ToString("X64"), "JP", DateTime.UtcNow);
+                        concurrentStore.Save(concurrentCache);
+                        concurrentStore.Load();
+                    }
+                    catch (Exception ex)
+                    {
+                        lock (concurrentErrors) concurrentErrors.Add(ex);
+                    }
+                }
+            })).ToArray();
+            startConcurrent.Set();
+            Task.WaitAll(concurrentTasks);
+            Equal(0, concurrentErrors.Count,
+                "concurrent region store instances load and save without exceptions" +
+                (concurrentErrors.Count == 0 ? "" : " (" + concurrentErrors[0].GetType().Name +
+                    ": " + concurrentErrors[0].Message + ")"));
+            RegionEligibilityCache concurrentLoaded = new RegionEligibilityStore(concurrentPath).Load();
+            Equal(1, concurrentLoaded.Records.Count,
+                "concurrent region store leaves a loadable final cache");
+            Equal(0, Directory.GetFiles(directory, "region-concurrent.json.tmp*").Length,
+                "concurrent region store cleans temporary files");
         }
         finally { Directory.Delete(directory, true); }
+
+        Throws<ArgumentException>(() => new RegionEligibilityStore(" "),
+            "region store rejects a blank path");
+        string relativePath = "region-cache-relative-" + Guid.NewGuid().ToString("N") + ".json";
+        try
+        {
+            bool relativeSaved = false;
+            try
+            {
+                var relativeCache = new RegionEligibilityCache();
+                relativeCache.Remember("scope-relative", "node-relative", 7000L.ToString("X64"), "JP", now);
+                new RegionEligibilityStore(relativePath).Save(relativeCache);
+                relativeSaved = File.Exists(Path.GetFullPath(relativePath));
+            }
+            catch { }
+            Equal(true, relativeSaved, "region store supports a bare relative file name");
+        }
+        finally
+        {
+            string relativeFullPath = Path.GetFullPath(relativePath);
+            if (File.Exists(relativeFullPath)) File.Delete(relativeFullPath);
+        }
     }
 
     private static void ZLibraryWebBehavior()
