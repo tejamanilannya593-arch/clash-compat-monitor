@@ -49,6 +49,7 @@ internal static class Tests
             "unexpected runtime IPv6 gets an actionable warning instead of a configuration rewrite");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
+        RegionEligibilityCaching();
         CandidateFiltering();
         PipeHttpDecoding();
         BoundedPipeBehavior();
@@ -80,6 +81,93 @@ internal static class Tests
         BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void RegionEligibilityCaching()
+    {
+        DateTime now = new DateTime(2026, 9, 17, 10, 0, 0, DateTimeKind.Utc);
+        var cache = new RegionEligibilityCache();
+        cache.Remember("scope-a", "node-a", "exit-a", "JP", now);
+        string countryCode;
+        bool supported;
+        Equal(true, cache.TryGet("scope-a", "node-a", now, out countryCode, out supported),
+            "fresh matching exit is cached");
+        Equal("JP", countryCode, "cached country is returned");
+        Equal(true, supported, "fresh Japan exit remains eligible");
+        Equal(false, cache.TryGet("scope-b", "node-a", now, out countryCode, out supported),
+            "subscription scope change invalidates region cache");
+        Equal(false, cache.TryGet("scope-a", "node-a", now.AddHours(24), out countryCode, out supported),
+            "region cache expires exactly at 24 hours");
+
+        cache.Remember("scope-a", "node-hk", "exit-hk", "HK", now);
+        Equal(true, cache.TryGet("scope-a", "node-hk", now, out countryCode, out supported),
+            "unsupported exit result is cached");
+        Equal(false, supported, "cached Hong Kong exit remains ineligible");
+
+        cache.Records.Add(new RegionEligibilityRecord {
+            Scope = "scope-a", Node = "old-policy", ExitFingerprint = "exit-old",
+            CountryCode = "JP", PolicyVersion = "old-policy", CheckedUtc = now
+        });
+        Equal(false, cache.TryGet("scope-a", "old-policy", now, out countryCode, out supported),
+            "policy version change invalidates region cache");
+
+        cache.Remember("scope-a", "node-a", "exit-new", "SG", now.AddMinutes(1));
+        Equal(1, cache.Records.Count(x => x.Scope == "scope-a" && x.Node == "node-a"),
+            "remember replaces an older matching scope and node");
+        Equal(true, cache.TryGet("scope-a", "node-a", now.AddMinutes(1), out countryCode, out supported),
+            "replacement record is readable");
+        Equal("SG", countryCode, "replacement record returns its new country");
+
+        var bounded = new RegionEligibilityCache();
+        for (int i = 0; i < 300; i++)
+            bounded.Remember("scope", "node-" + i, "fingerprint-" + i, "JP", now.AddMinutes(i));
+        Equal(256, bounded.Records.Count, "region cache is bounded to 256 newest records");
+        Equal("node-299", bounded.Records[0].Node, "region cache keeps newest record first");
+        Equal(false, bounded.Records.Any(x => x.Node == "node-43"), "region cache prunes older records");
+        Equal(true, bounded.Records.Any(x => x.Node == "node-44"), "region cache keeps the newest 256 records");
+
+        string directory = Path.Combine(Path.GetTempPath(), "monitor-region-cache-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string path = Path.Combine(directory, "region-eligibility.json");
+            string rawIp = "198.51.100.24";
+            ExitIdentity identity = ExitIdentityParser.Parse("ip=" + rawIp + "\nloc=JP\n", new byte[] { 4, 5, 6 });
+            var persisted = new RegionEligibilityCache();
+            persisted.Remember("scope-save", "node-save", identity.Fingerprint, identity.CountryCode, now);
+            for (int i = 0; i < 300; i++)
+            {
+                persisted.Records.Add(new RegionEligibilityRecord {
+                    Scope = "scope-save", Node = "saved-node-" + i, ExitFingerprint = "saved-fingerprint-" + i,
+                    CountryCode = "JP", PolicyVersion = AiRegionPolicy.SnapshotDate,
+                    CheckedUtc = now.AddMinutes(-i - 1)
+                });
+            }
+            var store = new RegionEligibilityStore(path);
+            store.Save(persisted);
+            byte[] serialized = File.ReadAllBytes(path);
+            Equal(false, serialized.Length >= 3 && serialized[0] == 0xEF && serialized[1] == 0xBB && serialized[2] == 0xBF,
+                "region cache is saved as UTF-8 without BOM");
+            string savedText = File.ReadAllText(path);
+            Equal(false, savedText.Contains(rawIp), "region cache never persists a raw exit IP");
+            Equal(256, new System.Web.Script.Serialization.JavaScriptSerializer()
+                .Deserialize<RegionEligibilityCache>(savedText).Records.Count,
+                "region store bounds serialized records to 256");
+            RegionEligibilityCache loaded = store.Load();
+            Equal(true, loaded.TryGet("scope-save", "node-save", now, out countryCode, out supported),
+                "region cache survives save and load");
+            Equal("JP", countryCode, "round-trip preserves country code");
+            Equal(identity.Fingerprint, loaded.Records[0].ExitFingerprint,
+                "round-trip preserves only the hashed exit fingerprint");
+
+            File.WriteAllText(path, "{broken json");
+            RegionEligibilityCache recovered = store.Load();
+            Equal(0, recovered.Records.Count, "corrupt region cache recovers empty");
+            Equal(1, Directory.GetFiles(directory, "region-eligibility.json.corrupt-*").Length,
+                "corrupt region cache is archived");
+            Equal(false, File.Exists(path), "corrupt source file is moved aside");
+        }
+        finally { Directory.Delete(directory, true); }
     }
 
     private static void ZLibraryWebBehavior()
