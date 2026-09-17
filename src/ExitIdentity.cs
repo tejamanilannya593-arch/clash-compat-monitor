@@ -135,6 +135,8 @@ public static class ChatGptSupportedRegions
          "TH TL TG TO TT TN TR TM TV UG UA AE GB US UY UZ VU VN WF YE ZM ZW")
         .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries), StringComparer.OrdinalIgnoreCase);
 
+    public static IEnumerable<string> AllCodes { get { return Codes; } }
+
     public static bool Contains(string countryCode)
     {
         return !String.IsNullOrWhiteSpace(countryCode) && Codes.Contains(countryCode.Trim());

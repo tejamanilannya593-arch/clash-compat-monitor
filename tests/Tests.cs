@@ -269,6 +269,13 @@ internal static class Tests
         Equal(true, ChatGptSupportedRegions.Contains("SG"), "Singapore is in dated ChatGPT support snapshot");
         Equal(true, ChatGptSupportedRegions.Contains("TW"), "Taiwan is in dated ChatGPT support snapshot");
         Equal(false, ChatGptSupportedRegions.Contains(""), "unknown exit is not assumed supported");
+        Equal(true, AiRegionPolicy.SupportsBoth("JP"), "Japan is in the ChatGPT and Gemini intersection");
+        Equal(true, AiRegionPolicy.SupportsBoth("SG"), "Singapore is in the ChatGPT and Gemini intersection");
+        Equal(true, AiRegionPolicy.SupportsBoth("TW"), "Taiwan is in the ChatGPT and Gemini intersection");
+        Equal(false, AiRegionPolicy.SupportsBoth("HK"), "Hong Kong is excluded because ChatGPT does not officially support it");
+        Equal(false, AiRegionPolicy.SupportsBoth("CN"), "mainland China is excluded from the shared consumer-web intersection");
+        Equal(false, AiRegionPolicy.SupportsBoth(""), "unknown exit is never assumed supported");
+        Equal("2026-09-17", AiRegionPolicy.SnapshotDate, "region policy exposes its dated snapshot");
 
         ExitIdentity identity = ExitIdentityParser.Parse("ip=203.0.113.8\nloc=JP\ncolo=NRT\n", new byte[] { 1, 2, 3 });
         Equal("JP", identity.CountryCode, "trace country parsed");
