@@ -15,6 +15,7 @@ public static class StatusReport
             "综合分：" + (score.HasValue ? score.Value.ToString("F1", CultureInfo.InvariantCulture) : "本轮未排名") + Environment.NewLine +
             "决定：" + DecisionText(decision) + Environment.NewLine +
             "说明：" + (detail ?? "无") + Environment.NewLine +
+            "AI 地区规则：ChatGPT ∩ Gemini 官方支持地区（快照 " + AiRegionPolicy.SnapshotDate + "）" + Environment.NewLine +
             "网络链路可用或登录链路通过，均不代表真实对话已经验证。";
     }
 

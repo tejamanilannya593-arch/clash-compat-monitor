@@ -62,12 +62,15 @@ public sealed class CompatibilityScanner
         {
             if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
-            if (service == ServiceKind.ChatGPT && result.FailureKind == ProbeFailureKind.None && exitIdentityProbe != null)
+            bool aiService = service == ServiceKind.ChatGPT || service == ServiceKind.Gemini;
+            bool regionEligibleEvidence = result.FailureKind == ProbeFailureKind.None ||
+                result.FailureKind == ProbeFailureKind.Partial;
+            if (aiService && regionEligibleEvidence)
             {
                 if (!identity.Known)
-                    result = ProbeResult.Unverified("无法确认实际出口，不能验证 ChatGPT 地区资格", result.ElapsedMilliseconds);
-                else if (!ChatGptSupportedRegions.Contains(identity.CountryCode))
-                    result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 支持地区快照中", result.ElapsedMilliseconds);
+                    result = ProbeResult.Unverified("无法确认实际出口，不能验证 AI 官方支持地区", result.ElapsedMilliseconds);
+                else if (!AiRegionPolicy.SupportsBoth(identity.CountryCode))
+                    result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 与 Gemini 官方支持地区交集中", result.ElapsedMilliseconds);
             }
             measurements[service] = result;
             probeCount++;

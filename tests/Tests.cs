@@ -500,7 +500,8 @@ internal static class Tests
         var probe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
         CandidateScanResult supported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
             new FakeExitIdentityProbe(new ExitIdentity("exit-jp", "JP", "ok")))
-            .ScanSelected(new CandidateNode("香港名称但日本出口", 1), new[] { ServiceKind.ChatGPT });
+            .ScanSelected(new CandidateNode("香港名称但日本出口", 1),
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini });
         Equal(CandidateHealth.Compatible, supported.Health, "actual supported exit wins over node label");
         Equal("JP", supported.ExitCountryCode, "scan carries actual exit country");
         Equal("exit-jp", supported.ExitFingerprint, "scan carries encrypted exit fingerprint");
@@ -509,9 +510,41 @@ internal static class Tests
 
         CandidateScanResult unsupported = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
             new FakeExitIdentityProbe(new ExitIdentity("exit-hk", "HK", "ok")))
-            .ScanSelected(new CandidateNode("日本名称但香港出口", 1), new[] { ServiceKind.ChatGPT });
-        Equal(CandidateHealth.RegionBlocked, unsupported.Health, "actual Hong Kong exit blocks ChatGPT switch evidence");
+            .ScanSelected(new CandidateNode("日本名称但香港出口", 1),
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini });
+        Equal(CandidateHealth.RegionBlocked, unsupported.Health,
+            "actual Hong Kong exit blocks combined AI switch evidence");
         Equal(ServiceKind.ChatGPT, unsupported.FailedService.Value, "region gate identifies ChatGPT");
+
+        CandidateScanResult unsupportedGemini = new CompatibilityScanner(new FakeMihomo(), probe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("exit-hk", "HK", "ok")))
+            .ScanSelected(new CandidateNode("香港出口", 1), new[] { ServiceKind.Gemini });
+        Equal(CandidateHealth.RegionBlocked, unsupportedGemini.Health,
+            "shared region gate also blocks successful Gemini evidence");
+        Equal<ServiceKind?>(ServiceKind.Gemini, unsupportedGemini.FailedService,
+            "region gate identifies Gemini");
+
+        var unknownProbe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        unknownProbe.Results[ServiceKind.Gemini] = ProbeResult.Partial("入口可达", 80);
+        CandidateScanResult unknownExit = new CompatibilityScanner(new FakeMihomo(), unknownProbe, "probe")
+            .ScanSelected(new CandidateNode("未配置出口探针", 1),
+                new[] { ServiceKind.ChatGPT, ServiceKind.Gemini });
+        Equal(CandidateHealth.Unknown, unknownExit.Health,
+            "missing exit identity probe cannot validate AI region eligibility");
+        Equal(ProbeFailureKind.Unverified, unknownExit.ServiceResults[ServiceKind.ChatGPT].FailureKind,
+            "unknown exit makes successful ChatGPT evidence unverified");
+        Equal(ProbeFailureKind.Unverified, unknownExit.ServiceResults[ServiceKind.Gemini].FailureKind,
+            "unknown exit makes partial Gemini evidence unverified");
+
+        var failedProbe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        failedProbe.Results[ServiceKind.Gemini] = ProbeResult.ServiceFailure("authentication rejected", 90);
+        CandidateScanResult explicitFailure = new CompatibilityScanner(new FakeMihomo(), failedProbe, "probe",
+            new FakeExitIdentityProbe(new ExitIdentity("exit-hk", "HK", "ok")))
+            .ScanSelected(new CandidateNode("服务失败", 1), new[] { ServiceKind.Gemini });
+        Equal(CandidateHealth.ServiceFailed, explicitFailure.Health,
+            "region gate does not overwrite an explicit service failure");
+        Equal(ProbeFailureKind.Service, explicitFailure.ServiceResults[ServiceKind.Gemini].FailureKind,
+            "explicit AI service failure remains intact");
     }
 
     private static void AccountVerificationBehavior()
@@ -1335,7 +1368,8 @@ internal static class Tests
         basicProbe.Results[ServiceKind.ChatGPT] = ProbeResult.Partial("页面可达");
         basicProbe.Results[ServiceKind.Gemini] = ProbeResult.Partial("登录页可达");
         var basic = new CompatibilityScanner(new FakeMihomo(), basicProbe, "probe").Scan(new CandidateNode("basic", 1), null);
-        Equal(CandidateHealth.BasicCompatible, basic.Health, "basic AI reachability classified separately");
+        Equal(CandidateHealth.Unknown, basic.Health,
+            "AI reachability remains unverified when no exit identity probe is configured");
         Equal(7, basicProbe.Calls.Count, "basic reachability still checks all platforms");
         var pendingProbe = new FakeProbe();
         pendingProbe.Results[ServiceKind.ChatGPT] = ProbeResult.Unverified("无法确认");
@@ -1363,7 +1397,8 @@ internal static class Tests
 
         probe = new FakeProbe();
         result = new CompatibilityScanner(mihomo, probe, "probe").Scan(new CandidateNode("node", 1), new[] { ServiceKind.Discord, ServiceKind.Spotify });
-        Equal(CandidateHealth.Compatible, result.Health, "all mandatory compatible");
+        Equal(CandidateHealth.Unknown, result.Health,
+            "mandatory AI services remain unverified without an exit identity probe");
         Equal(9, probe.Calls.Count, "mandatory plus active optional count");
         Equal(false, probe.Calls.Contains(ServiceKind.Epic), "inactive optional skipped");
         Equal(4096, HttpServiceProbe.LimitBody(new byte[6000]).Length, "response body cap");
@@ -2198,6 +2233,8 @@ internal static class Tests
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
+        Equal(true, report.Contains("AI 地区规则：ChatGPT ∩ Gemini 官方支持地区（快照 2026-09-17）"),
+            "status identifies the dated shared AI region policy");
         Equal(false, report.Contains("secret"), "status omits credentials");
         Equal(true, StatusReport.Format(now, "日本 J1", CandidateHealth.Compatible, 88,
             "保持当前节点", "ok").Contains("检测状态：登录链路及后台服务探测通过"),
