@@ -1,3 +1,30 @@
+const noticePattern = '^[^A-Za-z0-9\\u3400-\\u9FFF]*(?:(?:消息|通知|公告|提示|官网|订阅地址|notice|notification|message|subscription info)\\s*[:：]|(?:剩余流量|流量剩余|套餐到期|到期时间|过期时间|下次重置|流量重置)\\s*[:：])';
+const noticeName = new RegExp(noticePattern, 'i');
+// Mihomo uses Go/RE2: literal Unicode ranges, not JavaScript \\u escapes.
+const providerNoticeFilter = '(?i:' + noticePattern.replace('\\u3400', '㐀').replace('\\u9FFF', '鿿') + ')';
+
+function isNotice(name) {
+  return typeof name === 'string' && noticeName.test(name);
+}
+
+function removeNotices(config) {
+  if (Array.isArray(config.proxies)) config.proxies = config.proxies.filter(proxy => proxy && !isNotice(proxy.name));
+  for (const group of config['proxy-groups'] || []) {
+    if (Array.isArray(group.proxies)) {
+      const before = group.proxies.length;
+      group.proxies = group.proxies.filter(name => !isNotice(name));
+      if (before && !group.proxies.length && !(group.use || []).length && !group['include-all'] && !group['include-all-proxies'] && !group['include-all-providers'])
+        group.proxies = ['REJECT'];
+    }
+    if (isNotice(group.now)) delete group.now;
+    if ((group.use || []).length || group['include-all'] || group['include-all-proxies'] || group['include-all-providers']) {
+      const previous = group['exclude-filter'] || '';
+      if (!previous.includes(providerNoticeFilter))
+        group['exclude-filter'] = previous ? '(' + previous + ')|' + providerNoticeFilter : providerNoticeFilter;
+    }
+  }
+}
+
 function nodeCandidates(config) {
   const nonLeafTypes = new Set([
     'direct', 'reject', 'reject-drop', 'pass', 'compatible',
@@ -6,6 +33,7 @@ function nodeCandidates(config) {
   const seen = new Set();
   return (config.proxies || []).filter(proxy => {
     if (!proxy || typeof proxy.name !== 'string' || !proxy.name.trim()) return false;
+    if (isNotice(proxy.name)) return false;
     if (typeof proxy.type !== 'string' || nonLeafTypes.has(proxy.type.toLowerCase())) return false;
     if (typeof proxy.server !== 'string' || !proxy.server.trim()) return false;
     if (seen.has(proxy.name)) return false;
@@ -24,7 +52,10 @@ function providerNames(config) {
 function managedGroup(name, proxies, providers) {
   const group = { name, type: 'select' };
   if (proxies.length) group.proxies = proxies.slice();
-  if (providers.length) group.use = providers.slice();
+  if (providers.length) {
+    group.use = providers.slice();
+    group['exclude-filter'] = providerNoticeFilter;
+  }
   return group;
 }
 
@@ -46,6 +77,9 @@ function prependUniqueRules(rules, additions) {
 }
 
 function main(config, profileName) {
+  removeNotices(config);
+  config.profile = config.profile || {};
+  config.profile['store-selected'] = true;
   // The current machine has no usable native IPv6 route. Letting Mihomo return
   // fake IPv6 addresses makes direct applications wait for IPv6 timeouts before
   // falling back to IPv4, which is especially visible in WeChat media loading.
@@ -57,19 +91,26 @@ function main(config, profileName) {
   const providers = providerNames(config);
   if (!candidates.length && !providers.length) return config;
   const groups = config['proxy-groups'] || (config['proxy-groups'] = []);
-  const serviceNames = ['🔍 Google', '🤖 OpenAI', '⌨️ GitHub'];
-  const preferred = serviceNames.map(name => groups.find(item => item.name === name))
-    .map(group => group && group.now).find(name => candidates.includes(name));
+  const serviceNames = ['🚀 节点选择', '🔍 Google', '🤖 OpenAI', '⌨️ GitHub'];
+  const oldShared = groups.find(item => item.name === '🌐 统一稳定节点');
+  const previousFirst = oldShared && (oldShared.proxies || [])[0];
+  const preferred = ['🌐 统一稳定节点'].concat(serviceNames).map(name => groups.find(item => item.name === name))
+    .map(group => group && group.now).concat(previousFirst).find(name => candidates.includes(name));
   const ordered = preferred ? [preferred].concat(candidates.filter(name => name !== preferred)) : candidates.slice();
 
   upsertGroup(groups, managedGroup('🌐 统一稳定节点', ordered, providers));
   upsertGroup(groups, managedGroup('🧪 兼容性探测', ordered, providers));
+  if (!groups.some(item => item.name === '🚀 节点选择'))
+    groups.push({ name: '🚀 节点选择', type: 'select', proxies: ['🌐 统一稳定节点'] });
   serviceNames.forEach(name => {
     const group = groups.find(item => item.name === name);
     if (!group) return;
     group.type = 'select';
     group.proxies = ['🌐 统一稳定节点'];
     delete group.use;
+    delete group.now;
+    delete group['include-all']; delete group['include-all-proxies']; delete group['include-all-providers'];
+    delete group.filter; delete group['exclude-filter']; delete group['exclude-type'];
     delete group.url; delete group.interval; delete group.tolerance; delete group.lazy;
   });
 
@@ -110,4 +151,4 @@ function main(config, profileName) {
   return config;
 }
 
-if (typeof module !== 'undefined') module.exports = { main, nodeCandidates, providerNames };
+if (typeof module !== 'undefined') module.exports = { main, nodeCandidates, providerNames, isNotice };

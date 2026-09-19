@@ -146,12 +146,9 @@ public sealed class MonitorSnapshot
         string decision, DateTime checkedUtc, DateTime nextCheckUtc)
     {
         if (scan == null) throw new ArgumentNullException("scan");
-        bool aiNeedsAccountProof = scan.ServiceResults.Any(pair =>
-            (pair.Key == ServiceKind.ChatGPT || pair.Key == ServiceKind.Gemini) &&
-            pair.Value.Passed && pair.Value.FailureKind == ProbeFailureKind.None);
         return new MonitorSnapshot {
             State = scan.Health == CandidateHealth.Unknown || scan.Health == CandidateHealth.BasicCompatible ? MonitorRunState.Pending :
-                scan.Health == CandidateHealth.Compatible ? (aiNeedsAccountProof ? MonitorRunState.Pending : MonitorRunState.Running) : MonitorRunState.Degraded,
+                scan.Health == CandidateHealth.Compatible ? MonitorRunState.Running : MonitorRunState.Degraded,
             ActualNode = node ?? "",
             Score = score,
             Decision = decision ?? "",
@@ -192,10 +189,15 @@ public sealed class MonitorPresentation
     private static string ResponseLabel(MonitorSnapshot snapshot)
     {
         if (snapshot.State == MonitorRunState.Degraded) return "综合响应：不可用";
-        List<long> measured = snapshot.Services.Where(x => x.Available && x.Milliseconds > 0).Select(x => x.Milliseconds).ToList();
+        List<ServiceMeasurement> measuredServices = snapshot.Services.Where(x => x.Available && x.Milliseconds > 0).ToList();
+        List<long> measured = measuredServices.Select(x => x.Milliseconds).ToList();
         if (measured.Count == 0) return "综合响应：待测";
-        double average = measured.Average();
-        return "综合响应：" + Math.Round(average).ToString("F0") + " ms · " + QualityPolicy.LatencyBand(average);
+        double p75 = QualityMeasurement.Percentile75(measured.Select(x => (double)x), Double.NaN);
+        string label = "综合响应：" + Math.Round(p75).ToString("F0") + " ms · " + QualityPolicy.LatencyBand(p75);
+        ServiceMeasurement slowest = measuredServices.OrderByDescending(x => x.Milliseconds).First();
+        if (slowest.Milliseconds > 2000)
+            label += " · " + ServiceLabel(slowest.Service) + " " + slowest.Milliseconds + " ms";
+        return label;
     }
 
     public static string ServiceText(bool available, long milliseconds, string detail)
@@ -248,6 +250,9 @@ public sealed class MonitorPresentation
         if (snapshot.BrowserStatus == BrowserVerificationStatus.Running) return "正在验证 AI 对话";
         if (snapshot.BrowserStatus == BrowserVerificationStatus.SignInRequired) return "需要浏览器登录";
         if (snapshot.BrowserStatus == BrowserVerificationStatus.AutomationUnsupported) return "浏览器自动化暂不支持";
+        if (snapshot.Health == CandidateHealth.BasicCompatible) return "基础连接可用";
+        if (snapshot.State == MonitorRunState.Pending && snapshot.Health == CandidateHealth.Compatible)
+            return "基础连接可用";
         switch (snapshot.State)
         {
             case MonitorRunState.Running: return "运行正常";

@@ -47,6 +47,12 @@ public sealed class CompatibilityScanner
 
     public CandidateScanResult ScanSelected(CandidateNode candidate, IEnumerable<ServiceKind> requiredServices)
     {
+        return ScanSelected(candidate, requiredServices, TimeSpan.FromSeconds(5));
+    }
+
+    public CandidateScanResult ScanSelected(CandidateNode candidate, IEnumerable<ServiceKind> requiredServices,
+        TimeSpan probeTimeout)
+    {
         if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
         long totalMilliseconds = 0;
         int probeCount = 0;
@@ -56,12 +62,28 @@ public sealed class CompatibilityScanner
         var measurements = new Dictionary<ServiceKind, ProbeResult>();
         mihomo.Select(probeGroup, candidate.Name);
         ExitIdentity identity = new ExitIdentity("", "", "exit identity probe not configured");
+        Task<ExitIdentity> identityTask = null;
         if (exitIdentityProbe != null && services.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini))
-            identity = exitIdentityProbe.Probe(TimeSpan.FromSeconds(5));
+            identityTask = Task.Factory.StartNew(() => exitIdentityProbe.Probe(probeTimeout));
+        var probeTasks = new Dictionary<ServiceKind, Task<ProbeResult>>();
         foreach (ServiceKind service in services)
         {
             if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
-            ProbeResult result = probe.Probe(service, TimeSpan.FromSeconds(5));
+            ServiceKind scheduled = service;
+            probeTasks[scheduled] = Task.Factory.StartNew(() => probe.Probe(scheduled, probeTimeout));
+        }
+        var rawResults = new Dictionary<ServiceKind, ProbeResult>();
+        foreach (ServiceKind service in services)
+        {
+            if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
+            rawResults[service] = probeTasks[service].GetAwaiter().GetResult();
+        }
+        if (identityTask != null) identity = identityTask.GetAwaiter().GetResult();
+        ServiceKind? failedService = null;
+        ProbeResult failedResult = null;
+        foreach (ServiceKind service in services)
+        {
+            ProbeResult result = rawResults[service];
             bool aiService = service == ServiceKind.ChatGPT || service == ServiceKind.Gemini;
             bool regionEligibleEvidence = result.FailureKind == ProbeFailureKind.None ||
                 result.FailureKind == ProbeFailureKind.Partial;
@@ -77,13 +99,10 @@ public sealed class CompatibilityScanner
             totalMilliseconds += result.ElapsedMilliseconds;
             if (result.FailureKind == ProbeFailureKind.Partial) partial.Add(service + ": " + result.Detail);
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
-            else if (!result.Passed)
-            {
-                foreach (ServiceKind untested in services)
-                    if (!measurements.ContainsKey(untested)) measurements[untested] = ProbeResult.Unverified("前序服务检测失败，本轮尚未检测");
-                return Failure(candidate.Name, service, result, totalMilliseconds, probeCount, measurements, identity);
-            }
+            else if (!result.Passed && !failedService.HasValue) { failedService = service; failedResult = result; }
         }
+        if (failedService.HasValue)
+            return Failure(candidate.Name, failedService.Value, failedResult, totalMilliseconds, probeCount, measurements, identity);
         if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
         if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
         return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);

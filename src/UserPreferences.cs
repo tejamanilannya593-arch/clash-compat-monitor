@@ -51,25 +51,18 @@ public sealed class UserPreferenceStore
             int version;
             bool firstRun;
             bool automatic;
-            bool browserConversation = false;
             string versionValue;
             string firstRunValue;
             string automaticValue;
-            string browserConversationValue;
             string serviceValue;
             if (!values.TryGetValue("version", out versionValue) || !Int32.TryParse(versionValue, out version) ||
-                (version != 1 && version != 2) ||
+                (version != 1 && version != 2 && version != 3) ||
                 !values.TryGetValue("firstRun", out firstRunValue) || !Boolean.TryParse(firstRunValue, out firstRun) ||
                 !values.TryGetValue("automatic", out automaticValue) || !Boolean.TryParse(automaticValue, out automatic) ||
                 !values.TryGetValue("services", out serviceValue)) throw new InvalidDataException("Preferences are incomplete.");
             if (version == 1)
             {
                 automatic = false;
-            }
-            else if (!values.TryGetValue("browserConversation", out browserConversationValue) ||
-                !Boolean.TryParse(browserConversationValue, out browserConversation))
-            {
-                throw new InvalidDataException("Preferences are incomplete.");
             }
 
             var services = new List<ServiceKind>();
@@ -85,7 +78,7 @@ public sealed class UserPreferenceStore
             return new UserPreferences {
                 FirstRunComplete = firstRun,
                 AutomaticOptimization = automatic,
-                BrowserConversationVerification = browserConversation,
+                BrowserConversationVerification = false,
                 RequiredServices = services
             };
         }
@@ -107,10 +100,9 @@ public sealed class UserPreferenceStore
         string directory = Path.GetDirectoryName(path);
         if (!String.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
         string temporary = path + ".tmp";
-        string text = "version=2" + Environment.NewLine +
+        string text = "version=3" + Environment.NewLine +
             "firstRun=" + value.FirstRunComplete + Environment.NewLine +
             "automatic=" + value.AutomaticOptimization + Environment.NewLine +
-            "browserConversation=" + value.BrowserConversationVerification + Environment.NewLine +
             "services=" + String.Join(",", services.Select(service => service.ToString())) + Environment.NewLine;
         File.WriteAllText(temporary, text, Encoding.UTF8);
         if (File.Exists(path)) File.Replace(temporary, path, null);

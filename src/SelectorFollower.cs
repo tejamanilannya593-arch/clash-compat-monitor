@@ -18,13 +18,15 @@ public static class SelectorFollower
             String.Equals(sourceGroup, targetGroup, StringComparison.Ordinal)) return false;
 
         string selected = mihomo.GetSelected(sourceGroup);
-        if (String.IsNullOrWhiteSpace(selected)) return false;
-        if (!mihomo.GetChoices(targetGroup).Contains(selected, StringComparer.Ordinal)) return false;
-        if (String.Equals(mihomo.GetSelected(targetGroup), selected, StringComparison.Ordinal)) return false;
+        if (String.IsNullOrWhiteSpace(selected) || CandidateCatalog.IsSubscriptionNotice(selected)) return false;
+        string[] choices = mihomo.GetChoices(targetGroup);
+        string target = choices.Contains(sourceGroup, StringComparer.Ordinal) ? sourceGroup : selected;
+        if (!choices.Contains(target, StringComparer.Ordinal)) return false;
+        if (String.Equals(mihomo.GetSelected(targetGroup), target, StringComparison.Ordinal)) return false;
         if (!String.Equals(mihomo.GetSelected(sourceGroup), selected, StringComparison.Ordinal)) return false;
 
-        mihomo.Select(targetGroup, selected);
-        if (!String.Equals(mihomo.GetSelected(targetGroup), selected, StringComparison.Ordinal))
+        mihomo.Select(targetGroup, target);
+        if (!String.Equals(mihomo.GetSelected(targetGroup), target, StringComparison.Ordinal))
             throw new InvalidOperationException("General selector synchronization was not confirmed.");
         return true;
     }

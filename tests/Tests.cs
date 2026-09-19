@@ -62,11 +62,11 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.1", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.4", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
-        Equal(true, RuntimeConfigurationPolicy.Ipv6Action(true).Contains("重新应用增强脚本"),
-            "unexpected runtime IPv6 gets an actionable warning instead of a configuration rewrite");
+        Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
+            "IPv6 flag alone cannot disable monitoring or trigger configuration rewrites");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
         RegionEligibilityCaching();
@@ -433,6 +433,31 @@ internal static class Tests
         Equal(true, ServiceEvidencePolicy.CanEmergencySwitch(strict), "strict scan can be emergency target");
         Equal(false, ServiceEvidencePolicy.CanEmergencySwitch(reachable), "reachable-only scan cannot be emergency target");
 
+        var emergencyReachable = new CandidateScanResult("reachable", CandidateHealth.BasicCompatible, null, "login chain reachable", 300, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry reachable", 180) },
+                { ServiceKind.Google, ProbeResult.Success(120) }
+            });
+        Equal(true, ServiceEvidencePolicy.CanFastFailoverTarget(emergencyReachable, ServiceKind.ChatGPT),
+            "live target that passes failed service can rescue a broken current node");
+        var emergencyBroken = new CandidateScanResult("broken", CandidateHealth.ServiceFailed, ServiceKind.ChatGPT, "blocked", 300, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.ChatGPT, ProbeResult.ServiceFailure("blocked", 180) },
+                { ServiceKind.Google, ProbeResult.Success(120) }
+            });
+        Equal(false, ServiceEvidencePolicy.CanFastFailoverTarget(emergencyBroken, ServiceKind.ChatGPT),
+            "target repeating the current failure cannot be used for fast failover");
+        var emergencySlow = new CandidateScanResult("slow-target", CandidateHealth.Compatible, null, "ok", 2200, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.ChatGPT, ProbeResult.Success(500) },
+                { ServiceKind.GitHub, ProbeResult.Success(2001) }
+            });
+        Equal(false, ServiceEvidencePolicy.CanFastFailoverTarget(emergencySlow, ServiceKind.ChatGPT),
+            "fast failover refuses a target that still exceeds two seconds");
+
         var assurance = new ConnectionAssurance();
         assurance.Remember(reachable, "current", DateTime.UtcNow);
         Equal(0, assurance.Standbys.Count, "reachable-only scan cannot enter standby pool");
@@ -605,9 +630,12 @@ internal static class Tests
                 { ServiceKind.ChatGPT, ProbeResult.Success(100) },
                 { ServiceKind.Gemini, ProbeResult.Success(100) }
             }, "fingerprint", "JP");
-        Equal(false, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
+        Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
-            "quality switch waits for every selected AI account proof");
+            "quality switch uses complete network evidence without browser proof");
+        Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, new ExperienceData(), "scope",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
+            "compatible network evidence no longer depends on browser proof");
         AccountVerificationMemory.MarkBrowserConversation(data, "scope", "node", "fingerprint", ServiceKind.Gemini,
             now, BrowserConversationProof.CurrentProtocolVersion);
         Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, data, "scope",
@@ -616,9 +644,9 @@ internal static class Tests
         Equal(true, ServiceEvidencePolicy.CanQualitySwitch(strict, new ExperienceData(), "scope",
             new[] { ServiceKind.Google, ServiceKind.GitHub }, now),
             "non-AI configuration does not require account proof");
-        Equal(false, ServiceEvidencePolicy.CanRestoreAfterReload(strict, new ExperienceData(), "scope",
+        Equal(true, ServiceEvidencePolicy.CanRestoreAfterReload(strict, new ExperienceData(), "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
-            "reload recovery cannot proactively select unverified AI target");
+            "reload recovery accepts complete live network evidence");
         Equal(true, ServiceEvidencePolicy.CanRestoreAfterReload(strict, data, "scope",
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, now),
             "reload recovery accepts account-verified AI target");
@@ -1239,6 +1267,17 @@ internal static class Tests
         Equal("Tokyo-A", typed[0].Name, "typed filtering keeps source order");
         Equal(1, CandidateCatalog.Filter(new[] { "新协议节点" }, runtimeTypes).Count,
             "unknown runtime kind remains eligible for newer subscription protocols");
+        var notices = new[] { "消息: 17条未读，在APP查看", "📢 公告：请更新订阅", "剩余流量：100GB", "套餐到期：2027-01-01", "Notice: subscription updated" };
+        foreach (string notice in notices) runtimeTypes[notice] = "Trojan";
+        Equal(0, CandidateCatalog.Filter(notices, runtimeTypes).Count,
+            "subscription notice entries are excluded even with real proxy protocol metadata");
+        var providerMetadata = new[] { "----- 联系我们 -----", "----- 账号信息 -----",
+            "电报: https://t.me/example", "登录账号: user123", "豪华套餐: 剩余348天", "邮箱: support@example.com" };
+        foreach (string notice in providerMetadata) runtimeTypes[notice] = "Trojan";
+        Equal(0, CandidateCatalog.Filter(providerMetadata, runtimeTypes).Count,
+            "provider contact and account metadata never enter node measurements");
+        Equal(2, CandidateCatalog.Filter(new[] { "香港 I1 | 通知优化", "Tokyo-A" }, runtimeTypes).Count,
+            "notice filtering does not reject node regions or ordinary words inside node names");
     }
 
     private static void PipeHttpDecoding()
@@ -1407,13 +1446,13 @@ internal static class Tests
         var scanner = new CompatibilityScanner(mihomo, probe, "probe");
         var result = scanner.Scan(new CandidateNode("node", 1), new ServiceKind[0]);
         Equal(CandidateHealth.ServiceFailed, result.Health, "chatgpt failure classification");
-        Equal(1, probe.Calls.Count, "chatgpt fail fast count");
+        Equal(7, probe.Calls.Count, "chatgpt failure still completes concurrent service batch");
 
         probe = new FakeProbe();
         probe.Results[ServiceKind.Gemini] = ProbeResult.RegionFailure("unsupported");
         result = new CompatibilityScanner(mihomo, probe, "probe").Scan(new CandidateNode("node", 1), new ServiceKind[0]);
         Equal(CandidateHealth.RegionBlocked, result.Health, "gemini region classification");
-        Equal(2, probe.Calls.Count, "gemini fail fast count");
+        Equal(7, probe.Calls.Count, "gemini failure still completes concurrent service batch");
 
         probe = new FakeProbe();
         result = new CompatibilityScanner(mihomo, probe, "probe").Scan(new CandidateNode("node", 1), new[] { ServiceKind.Discord, ServiceKind.Spotify });
@@ -1444,6 +1483,38 @@ internal static class Tests
         Equal(5000.0, QualityMeasurement.ResponseMilliseconds(
             new CandidateScanResult("none", CandidateHealth.Transient, null, "none", 0, 0), 5000),
             "empty scan uses fallback");
+        var unevenResults = new Dictionary<ServiceKind, ProbeResult> {
+            { ServiceKind.ChatGPT, ProbeResult.Partial("入口可达", 824) },
+            { ServiceKind.Gemini, ProbeResult.Success(670) },
+            { ServiceKind.Google, ProbeResult.Success(214) },
+            { ServiceKind.GitHub, ProbeResult.Success(295) },
+            { ServiceKind.SteamStore, ProbeResult.Success(322) },
+            { ServiceKind.SteamCommunity, ProbeResult.Success(2569) },
+            { ServiceKind.SteamApi, ProbeResult.Success(377) }
+        };
+        var unevenScan = new CandidateScanResult("uneven", CandidateHealth.BasicCompatible, null,
+            "入口可达", 5271, 7, unevenResults);
+        Equal(824.0, QualityMeasurement.ResponseMilliseconds(unevenScan, 5000),
+            "response uses conservative nearest-rank p75 instead of average");
+        string unevenLabel = MonitorPresentation.From(MonitorSnapshot.CreateRunning("uneven", unevenScan,
+            null, "保持当前节点", DateTime.UtcNow, DateTime.UtcNow.AddMinutes(1))).ResponseText;
+        Equal("综合响应：824 ms · 较慢 · Steam 社区 2569 ms", unevenLabel,
+            "presentation exposes severe slow service instead of diluting it");
+
+        var concurrentProbe = new ConcurrentEntryProbe(3);
+        var concurrentTimer = System.Diagnostics.Stopwatch.StartNew();
+        CandidateScanResult concurrent = new CompatibilityScanner(mihomo, concurrentProbe, "probe").ScanSelected(
+            new CandidateNode("parallel", 1), new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google });
+        concurrentTimer.Stop();
+        Equal(CandidateHealth.Unknown, concurrent.Health,
+            "concurrent AI probes still require a known exit identity");
+        Equal(3, concurrent.ProbeCount, "concurrent scan retains every selected result");
+        Equal(true, concurrentTimer.ElapsedMilliseconds < 450, "three bounded probes do not wait serially");
+
+        probe = new FakeProbe { DefaultResult = ProbeResult.Success(100) };
+        new CompatibilityScanner(mihomo, probe, "probe").ScanSelected(
+            new CandidateNode("quick", 1), new[] { ServiceKind.Google }, TimeSpan.FromSeconds(2));
+        Equal(TimeSpan.FromSeconds(2), probe.Timeouts.Single(), "fast candidate scan uses its shorter probe timeout");
 
         probe = new FakeProbe { DefaultResult = ProbeResult.Success(75) };
         scanner = new CompatibilityScanner(mihomo, probe, "probe",
@@ -1458,7 +1529,7 @@ internal static class Tests
         Equal("selected", snapshot.ActualNode, "snapshot leaf node");
         Equal(2, snapshot.Services.Count, "snapshot retains service evidence");
         MonitorPresentation view = MonitorPresentation.From(snapshot);
-        Equal("部分服务待验证", view.StateText, "login-ready AI scan waits for account verification");
+        Equal("运行正常", view.StateText, "login-ready AI scan is usable without a browser companion");
         Equal("网络链路兼容 · 真实对话待验证 · 75 ms",
             MonitorPresentation.ServiceText(snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT)),
             "AI service distinguishes login chain from account proof");
@@ -1487,7 +1558,85 @@ internal static class Tests
         Equal(MonitorRunState.Degraded, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.Transient, null, "timeout"), null, "", snapshotTime, snapshotTime).State, "failed scan is not running normally");
         Equal(MonitorRunState.Pending, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending"), null, "", snapshotTime, snapshotTime).State, "unknown scan is pending");
         Equal(MonitorRunState.Pending, MonitorSnapshot.CreateRunning("x", new CandidateScanResult("x", CandidateHealth.BasicCompatible, null, "challenge"), null, "", snapshotTime, snapshotTime).State, "reachable-only scan is pending not running normally");
+        MonitorSnapshot basicProgress = MonitorSnapshot.CreateRunning("x",
+            new CandidateScanResult("x", CandidateHealth.BasicCompatible, null, "challenge", 100, 1,
+                new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Partial("入口可达", 100) } }),
+            null, "", snapshotTime, snapshotTime).WithProgress("后台准备备用节点");
+        Equal("基础连接可用", MonitorPresentation.From(basicProgress).StateText,
+            "background maintenance does not hide completed basic reachability");
         Equal(true, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "definite startup failure gets immediate confirmation");
+        Equal(true, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "ordinary timeout is quickly confirmed once");
+        Equal(false, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.RegionBlocked, ServiceKind.ChatGPT, "unsupported country")), "explicit region rejection switches without retesting current node");
+        Equal(false, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.ServiceFailed, ServiceKind.Gemini, "http rejection")), "explicit service rejection switches without retesting current node");
+        var severeLatency = new CandidateScanResult("x", CandidateHealth.Compatible, null, "slow", 2300, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.Google, ProbeResult.Success(300) },
+                { ServiceKind.GitHub, ProbeResult.Success(2001) }
+            });
+        Equal(ServiceKind.GitHub, StartupRecovery.FastFailoverService(severeLatency).Value,
+            "one severely slow selected service enters fast replacement");
+        var boundaryLatency = new CandidateScanResult("x", CandidateHealth.Compatible, null, "boundary", 2300, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.Google, ProbeResult.Success(300) },
+                { ServiceKind.GitHub, ProbeResult.Success(2000) }
+            });
+        Equal(false, StartupRecovery.FastFailoverService(boundaryLatency).HasValue,
+            "two second boundary does not churn the current node");
+        var unknownSlow = new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending", 2500, 1,
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.GitHub, ProbeResult.Success(2500) } });
+        Equal(false, StartupRecovery.FastFailoverService(unknownSlow).HasValue,
+            "incomplete evidence cannot trigger repeated latency switching");
+        var rankedRescue = StartupRecovery.RankFastCandidates(
+            new[] { new CandidateNode("current", 1), new CandidateNode("slow", 1), new CandidateNode("fast", 1) },
+            new Dictionary<string, int> { { "slow", 900 }, { "fast", 120 } }, "current", 2);
+        Equal("fast", rankedRescue[0], "fast rescue checks the lowest live Mihomo delay first");
+        Equal("slow", rankedRescue[1], "fast rescue keeps a bounded fallback");
+        ServiceKind[] criticalServices = StartupRecovery.FastProbeServices(
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google, ServiceKind.GitHub,
+                ServiceKind.SteamStore, ServiceKind.SteamCommunity, ServiceKind.SteamApi }, ServiceKind.SteamApi);
+        Equal("ChatGPT,Gemini,Google,GitHub,SteamApi", String.Join(",", criticalServices),
+            "fast comparison skips duplicate Steam endpoints but keeps the failed service");
+        var fasterTarget = new CandidateScanResult("fast", CandidateHealth.BasicCompatible, null, "ok", 800, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 400) },
+                { ServiceKind.GitHub, ProbeResult.Success(400) }
+            });
+        var slowerTarget = new CandidateScanResult("slow", CandidateHealth.BasicCompatible, null, "ok", 1400, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 700) },
+                { ServiceKind.GitHub, ProbeResult.Success(700) }
+            });
+        string[] verifiedOrder = StartupRecovery.RankVerifiedFastTargets(
+            new[] { slowerTarget, fasterTarget }, new Dictionary<string, int> { { "slow", 80 }, { "fast", 120 } },
+            ServiceKind.ChatGPT);
+        Equal("fast", verifiedOrder[0], "real service response outranks a lower synthetic delay");
+        Equal(false, StartupRecovery.ShouldStopFastComparison(5, 0, 5000), "comparison expands when the first five have no usable target");
+        Equal(false, StartupRecovery.ShouldStopFastComparison(5, 2, 1200), "comparison keeps looking when two targets are merely usable");
+        Equal(true, StartupRecovery.ShouldStopFastComparison(5, 2, 700), "comparison stops after two targets include a genuinely fast option");
+        Equal(true, StartupRecovery.ShouldStopFastComparison(12, 0, 5000), "comparison remains bounded when the subscription has no usable target");
+        string[] orderedFastCandidates = StartupRecovery.OrderFastCandidates(
+            new[] { "live-fast", "live-second" }, new[] { "stale-standby", "live-fast" },
+            new[] { "old-history" }, new[] { "old-experience" },
+            new[] { "current", "last-resort" }, "current", 5);
+        Equal("live-fast,live-second,stale-standby,old-history,old-experience", String.Join(",", orderedFastCandidates),
+            "fresh live latency order outranks stale standby and history");
+        var firstTimeout = new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.SteamApi, "timeout", 5200, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.Google, ProbeResult.Success(200) },
+                { ServiceKind.SteamApi, ProbeResult.TransientFailure("timeout", 5000) }
+            });
+        var retryPassed = new CandidateScanResult("x", CandidateHealth.Compatible, null, "ok", 300, 1,
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.SteamApi, ProbeResult.Success(300) } });
+        CandidateScanResult recovered = StartupRecovery.ApplySuccessfulConfirmation(firstTimeout, retryPassed, ServiceKind.SteamApi);
+        Equal(CandidateHealth.Compatible, recovered.Health, "successful timeout retry repairs the current cycle");
+        Equal(false, recovered.FailedService.HasValue, "successful timeout retry clears the stale failure");
+        Equal(300L, recovered.ServiceResults[ServiceKind.SteamApi].ElapsedMilliseconds,
+            "successful timeout retry replaces the failed service evidence");
         Equal(false, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Unknown, null, "pending")), "unknown startup evidence is not forced failure");
         Equal(4, StartupRecovery.MaximumCandidates(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "startup failure search is bounded");
         Equal(3, StartupRecovery.MaximumCandidates(selected), "healthy maintenance search stays small");
@@ -1502,13 +1651,31 @@ internal static class Tests
     private sealed class FakeProbe : IServiceProbe
     {
         public readonly List<ServiceKind> Calls = new List<ServiceKind>();
+        public readonly List<TimeSpan> Timeouts = new List<TimeSpan>();
         public readonly Dictionary<ServiceKind, ProbeResult> Results = new Dictionary<ServiceKind, ProbeResult>();
         public ProbeResult DefaultResult = ProbeResult.Success();
         public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
         {
-            Calls.Add(service);
+            lock (Calls)
+            {
+                Calls.Add(service);
+                Timeouts.Add(timeout);
+            }
             ProbeResult result;
             return Results.TryGetValue(service, out result) ? result : DefaultResult;
+        }
+    }
+
+    private sealed class ConcurrentEntryProbe : IServiceProbe
+    {
+        private readonly CountdownEvent entered;
+        public ConcurrentEntryProbe(int count) { entered = new CountdownEvent(count); }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            entered.Signal();
+            return entered.Wait(TimeSpan.FromMilliseconds(500))
+                ? ProbeResult.Success(100)
+                : ProbeResult.ServiceFailure("probes were serialized");
         }
     }
 
@@ -1656,16 +1823,16 @@ internal static class Tests
             "conservative mode skips quality comparison for usable current");
         Equal("current usable; conservative mode holds", SwitchModePolicy.ConservativeHoldReason,
             "conservative mode has stable decision reason");
-        Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred HTTP response threshold");
-        Equal("优秀", QualityPolicy.LatencyBand(500), "excellent latency band boundary");
-        Equal("良好", QualityPolicy.LatencyBand(800), "good latency band boundary");
-        Equal("可连接但偏慢", QualityPolicy.LatencyBand(1500), "connectable but slow latency band boundary");
-        Equal("不适合自动寻优", QualityPolicy.LatencyBand(1501), "automatic optimization latency cutoff");
+        Equal(500.0, QualityPolicy.PreferredResponseMilliseconds, "preferred candidate response threshold");
+        Equal("优秀", QualityPolicy.LatencyBand(300), "excellent latency band boundary");
+        Equal("良好", QualityPolicy.LatencyBand(500), "good latency band boundary");
+        Equal("可用但偏慢", QualityPolicy.LatencyBand(800), "usable but slow latency band boundary");
+        Equal("较慢", QualityPolicy.LatencyBand(801), "slow latency band starts above 800");
         Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 1000.0 }), "current latency needs three samples");
         Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 800.0, 900.0 }), "current median at 800 holds");
         Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 900.0 }), "current median above 800 may optimize");
-        Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0, 800.0 }), "candidate median p95 and jitter pass");
-        Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1500.0 }), "candidate median 800 and maximum 1500 pass");
+        Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 500.0, 500.0 }), "candidate median 500 and jitter pass");
+        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 501.0, 501.0, 501.0 }), "candidate median above 500 is not preferred");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0 }), "candidate latency needs five samples");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }), "candidate maximum above 1500 fails");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 100.0, 300.0, 500.0, 700.0, 800.0 }), "candidate jitter above 150 fails");
@@ -1676,7 +1843,7 @@ internal static class Tests
         Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1500 passes");
         Equal(false, QualityPolicy.ServicesWithinLimit(slowService), "single slow service rejects quality candidate");
         double[] slowCurrent = { 700, 801, 900 };
-        double[] preferredTarget = { 300, 400, 500, 600, 800 };
+        double[] preferredTarget = { 300, 400, 500, 500, 500 };
         Equal(false, controller.DecideQuality(70, 82, false, true, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "under 20 percent holds");
         Equal(true, controller.DecideQuality(70, 85, false, true, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "over 20 percent switches to preferred latency");
         Equal(false, controller.DecideQuality(70, 90, false, false, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "fresh verification required");
@@ -1784,6 +1951,10 @@ internal static class Tests
 
     private static void ProxyPathHealthBehavior()
     {
+        Equal(false, ProxyPathHealthPolicy.ShouldCheck(false),
+            "stable selector does not pay the path diagnostic cost every cycle");
+        Equal(true, ProxyPathHealthPolicy.ShouldCheck(true),
+            "changed selector is checked after alignment");
         Equal(false, ProxyPathHealth.Evaluate(true, true, true, true).Mismatch,
             "both proxy paths healthy allow normal decisions");
         Equal(true, ProxyPathHealth.Evaluate(false, false, true, true).Mismatch,
@@ -1809,6 +1980,13 @@ internal static class Tests
 
     private static void SelectorFollowerBehavior()
     {
+        var nested = new SelectorMihomo("node-a", "old-node", new[] { "shared" });
+        Equal(true, SelectorFollower.Synchronize(nested, "shared", "general"),
+            "main selector binds to the shared group when the persistent group reference is available");
+        Equal("shared", nested.GetSelected("general"), "general selector follows the shared group reference");
+        nested.SetShared("node-b");
+        Equal(false, SelectorFollower.Synchronize(nested, "shared", "general"),
+            "nested shared reference follows changed nodes without another selection write");
         var mihomo = new SelectorMihomo("node-a", "subscription notice", new[] { "node-a", "node-b" });
         Equal(true, SelectorFollower.Synchronize(mihomo, "shared", "general"),
             "general selector follows verified shared node");
@@ -1896,8 +2074,10 @@ internal static class Tests
         Equal(true, loaded.FirstRunComplete, "first run persisted");
         Equal(2, loaded.RequiredServices.Count, "service selection persisted");
         Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
-        Equal(true, loaded.BrowserConversationVerification, "browser proof consent persisted");
-        Equal(true, File.ReadAllText(path).Contains("version=2"), "preference schema upgraded");
+        Equal(false, loaded.BrowserConversationVerification, "removed browser consent is not persisted");
+        Equal(true, File.ReadAllText(path).Contains("version=3"), "preference schema upgraded");
+        Equal(true, File.ReadAllText(path).Contains("version=3"), "browser-free preference schema is version 3");
+        Equal(false, File.ReadAllText(path).Contains("browserConversation"), "saved preferences contain no browser consent");
         File.WriteAllText(path, "broken", Encoding.UTF8);
         Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
@@ -1916,6 +2096,11 @@ internal static class Tests
             "legacy jmcomic preference is migration not corruption");
         migrationStore.Save(migrated);
         Equal(false, File.ReadAllText(migrationPath).Contains("JMComic"), "saving removes legacy jmcomic value");
+        File.WriteAllText(migrationPath,
+            "version=2\r\nfirstRun=True\r\nautomatic=True\r\nbrowserConversation=True\r\nservices=ChatGPT,GitHub\r\n", Encoding.UTF8);
+        UserPreferences browserLegacy = migrationStore.Load();
+        Equal(true, browserLegacy.AutomaticOptimization, "version 2 browser consent is ignored without corrupting preferences");
+        Equal("ChatGPT,GitHub", String.Join(",", browserLegacy.RequiredServices), "version 2 services survive browser removal");
     }
 
     private static void MonitorCoordinatorBehavior()
@@ -2249,7 +2434,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.1"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.4"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

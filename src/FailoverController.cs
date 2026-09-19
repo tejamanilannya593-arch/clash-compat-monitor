@@ -95,18 +95,20 @@ public sealed class FailoverController
 
 public static class QualityPolicy
 {
+    public const double ExcellentResponseMilliseconds = 300.0;
     public const double PreferredResponseMilliseconds = 500.0;
     public const double OptimizationResponseMilliseconds = 800.0;
     public const double MaximumServiceResponseMilliseconds = 1500.0;
+    public const double SevereServiceResponseMilliseconds = 2000.0;
     public const double MaximumJitterMilliseconds = 150.0;
 
     public static string LatencyBand(double milliseconds)
     {
         if (Double.IsNaN(milliseconds) || Double.IsInfinity(milliseconds) || milliseconds < 0) return "待测";
-        if (milliseconds <= PreferredResponseMilliseconds) return "优秀";
-        if (milliseconds <= OptimizationResponseMilliseconds) return "良好";
-        if (milliseconds <= MaximumServiceResponseMilliseconds) return "可连接但偏慢";
-        return "不适合自动寻优";
+        if (milliseconds <= ExcellentResponseMilliseconds) return "优秀";
+        if (milliseconds <= PreferredResponseMilliseconds) return "良好";
+        if (milliseconds <= OptimizationResponseMilliseconds) return "可用但偏慢";
+        return "较慢";
     }
 
     public static bool CurrentNeedsOptimization(IEnumerable<double> responses)
@@ -122,13 +124,27 @@ public static class QualityPolicy
         double median = Median(recent);
         double maximum = recent[recent.Count - 1];
         List<double> deviations = recent.Select(x => Math.Abs(x - median)).OrderBy(x => x).ToList();
-        return median <= OptimizationResponseMilliseconds && maximum <= MaximumServiceResponseMilliseconds &&
+        return median <= PreferredResponseMilliseconds && maximum <= MaximumServiceResponseMilliseconds &&
             Median(deviations) <= MaximumJitterMilliseconds;
     }
 
     public static bool ServicesWithinLimit(CandidateScanResult scan)
     {
         return scan != null && !scan.ServiceResults.Values.Any(x => x.ElapsedMilliseconds > MaximumServiceResponseMilliseconds);
+    }
+
+    public static bool ServicesWithinFastFailoverLimit(CandidateScanResult scan)
+    {
+        return scan != null && !scan.ServiceResults.Values.Any(x => x.ElapsedMilliseconds > SevereServiceResponseMilliseconds);
+    }
+
+    public static ServiceKind? SeverelySlowService(CandidateScanResult scan)
+    {
+        if (scan == null || scan.ServiceResults == null) return null;
+        var slowest = scan.ServiceResults.Where(x => x.Value != null && x.Value.Passed &&
+            x.Value.ElapsedMilliseconds > SevereServiceResponseMilliseconds)
+            .OrderByDescending(x => x.Value.ElapsedMilliseconds).FirstOrDefault();
+        return slowest.Value == null ? (ServiceKind?)null : slowest.Key;
     }
 
     private static IEnumerable<double> Valid(IEnumerable<double> responses)

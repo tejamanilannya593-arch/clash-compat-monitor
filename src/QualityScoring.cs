@@ -45,8 +45,23 @@ public static class QualityMeasurement
 {
     public static double ResponseMilliseconds(CandidateScanResult scan, double fallback)
     {
-        return scan != null && scan.ProbeCount > 0 && scan.TotalMilliseconds > 0
+        if (scan == null) return fallback;
+        List<double> measured = scan.ServiceResults.Values
+            .Where(x => x.Passed && x.ElapsedMilliseconds > 0)
+            .Select(x => (double)x.ElapsedMilliseconds).ToList();
+        if (measured.Count > 0) return Percentile75(measured, fallback);
+        return scan.ProbeCount > 0 && scan.TotalMilliseconds > 0
             ? (double)scan.TotalMilliseconds / scan.ProbeCount : fallback;
+    }
+
+    public static double Percentile75(IEnumerable<double> values, double fallback)
+    {
+        List<double> sorted = (values ?? Enumerable.Empty<double>())
+            .Where(x => !Double.IsNaN(x) && !Double.IsInfinity(x) && x > 0)
+            .OrderBy(x => x).ToList();
+        if (sorted.Count == 0) return fallback;
+        int rank = (int)Math.Ceiling(sorted.Count * 0.75);
+        return sorted[Math.Max(0, rank - 1)];
     }
 }
 

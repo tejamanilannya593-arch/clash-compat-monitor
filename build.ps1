@@ -12,15 +12,5 @@ $testInputs = @($sources) + @((Join-Path $root 'tests\Tests.cs'))
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & "$out\Monitor.Tests.exe"
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-& node (Join-Path $root 'browser-extension\tests\run.js')
-if ($LASTEXITCODE) { exit $LASTEXITCODE }
-$browserHostSources = @(
-    (Join-Path $root 'src\BrowserNativeProtocol.cs'),
-    (Join-Path $root 'src\BrowserHostProgram.cs'),
-    (Join-Path $root 'src\BrowserBridgeServer.cs'),
-    (Join-Path $root 'src\AssemblyInfo.cs')
-)
-& $csc /nologo /warnaserror /platform:x86 /target:exe /main:BrowserHostProgram /out:"$out\ClashCompatibilityMonitor.BrowserHost.exe" @refs @browserHostSources
-if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & $csc /nologo /warnaserror /platform:x86 /target:winexe /main:Program /win32manifest:"$manifest" /win32icon:"$icon" /out:"$out\ClashCompatibilityMonitor.exe" @refs @sources
 exit $LASTEXITCODE

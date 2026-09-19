@@ -40,6 +40,14 @@ public interface IProxyPathHealthChecker
     ProxyPathHealth Check();
 }
 
+public static class ProxyPathHealthPolicy
+{
+    public static bool ShouldCheck(bool selectorAlignmentChanged)
+    {
+        return selectorAlignmentChanged;
+    }
+}
+
 public sealed class ProxyPathHealthChecker : IProxyPathHealthChecker
 {
     private readonly string probeProxy;

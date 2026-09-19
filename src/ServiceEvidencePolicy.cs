@@ -15,17 +15,21 @@ public static class ServiceEvidencePolicy
         return scan != null && scan.Health == CandidateHealth.Compatible;
     }
 
+    public static bool CanFastFailoverTarget(CandidateScanResult scan, ServiceKind failedService)
+    {
+        if (!CanHold(scan)) return false;
+        ProbeResult failedServiceResult;
+        return scan.ServiceResults.TryGetValue(failedService, out failedServiceResult) &&
+            failedServiceResult.Passed &&
+            !scan.ServiceResults.Values.Any(x => !x.Passed &&
+                x.FailureKind != ProbeFailureKind.Unverified) &&
+            QualityPolicy.ServicesWithinFastFailoverLimit(scan);
+    }
+
     public static bool CanQualitySwitch(CandidateScanResult scan, ExperienceData data, string scope,
         IEnumerable<ServiceKind> requiredServices, DateTime now)
     {
-        if (!CanEmergencySwitch(scan)) return false;
-        foreach (ServiceKind service in (requiredServices ?? Enumerable.Empty<ServiceKind>())
-            .Where(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini).Distinct())
-        {
-            if (!AccountVerificationMemory.IsBrowserConversationValid(data, scope, scan.Name,
-                scan.ExitFingerprint, service, now, BrowserConversationProof.CurrentProtocolVersion)) return false;
-        }
-        return true;
+        return CanEmergencySwitch(scan);
     }
 
     public static bool CanRestoreAfterReload(CandidateScanResult scan, ExperienceData data, string scope,

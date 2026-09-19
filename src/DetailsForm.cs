@@ -10,19 +10,16 @@ public sealed class DetailsForm : Form
     private readonly Action requestCheck;
     private readonly Action<bool> setPaused;
     private readonly Action restorePrevious;
-    private readonly Action startBrowserVerification;
     private readonly Action<string, ServiceKind, DateTime> reportServiceFailure;
     private readonly Action exitApplication;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
     private readonly List<ServiceChoice> choices = new List<ServiceChoice>();
     private readonly CheckBox performanceOptimization = new CheckBox();
-    private readonly CheckBox browserConversationVerification = new CheckBox();
     private readonly Label stateLabel = HeadingLabel();
     private readonly Label nodeLabel = new Label();
     private readonly Label decisionLabel = new Label();
     private readonly Label responseLabel = new Label();
-    private readonly Label browserStatusLabel = new Label();
     private readonly Label selectionLabel = new Label();
     private readonly Label nextCheckLabel = new Label();
     private readonly ListView serviceList = new ListView();
@@ -39,7 +36,6 @@ public sealed class DetailsForm : Form
         this.requestCheck = requestCheck;
         this.setPaused = setPaused;
         this.restorePrevious = restorePrevious;
-        this.startBrowserVerification = startBrowserVerification;
         this.reportServiceFailure = reportServiceFailure;
         this.exitApplication = exitApplication;
 
@@ -92,11 +88,6 @@ public sealed class DetailsForm : Form
         performanceOptimization.Checked = preferences.AutomaticOptimization;
         performanceOptimization.Margin = new Padding(0, 12, 0, 0);
         layout.Controls.Add(performanceOptimization);
-        browserConversationVerification.Text = "允许浏览器伴侣自动进行真实对话验证（会发送并保留测试对话）";
-        browserConversationVerification.AutoSize = true;
-        browserConversationVerification.Checked = preferences.BrowserConversationVerification;
-        browserConversationVerification.Margin = new Padding(0, 7, 0, 0);
-        layout.Controls.Add(browserConversationVerification);
         var save = new Button { Text = "保存设置并开始守护", AutoSize = true, Height = 38,
             Padding = new Padding(14, 4, 14, 4), BackColor = Color.FromArgb(45, 120, 240), ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 16, 0, 0) };
@@ -125,7 +116,6 @@ public sealed class DetailsForm : Form
         }
         savePreferences(new UserPreferences { FirstRunComplete = true,
             AutomaticOptimization = performanceOptimization.Checked,
-            BrowserConversationVerification = browserConversationVerification.Checked,
             RequiredServices = selected });
         ShowSettings(false);
     }
@@ -160,9 +150,6 @@ public sealed class DetailsForm : Form
         ConfigureText(responseLabel, 9F, FontStyle.Bold, Color.FromArgb(45, 120, 90));
         responseLabel.Padding = new Padding(0, 0, 0, 5);
         layout.Controls.Add(responseLabel);
-        ConfigureText(browserStatusLabel, 9F, FontStyle.Regular, Color.FromArgb(74, 102, 143));
-        browserStatusLabel.Padding = new Padding(0, 0, 0, 5);
-        layout.Controls.Add(browserStatusLabel);
         ConfigureText(nextCheckLabel, 9F, FontStyle.Regular, Color.FromArgb(88, 101, 122));
         nextCheckLabel.Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         layout.Controls.Add(nextCheckLabel);
@@ -191,7 +178,6 @@ public sealed class DetailsForm : Form
         };
         buttons.Controls.Add(pauseButton);
         buttons.Controls.Add(ActionButton("恢复上一个节点", delegate { restorePrevious(); }));
-        buttons.Controls.Add(ActionButton("自动实测当前节点", delegate { startBrowserVerification(); }));
         buttons.Controls.Add(ActionButton("当前节点 ChatGPT 不可用", delegate { ReportCurrentFailure(ServiceKind.ChatGPT); }));
         buttons.Controls.Add(ActionButton("当前节点 Gemini 不可用", delegate { ReportCurrentFailure(ServiceKind.Gemini); }));
         buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
@@ -212,8 +198,6 @@ public sealed class DetailsForm : Form
         nodeLabel.Text = view.NodeText;
         decisionLabel.Text = view.DecisionText;
         responseLabel.Text = view.ResponseText;
-        browserStatusLabel.Text = String.IsNullOrWhiteSpace(snapshot.BrowserStatusDetail)
-            ? "浏览器伴侣：尚未连接" : "浏览器伴侣：" + snapshot.BrowserStatusDetail;
         selectionLabel.Text = String.IsNullOrWhiteSpace(snapshot.SelectionReason) ? "" : "当前节点来源：" + snapshot.SelectionReason;
         nextCheckLabel.Text = "最近检测：" + (snapshot.CheckedUtc == DateTime.MinValue ? "尚未完成" : snapshot.CheckedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss")) +
             (snapshot.NextCheckUtc == DateTime.MaxValue ? "" : " · 下次检查：" + snapshot.NextCheckUtc.ToLocalTime().ToString("HH:mm:ss"));
