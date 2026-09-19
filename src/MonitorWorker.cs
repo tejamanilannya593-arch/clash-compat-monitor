@@ -49,6 +49,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly FailoverController controller;
     private readonly TrafficGuard trafficGuard;
     private readonly IProxyPathHealthChecker pathHealthChecker;
+    private readonly Func<RuntimeSnapshot> runtimeSnapshotProvider;
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
     private int accountCommandRunning;
@@ -77,6 +78,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
     public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock,
         IExitIdentityProbe exitIdentityProbe = null, IProxyPathHealthChecker pathHealthChecker = null)
+        : this(config, mihomo, probe, logger, clock, exitIdentityProbe, pathHealthChecker, null)
+    {
+    }
+
+    internal MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe,
+        BoundedLogger logger, IClock clock, IExitIdentityProbe exitIdentityProbe,
+        IProxyPathHealthChecker pathHealthChecker, Func<RuntimeSnapshot> runtimeSnapshotProvider)
     {
         this.config = config;
         this.mihomo = mihomo;
@@ -85,6 +93,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         this.logger = logger;
         this.clock = clock;
         this.pathHealthChecker = pathHealthChecker;
+        this.runtimeSnapshotProvider = runtimeSnapshotProvider ?? delegate { return RuntimeInspector.Capture(mihomo); };
         experienceStore = new ExperienceStore(Path.Combine(config.RootPath, "state", "experience.json"));
         experience = experienceStore.Load();
         regionEligibilityStore = new RegionEligibilityStore(
@@ -262,7 +271,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             cycleTimer = Stopwatch.StartNew();
             lastPreferences = preferences;
             Report("正在检查 Clash 连接与运行环境", null);
-            RuntimeSnapshot runtime = RuntimeInspector.Capture(mihomo);
+            RuntimeSnapshot runtime = runtimeSnapshotProvider();
             ConflictResult conflict = new ConflictDetector().Evaluate(runtime);
             if (conflict.Paused)
             {

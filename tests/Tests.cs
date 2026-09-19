@@ -75,6 +75,7 @@ internal static class Tests
         BoundedPipeBehavior();
         MihomoPipeIntegration();
         CompatibilityScanning();
+        FastFailoverWorkerOrchestration();
         ZLibraryWebBehavior();
         ZLibraryChoiceBehavior();
         DetailsTypographyBehavior();
@@ -1703,6 +1704,277 @@ internal static class Tests
         int beforeStop = probe.Calls.Count;
         Throws<OperationCanceledException>(() => scanner.ScanSelected(new CandidateNode("cancelled", 1), new[] { ServiceKind.Google }), "cancelled scan exits before probe");
         Equal(beforeStop, probe.Calls.Count, "cancelled scan sends no requests");
+    }
+
+    private static void FastFailoverWorkerOrchestration()
+    {
+        int originalWorkerThreads;
+        int originalIoThreads;
+        ThreadPool.GetMinThreads(out originalWorkerThreads, out originalIoThreads);
+        ThreadPool.SetMinThreads(Math.Max(originalWorkerThreads, 32), Math.Max(originalIoThreads, 32));
+        try
+        {
+            RunEligibleFastFailoverOrchestration();
+            RunEightCandidateFastFailoverBound();
+        }
+        finally
+        {
+            ThreadPool.SetMinThreads(originalWorkerThreads, originalIoThreads);
+        }
+    }
+
+    private static void RunEligibleFastFailoverOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-fast-worker-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 10)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            var probe = new OrchestratedServiceProbe(mihomo, true);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo, probe,
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 19, 8, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal(10, mihomo.DelayNodes(2500).Count,
+                "fast failover measures every alternative leaf with the 2500 ms delay budget");
+            Equal(10, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                "fast failover does not repeat the all-node delay round");
+            Equal(10, mihomo.AllDelayNodes().Count,
+                "successful fast failover performs no second delay round with another timeout");
+            Equal(10, mihomo.MaximumConcurrentDelayCalls,
+                "all alternative Mihomo delay checks run in the same concurrent round");
+            Equal("node-01,node-02,node-03",
+                String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "quick scans follow current live delay order and stop at three eligible candidates");
+            Equal("current,node-01,node-02",
+                String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(5))),
+                "winner full verification failure advances to the second ranked candidate");
+            Equal("node-02", mihomo.GetSelected("shared"),
+                "second ranked candidate is switched only after its full verification passes");
+            string log = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, log.Contains("fast selection delay_ms=") && log.Contains("checked=3 eligible=3"),
+                "fast selection orchestration records checked and eligible counts");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunEightCandidateFastFailoverBound()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-fast-bound-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 10)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedServiceProbe(mihomo, false),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 19, 9, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, true), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal(10, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                "unsupported exits still receive one concurrent all-node delay round");
+            Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08",
+                String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "fast failover checks at most eight low-delay candidates when none is region eligible");
+            Equal("current", mihomo.GetSelected("shared"),
+                "zero eligible quick scans never switch the shared group");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static MonitorConfiguration FastWorkerConfiguration(string root)
+    {
+        return new MonitorConfiguration {
+            RootPath = root,
+            StatePath = Path.Combine(root, "state", "health.state"),
+            QualityStatePath = Path.Combine(root, "state", "quality.state"),
+            SharedGroup = "shared",
+            GeneralGroup = "general",
+            ProbeGroup = "probe"
+        };
+    }
+
+    private sealed class OrchestratedScanEvent
+    {
+        private readonly object gate = new object();
+        private TimeSpan timeout;
+        public OrchestratedScanEvent(string node, int visit)
+        {
+            Node = node;
+            Visit = visit;
+        }
+        public string Node { get; private set; }
+        public int Visit { get; private set; }
+        public TimeSpan Timeout { get { lock (gate) return timeout; } }
+        public void ObserveTimeout(TimeSpan value) { lock (gate) timeout = value; }
+    }
+
+    private sealed class OrchestratedMihomo : IMihomoClient
+    {
+        private readonly object gate = new object();
+        private readonly string[] choices;
+        private readonly Dictionary<string, int> delays;
+        private readonly Dictionary<string, int> scanVisits = new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly List<OrchestratedScanEvent> scans = new List<OrchestratedScanEvent>();
+        private readonly List<KeyValuePair<string, int>> delayCalls = new List<KeyValuePair<string, int>>();
+        private readonly CountdownEvent delayEntries;
+        private string shared;
+        private string general;
+        private OrchestratedScanEvent activeScan;
+        private int activeDelayCalls;
+        private int maximumConcurrentDelayCalls;
+
+        public OrchestratedMihomo(string selected, IEnumerable<string> choices,
+            Dictionary<string, int> delays)
+        {
+            shared = selected;
+            general = selected;
+            this.choices = choices.ToArray();
+            this.delays = delays;
+            delayEntries = new CountdownEvent(delays.Count);
+        }
+
+        public int MaximumConcurrentDelayCalls
+        {
+            get { lock (gate) return maximumConcurrentDelayCalls; }
+        }
+
+        public string[] GetChoices(string groupName) { return choices.ToArray(); }
+
+        public string GetSelected(string groupName)
+        {
+            lock (gate)
+            {
+                if (groupName == "shared") return shared;
+                if (groupName == "general") return general;
+                return activeScan == null ? "" : activeScan.Node;
+            }
+        }
+
+        public void Select(string groupName, string proxyName)
+        {
+            lock (gate)
+            {
+                if (groupName == "shared") { shared = proxyName; return; }
+                if (groupName == "general") { general = proxyName; return; }
+                int visits;
+                scanVisits.TryGetValue(proxyName, out visits);
+                scanVisits[proxyName] = visits + 1;
+                activeScan = new OrchestratedScanEvent(proxyName, visits + 1);
+                scans.Add(activeScan);
+            }
+        }
+
+        public int GetDelay(string proxyName, string url, int timeoutMilliseconds)
+        {
+            bool concurrentRound = timeoutMilliseconds == 2500;
+            if (concurrentRound)
+            {
+                lock (gate)
+                {
+                    delayCalls.Add(new KeyValuePair<string, int>(proxyName, timeoutMilliseconds));
+                    activeDelayCalls++;
+                    maximumConcurrentDelayCalls = Math.Max(maximumConcurrentDelayCalls, activeDelayCalls);
+                }
+                delayEntries.Signal();
+                delayEntries.Wait(TimeSpan.FromSeconds(3));
+                lock (gate) activeDelayCalls--;
+            }
+            else lock (gate) delayCalls.Add(new KeyValuePair<string, int>(proxyName, timeoutMilliseconds));
+            int delay;
+            return delays.TryGetValue(proxyName, out delay) ? delay : Int32.MaxValue;
+        }
+
+        public bool IsRuntimeIpv6Enabled() { return false; }
+        public bool IsAvailable() { return true; }
+
+        public OrchestratedScanEvent ActiveScan()
+        {
+            lock (gate) return activeScan;
+        }
+
+        public List<string> DelayNodes(int timeoutMilliseconds)
+        {
+            lock (gate) return delayCalls.Where(x => x.Value == timeoutMilliseconds).Select(x => x.Key).ToList();
+        }
+
+        public List<string> AllDelayNodes()
+        {
+            lock (gate) return delayCalls.Select(x => x.Key).ToList();
+        }
+
+        public List<string> ScanNodes(TimeSpan timeout)
+        {
+            lock (gate) return scans.Where(x => x.Timeout == timeout).Select(x => x.Node).ToList();
+        }
+    }
+
+    private sealed class OrchestratedServiceProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly bool failFirstFullWinner;
+        public OrchestratedServiceProbe(OrchestratedMihomo mihomo, bool failFirstFullWinner)
+        {
+            this.mihomo = mihomo;
+            this.failFirstFullWinner = failFirstFullWinner;
+        }
+
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            if (scan.Node == "current" && service == ServiceKind.ChatGPT)
+                return ProbeResult.ServiceFailure("current failed", 900);
+            if (failFirstFullWinner && scan.Node == "node-01" && scan.Visit == 2 &&
+                service == ServiceKind.GitHub)
+                return ProbeResult.ServiceFailure("winner full verification failed", 100);
+            int number;
+            if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 9;
+            return ProbeResult.Success(number * 100);
+        }
+    }
+
+    private sealed class OrchestratedExitIdentityProbe : IExitIdentityProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly bool unsupportedAlternatives;
+        public OrchestratedExitIdentityProbe(OrchestratedMihomo mihomo, bool unsupportedAlternatives)
+        {
+            this.mihomo = mihomo;
+            this.unsupportedAlternatives = unsupportedAlternatives;
+        }
+
+        public ExitIdentity Probe(TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            int number;
+            if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 999;
+            string country = unsupportedAlternatives && scan.Node != "current" ? "HK" : "JP";
+            return new ExitIdentity(((long)number + 10000).ToString("X64"), country, "ok");
+        }
     }
 
     private sealed class FakeProbe : IServiceProbe
