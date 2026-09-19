@@ -58,6 +58,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private UserPreferences lastPreferences = UserPreferences.Defaults();
     private readonly ExperienceStore experienceStore;
     private ExperienceData experience;
+    private readonly RegionEligibilityStore regionEligibilityStore;
+    private readonly RegionEligibilityCache regionEligibility;
     private bool firstCompletedCycle = true;
     public event Action<MonitorSnapshot> Progress;
     public Func<bool> ShouldStop { get; set; }
@@ -85,6 +87,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         this.pathHealthChecker = pathHealthChecker;
         experienceStore = new ExperienceStore(Path.Combine(config.RootPath, "state", "experience.json"));
         experience = experienceStore.Load();
+        regionEligibilityStore = new RegionEligibilityStore(
+            Path.Combine(config.RootPath, "state", "region-eligibility.json"));
+        regionEligibility = regionEligibilityStore.Load();
         if (experience.Assurance == null || experience.Assurance.Standbys == null) experience.Assurance = new ConnectionAssurance();
         controller = new FailoverController(clock, config.MinimumHold);
         trafficGuard = new TrafficGuard(clock, 3.0 * 1024 * 1024, TimeSpan.FromMinutes(5));
@@ -315,6 +320,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             Report("正在检测当前节点：" + current, null);
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, servicesToProbe);
+            RememberRegionEligibility(memoryScope, currentScan);
             currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
             bool selectorAlignmentChanged = !dryRun && FollowGeneralNode(currentScan);
             if (ProxyPathHealthPolicy.ShouldCheck(selectorAlignmentChanged) && pathHealthChecker != null && runtime.SystemProxy.Length > 0)
@@ -359,6 +365,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 {
                     Report("当前节点出现超时，正在快速确认 " + MonitorPresentation.ServiceLabel(failedService), currentEvidence);
                     confirmation = scanner.ScanSelected(currentCandidate, new[] { failedService });
+                    RememberRegionEligibility(memoryScope, confirmation);
                 }
                 currentFailureConfirmed = severeLatency ||
                     (confirmation.Health != CandidateHealth.Unknown && !ConnectionAssurance.Passed(confirmation));
@@ -368,6 +375,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 {
                     var incidentChecks = new List<CandidateScanResult>();
                     List<CandidateNode> delayPool = candidates.Where(x => x.Name != current).ToList();
+                    Stopwatch delayTimer = Stopwatch.StartNew();
                     List<Task<KeyValuePair<string, int>>> delayTasks = delayPool.Select(candidate =>
                         Task.Factory.StartNew(() => {
                             try { return new KeyValuePair<string, int>(candidate.Name,
@@ -377,60 +385,61 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             catch (ArgumentException) { return new KeyValuePair<string, int>(candidate.Name, Int32.MaxValue); }
                         })).ToList();
                     Task.WaitAll(delayTasks.Cast<Task>().ToArray());
+                    delayTimer.Stop();
                     var rescueDelays = delayTasks.Select(x => x.Result).ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal);
-                    string[] liveRanked = StartupRecovery.RankFastCandidates(delayPool, rescueDelays, current, 15);
-                    string[] fastCandidates = StartupRecovery.OrderFastCandidates(
-                        liveRanked,
-                        assurance.Available(candidates.Select(x => x.Name), current, clock.UtcNow),
-                        state.Records.Values
-                            .Where(x => x.Name != current && ServiceEvidencePolicy.CanHold(new CandidateScanResult(x.Name, x.Health, null, "history")))
-                            .OrderByDescending(x => x.CheckedUtc).Select(x => x.Name),
-                        experience.Recommend(memoryScope, candidates.Select(x => x.Name), clock.UtcNow).Select(x => x.Node),
-                        candidates.Select(x => x.Name), current, 15);
+                    string[] liveRanked = StartupRecovery.RankFastCandidates(
+                        delayPool, rescueDelays, current, Int32.MaxValue);
                     ServiceKind[] fastServices = StartupRecovery.FastProbeServices(requiredServices, failedService);
+                    ServiceKind[] fullFailoverServices = StartupRecovery.FullFailoverProbeServices(
+                        servicesToProbe, failedService);
                     var quickScans = new List<CandidateScanResult>();
                     int comparedCandidates = 0;
-                    foreach (string standby in fastCandidates)
+                    foreach (string standby in liveRanked)
                     {
+                        if (StartupRecovery.ShouldStopAfterCheckedCandidates(comparedCandidates)) break;
                         Report("正在比较低延迟候选：" + standby, currentEvidence);
                         CandidateNode standbyCandidate = candidates.FirstOrDefault(x => x.Name == standby);
                         if (standbyCandidate != null)
                         {
                             CandidateScanResult quickScan = scanner.ScanSelected(standbyCandidate, fastServices,
                                 TimeSpan.FromSeconds(2));
+                            RememberRegionEligibility(memoryScope, quickScan);
                             incidentChecks.Add(quickScan);
                             scans[standby] = quickScan;
                             scanTimes[standby] = clock.UtcNow;
-                            if (ServiceEvidencePolicy.CanFastFailoverTarget(quickScan, failedService)) quickScans.Add(quickScan);
+                            if (StartupRecovery.IsEligibleQuickScan(quickScan, failedService)) quickScans.Add(quickScan);
                             comparedCandidates++;
-                            double bestQuickResponse = quickScans.Count == 0 ? 5000 :
-                                quickScans.Min(x => QualityMeasurement.ResponseMilliseconds(x, 5000));
-                            if (StartupRecovery.ShouldStopFastComparison(comparedCandidates, quickScans.Count,
-                                bestQuickResponse)) break;
+                            if (StartupRecovery.ShouldStopAfterEligibleCandidates(quickScans.Count)) break;
                         }
                     }
                     string[] verifiedTargets = StartupRecovery.RankVerifiedFastTargets(quickScans, rescueDelays, failedService);
-                    logger.Write("fast comparison checked=" + comparedCandidates + " qualified=" + verifiedTargets.Length);
-                    foreach (string standby in verifiedTargets)
+                    double selectedResponseForLog = -1;
+                    var fullValidationAttempts = new HashSet<string>(StringComparer.Ordinal);
+                    while (true)
                     {
+                        string standby = StartupRecovery.NextFullValidationTarget(
+                            verifiedTargets, fullValidationAttempts);
+                        if (standby == null) break;
+                        fullValidationAttempts.Add(standby);
                         CandidateNode standbyCandidate = candidates.First(x => x.Name == standby);
-                        CandidateScanResult replacementScan = quickScans.First(x => x.Name == standby);
-                        if (servicesToProbe.Any(x => !replacementScan.ServiceResults.ContainsKey(x)))
-                        {
-                            Report("最优候选正在完成切换前验证：" + standby, currentEvidence);
-                            replacementScan = scanner.ScanSelected(standbyCandidate, servicesToProbe);
-                            scans[standby] = replacementScan;
-                            scanTimes[standby] = clock.UtcNow;
-                        }
-                        if (!ServiceEvidencePolicy.CanFastFailoverTarget(replacementScan, failedService)) continue;
+                        Report("候选正在完成切换前验证：" + standby, currentEvidence);
+                        CandidateScanResult replacementScan = scanner.ScanSelected(
+                            standbyCandidate, fullFailoverServices);
+                        RememberRegionEligibility(memoryScope, replacementScan);
+                        scans[standby] = replacementScan;
+                        scanTimes[standby] = clock.UtcNow;
+                        if (!StartupRecovery.IsEligibleQuickScan(replacementScan, failedService)) continue;
                         if (dryRun || !String.Equals(mihomo.GetSelected(config.SharedGroup), failedNode, StringComparison.Ordinal)) continue;
 
                         if (!severeLatency && (failedService == ServiceKind.ChatGPT || failedService == ServiceKind.Gemini))
                             AccountVerificationMemory.Revoke(experience, memoryScope, failedNode, failedService,
                                 clock.UtcNow, "confirmed service failure");
                         bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(replacementScan);
-                        string fastReason = severeLatency ? "当前节点单项响应超过 2000 ms，实测最优备用节点验证通过" :
-                            "当前节点故障，实测最优备用节点验证通过，快速切换";
+                        double selectedResponse = QualityMeasurement.ResponseMilliseconds(replacementScan, 5000);
+                        selectedResponseForLog = selectedResponse;
+                        string fastSelectionSummary = StartupRecovery.FastSelectionSummary(selectedResponse);
+                        string fastReason = severeLatency ? "当前节点单项响应超过 2000 ms，" + fastSelectionSummary + "完整验证通过" :
+                            "当前节点故障，" + fastSelectionSummary + "完整验证通过，快速切换";
                         SelectRecorded(failedNode, standby, fastReason);
                         assurance.Begin(failedNode, standby, failedNodeResponse, false, provisional, clock.UtcNow);
                         previousSelectedNode = failedNode;
@@ -442,13 +451,17 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         currentFailureConfirmed = false;
                         fastSwitched = true;
                         observing = true;
-                        assuranceDecision = severeLatency ? "当前节点单项响应过慢，已切换到实测最优备用节点" :
-                            "当前节点故障，已切换到实测最优备用节点";
+                        assuranceDecision = severeLatency ? "当前节点单项响应过慢，已切换到" + fastSelectionSummary :
+                            "当前节点故障，已切换到" + fastSelectionSummary;
                         logger.Write("fast failover switched from=" + SafeName(failedNode) + " to=" + SafeName(standby) +
                             " failed_service=" + failedService + " target_health=" + replacementScan.Health +
-                            " response_ms=" + QualityMeasurement.ResponseMilliseconds(replacementScan, 5000).ToString("F0"));
+                            " response_ms=" + selectedResponse.ToString("F0"));
                         break;
                     }
+                    logger.Write("fast selection delay_ms=" + delayTimer.ElapsedMilliseconds +
+                        " checked=" + comparedCandidates + " eligible=" + verifiedTargets.Length +
+                        " selected_response_ms=" + selectedResponseForLog.ToString("F0",
+                            System.Globalization.CultureInfo.InvariantCulture));
                     if (!fastSwitched && !severeLatency && ServiceIncidentPolicy.HasConsensus(confirmation, incidentChecks, failedService))
                     {
                         ProbeFailureKind kind = ServiceIncidentPolicy.FailureKind(confirmation, failedService);
@@ -509,6 +522,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     {
                         var old = candidates.FirstOrDefault(x => x.Name == assurance.Previous);
                         CandidateScanResult oldScan = old == null ? null : scanner.ScanSelected(old, servicesToProbe);
+                        RememberRegionEligibility(memoryScope, oldScan);
                         if (ServiceEvidencePolicy.CanEmergencySwitch(oldScan) &&
                             (!ConnectionAssurance.Passed(currentScan) || QualityMeasurement.ResponseMilliseconds(oldScan, 5000) < QualityMeasurement.ResponseMilliseconds(currentScan, 5000) * 0.8) &&
                             mihomo.GetSelected(config.SharedGroup) == current)
@@ -570,6 +584,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 {
                     Report("正在复检备用节点：" + standby, currentEvidence);
                     CandidateScanResult standbyScan = scanner.ScanSelected(candidates.First(x => x.Name == standby), servicesToProbe);
+                    RememberRegionEligibility(memoryScope, standbyScan);
                     scans[standby] = standbyScan;
                     scanTimes[standby] = clock.UtcNow;
                     if (suppressedServices.Count == 0) assurance.Remember(standbyScan, current, clock.UtcNow);
@@ -602,6 +617,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     if (!scans.TryGetValue(candidate.Name, out scan))
                     {
                         scan = scanner.ScanSelected(candidate, servicesToProbe);
+                        RememberRegionEligibility(memoryScope, scan);
                         scanTimes[candidate.Name] = clock.UtcNow;
                     }
                     scans[candidate.Name] = scan;
@@ -749,6 +765,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     {
                         Report("切换前正在复检目标节点：" + best.Key, currentEvidence);
                         finalScan = scanner.ScanSelected(candidates.First(x => x.Name == best.Key), servicesToProbe);
+                        RememberRegionEligibility(memoryScope, finalScan);
                         scans[best.Key] = finalScan;
                         scanTimes[best.Key] = clock.UtcNow;
                     }
@@ -831,10 +848,32 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         }
         finally
         {
+            SaveRegionEligibility();
             cycleTimer = null;
             System.Threading.Volatile.Write(ref running, 0);
             MemoryTrimmer.TrimIdleWorkingSet();
         }
+    }
+
+    private void RememberRegionEligibility(string scope, CandidateScanResult scan)
+    {
+        if (scan == null) return;
+        regionEligibility.TryRemember(scope, scan.Name, scan.ExitFingerprint,
+            scan.ExitCountryCode, clock.UtcNow);
+    }
+
+    private void SaveRegionEligibility()
+    {
+        try { regionEligibilityStore.Save(regionEligibility); }
+        catch (IOException ex) { LogRegionEligibilitySaveFailure(ex); }
+        catch (UnauthorizedAccessException ex) { LogRegionEligibilitySaveFailure(ex); }
+        catch (ArgumentException ex) { LogRegionEligibilitySaveFailure(ex); }
+    }
+
+    private void LogRegionEligibilitySaveFailure(Exception error)
+    {
+        try { logger.Write("region eligibility save failed " + error.GetType().Name); }
+        catch { }
     }
 
     private void SelectRecorded(string from, string to, string reason)

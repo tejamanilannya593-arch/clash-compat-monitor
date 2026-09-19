@@ -71,19 +71,57 @@ public static class StartupRecovery
     public static ServiceKind[] FastProbeServices(System.Collections.Generic.IEnumerable<ServiceKind> required,
         ServiceKind failedService)
     {
-        return (required ?? new ServiceKind[0]).Where(x =>
-                x != ServiceKind.SteamStore && x != ServiceKind.SteamCommunity && x != ServiceKind.SteamApi)
+        return new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google, ServiceKind.GitHub }
             .Concat(new[] { failedService }).Distinct().ToArray();
+    }
+
+    public static ServiceKind[] FullFailoverProbeServices(
+        System.Collections.Generic.IEnumerable<ServiceKind> required, ServiceKind failedService)
+    {
+        return FastProbeServices(required, failedService)
+            .Concat(required ?? new ServiceKind[0]).Distinct().ToArray();
     }
 
     public static string[] RankVerifiedFastTargets(System.Collections.Generic.IEnumerable<CandidateScanResult> scans,
         System.Collections.Generic.IDictionary<string, int> delays, ServiceKind failedService)
     {
         return (scans ?? new CandidateScanResult[0])
-            .Where(x => ServiceEvidencePolicy.CanFastFailoverTarget(x, failedService))
+            .Where(x => IsEligibleQuickScan(x, failedService))
             .OrderBy(x => QualityMeasurement.ResponseMilliseconds(x, 5000))
             .ThenBy(x => delays != null && delays.ContainsKey(x.Name) ? delays[x.Name] : Int32.MaxValue)
             .Select(x => x.Name).ToArray();
+    }
+
+    public static bool IsEligibleQuickScan(CandidateScanResult scan, ServiceKind failedService)
+    {
+        return scan != null && AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) &&
+            ServiceEvidencePolicy.CanFastFailoverTarget(scan, failedService);
+    }
+
+    public static bool ShouldStopAfterEligibleCandidates(int eligibleCandidates)
+    {
+        return eligibleCandidates >= 3;
+    }
+
+    public static bool ShouldStopAfterCheckedCandidates(int checkedCandidates)
+    {
+        return checkedCandidates >= 8;
+    }
+
+    public static string FastSelectionSummary(double responseMilliseconds)
+    {
+        return responseMilliseconds <= 800 ? "实测优质节点" :
+            "当前合格候选中延迟最低，但未达到 800 ms 优质标准";
+    }
+
+    public static string NextFullValidationTarget(
+        System.Collections.Generic.IEnumerable<string> rankedTargets,
+        System.Collections.Generic.IEnumerable<string> attemptedTargets)
+    {
+        var attempted = new System.Collections.Generic.HashSet<string>(
+            attemptedTargets ?? new string[0], StringComparer.Ordinal);
+        return (rankedTargets ?? new string[0])
+            .FirstOrDefault(x => !String.IsNullOrWhiteSpace(x) && !attempted.Contains(x));
     }
 
     public static string[] OrderFastCandidates(

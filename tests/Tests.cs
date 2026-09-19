@@ -153,6 +153,10 @@ internal static class Tests
             "region cache rejects a non-hex exit fingerprint");
         Throws<ArgumentException>(() => cache.Remember("scope-a", "lower-hash", new string('a', 64), "JP", now),
             "region cache rejects a lowercase exit fingerprint");
+        Equal(false, cache.TryRemember("scope-a", "unknown-exit", "test-fingerprint", "JP", now),
+            "region cache safely ignores a non-canonical fingerprint");
+        Equal(false, cache.Records.Any(x => x.Node == "unknown-exit"),
+            "non-canonical fingerprint is never retained for persistence");
 
         var bounded = new RegionEligibilityCache();
         for (int i = 0; i < 300; i++)
@@ -167,6 +171,13 @@ internal static class Tests
         try
         {
             string path = Path.Combine(directory, "region-eligibility.json");
+            string invalidOnlyPath = Path.Combine(directory, "invalid-only.json");
+            var invalidOnly = new RegionEligibilityCache();
+            Equal(false, invalidOnly.TryRemember("scope", "unknown", "test-fingerprint", "JP", now),
+                "invalid-only cache safely declines a fake fingerprint");
+            new RegionEligibilityStore(invalidOnlyPath).Save(invalidOnly);
+            Equal(false, File.Exists(invalidOnlyPath),
+                "invalid-only cache does not create a persistent file");
             string rawIp = "198.51.100.24";
             ExitIdentity identity = ExitIdentityParser.Parse("ip=" + rawIp + "\nloc=JP\n", new byte[] { 4, 5, 6 });
             var persisted = new RegionEligibilityCache();
@@ -1598,22 +1609,68 @@ internal static class Tests
                 ServiceKind.SteamStore, ServiceKind.SteamCommunity, ServiceKind.SteamApi }, ServiceKind.SteamApi);
         Equal("ChatGPT,Gemini,Google,GitHub,SteamApi", String.Join(",", criticalServices),
             "fast comparison skips duplicate Steam endpoints but keeps the failed service");
+        ServiceKind[] fixedCriticalServices = StartupRecovery.FastProbeServices(
+            new[] { ServiceKind.Discord, ServiceKind.ZLibraryWeb }, ServiceKind.GitHub);
+        Equal("ChatGPT,Gemini,Google,GitHub", String.Join(",", fixedCriticalServices),
+            "fast comparison always checks the four region-safe critical services");
+        ServiceKind[] fullFailoverServices = StartupRecovery.FullFailoverProbeServices(
+            new[] { ServiceKind.Discord, ServiceKind.ZLibraryWeb }, ServiceKind.GitHub);
+        Equal("ChatGPT,Gemini,Google,GitHub,Discord,ZLibraryWeb", String.Join(",", fullFailoverServices),
+            "full failover validation retains every selected service after the critical gate");
         var fasterTarget = new CandidateScanResult("fast", CandidateHealth.BasicCompatible, null, "ok", 800, 2,
             new Dictionary<ServiceKind, ProbeResult>
             {
                 { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 400) },
                 { ServiceKind.GitHub, ProbeResult.Success(400) }
-            });
+            }, 101L.ToString("X64"), "JP");
         var slowerTarget = new CandidateScanResult("slow", CandidateHealth.BasicCompatible, null, "ok", 1400, 2,
             new Dictionary<ServiceKind, ProbeResult>
             {
                 { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 700) },
                 { ServiceKind.GitHub, ProbeResult.Success(700) }
-            });
+            }, 102L.ToString("X64"), "JP");
         string[] verifiedOrder = StartupRecovery.RankVerifiedFastTargets(
             new[] { slowerTarget, fasterTarget }, new Dictionary<string, int> { { "slow", 80 }, { "fast", 120 } },
             ServiceKind.ChatGPT);
         Equal("fast", verifiedOrder[0], "real service response outranks a lower synthetic delay");
+        Equal(2, verifiedOrder.Length, "one or two eligible candidates are still ranked for failover");
+        var unsupportedFastTarget = new CandidateScanResult("unsupported", CandidateHealth.BasicCompatible, null,
+            "ok", 200, 1,
+            new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 200) } },
+            103L.ToString("X64"), "HK");
+        Equal(false, StartupRecovery.IsEligibleQuickScan(unsupportedFastTarget, ServiceKind.ChatGPT),
+            "only actual shared-region candidates count as eligible");
+        Equal(true, StartupRecovery.ShouldStopAfterEligibleCandidates(3),
+            "fast selection stops after three eligible candidates");
+        Equal(false, StartupRecovery.ShouldStopAfterEligibleCandidates(2),
+            "fast selection continues with only two eligible candidates");
+        Equal(false, StartupRecovery.ShouldStopAfterCheckedCandidates(7),
+            "fast selection may inspect seven unsupported low-delay candidates");
+        Equal(true, StartupRecovery.ShouldStopAfterCheckedCandidates(8),
+            "fast selection checks at most eight low-delay candidates");
+        Equal("实测优质节点", StartupRecovery.FastSelectionSummary(800),
+            "800 ms target is labeled preferred");
+        Equal("当前合格候选中延迟最低，但未达到 800 ms 优质标准",
+            StartupRecovery.FastSelectionSummary(801),
+            "over-800 ms target is not mislabeled as preferred");
+        var middleTarget = new CandidateScanResult("middle", CandidateHealth.BasicCompatible, null, "ok", 1000, 2,
+            new Dictionary<ServiceKind, ProbeResult>
+            {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 500) },
+                { ServiceKind.GitHub, ProbeResult.Success(500) }
+            }, 104L.ToString("X64"), "JP");
+        string[] fullValidationOrder = StartupRecovery.RankVerifiedFastTargets(
+            new[] { slowerTarget, middleTarget, fasterTarget },
+            new Dictionary<string, int> { { "slow", 50 }, { "middle", 70 }, { "fast", 90 } },
+            ServiceKind.ChatGPT);
+        Equal("fast,middle,slow", String.Join(",", fullValidationOrder),
+            "full validation ranks every fallback after the winner");
+        var attemptedFullTargets = new HashSet<string>(StringComparer.Ordinal);
+        string firstFullTarget = StartupRecovery.NextFullValidationTarget(fullValidationOrder, attemptedFullTargets);
+        attemptedFullTargets.Add(firstFullTarget);
+        string secondFullTarget = StartupRecovery.NextFullValidationTarget(fullValidationOrder, attemptedFullTargets);
+        Equal("fast", firstFullTarget, "full validation starts with the real-service winner");
+        Equal("middle", secondFullTarget, "failed winner advances to the second ranked target");
         Equal(false, StartupRecovery.ShouldStopFastComparison(5, 0, 5000), "comparison expands when the first five have no usable target");
         Equal(false, StartupRecovery.ShouldStopFastComparison(5, 2, 1200), "comparison keeps looking when two targets are merely usable");
         Equal(true, StartupRecovery.ShouldStopFastComparison(5, 2, 700), "comparison stops after two targets include a genuinely fast option");

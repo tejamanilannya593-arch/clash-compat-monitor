@@ -67,6 +67,19 @@ public sealed class RegionEligibilityCache
         Records = Records.OrderByDescending(x => x.CheckedUtc).Take(256).ToList();
     }
 
+    public bool TryRemember(string scope, string node, string exitFingerprint, string countryCode, DateTime now)
+    {
+        if (!CanRemember(scope, node, exitFingerprint, countryCode)) return false;
+        Remember(scope, node, exitFingerprint, countryCode, now);
+        return true;
+    }
+
+    public static bool CanRemember(string scope, string node, string exitFingerprint, string countryCode)
+    {
+        return IsBoundedText(scope, MaxScopeLength) && IsBoundedText(node, MaxNodeLength) &&
+            IsCanonicalFingerprint(exitFingerprint) && IsCountryCode(countryCode);
+    }
+
     internal static bool IsValidRecord(RegionEligibilityRecord item, DateTime latestAllowedUtc)
     {
         return item != null && IsBoundedText(item.Scope, MaxScopeLength) &&
@@ -142,11 +155,12 @@ public sealed class RegionEligibilityStore
     {
         if (cache == null) throw new ArgumentNullException("cache");
         WithLock(delegate {
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
             DateTime latestAllowedUtc = DateTime.UtcNow.AddMinutes(5);
             cache.Records = (cache.Records ?? new List<RegionEligibilityRecord>())
                 .Where(x => RegionEligibilityCache.IsValidRecord(x, latestAllowedUtc))
                 .OrderByDescending(x => x.CheckedUtc).Take(256).ToList();
+            if (cache.Records.Count == 0 && !File.Exists(path)) return;
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
             string temporary = path + ".tmp-" + Guid.NewGuid().ToString("N");
             try
             {
