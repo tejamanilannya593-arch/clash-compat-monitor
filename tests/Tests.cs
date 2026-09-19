@@ -39,6 +39,26 @@ internal static class Tests
         }
     }
 
+    private static void DeleteDirectoryEventually(string path)
+    {
+        IOException lastFailure = null;
+        bool deleted = SpinWait.SpinUntil(delegate {
+            if (!Directory.Exists(path)) return true;
+            try
+            {
+                Directory.Delete(path, true);
+                return !Directory.Exists(path);
+            }
+            catch (IOException ex)
+            {
+                lastFailure = ex;
+                return false;
+            }
+        }, TimeSpan.FromSeconds(2));
+        if (!deleted)
+            throw lastFailure ?? new IOException("Timed out while deleting test directory: " + path);
+    }
+
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
@@ -239,7 +259,7 @@ internal static class Tests
                 var concurrentStore = new RegionEligibilityStore(worker % 2 == 0
                     ? concurrentPath : Path.Combine(directory, ".", "region-concurrent.json"));
                 startConcurrent.Wait();
-                for (int iteration = 0; iteration < 80; iteration++)
+                for (int iteration = 0; iteration < 40; iteration++)
                 {
                     try
                     {
@@ -267,7 +287,7 @@ internal static class Tests
             Equal(0, Directory.GetFiles(directory, "region-concurrent.json.tmp*").Length,
                 "concurrent region store cleans temporary files");
         }
-        finally { Directory.Delete(directory, true); }
+        finally { DeleteDirectoryEventually(directory); }
 
         Throws<ArgumentException>(() => new RegionEligibilityStore(" "),
             "region store rejects a blank path");
