@@ -1614,6 +1614,24 @@ internal static class Tests
             });
         Equal(ServiceKind.GitHub, StartupRecovery.FastFailoverService(severeLatency).Value,
             "one severely slow selected service enters fast replacement");
+        Equal(true, StartupRecovery.RequiresRepeatConfirmation(severeLatency),
+            "severe latency is confirmed once before candidate discovery");
+        Equal(false, StartupRecovery.ConfirmsSevereLatency(
+            new CandidateScanResult("x", CandidateHealth.Compatible, null, "recovered", 500, 1,
+                new Dictionary<ServiceKind, ProbeResult> {
+                    { ServiceKind.GitHub, ProbeResult.Success(500) }
+                }), ServiceKind.GitHub),
+            "recovered retry does not confirm severe latency");
+        Equal(true, StartupRecovery.ConfirmsSevereLatency(
+            new CandidateScanResult("x", CandidateHealth.Compatible, null, "still slow", 2100, 1,
+                new Dictionary<ServiceKind, ProbeResult> {
+                    { ServiceKind.GitHub, ProbeResult.Success(2100) }
+                }), ServiceKind.GitHub),
+            "repeated response above two seconds confirms severe latency");
+        Equal(false, StartupRecovery.ConfirmsSevereLatency(
+            new CandidateScanResult("x", CandidateHealth.Unknown, null, "unknown"),
+            ServiceKind.GitHub),
+            "unknown retry cannot manufacture confirmed degradation");
         var boundaryLatency = new CandidateScanResult("x", CandidateHealth.Compatible, null, "boundary", 2300, 2,
             new Dictionary<ServiceKind, ProbeResult>
             {

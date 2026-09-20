@@ -12,7 +12,19 @@ public static class StartupRecovery
 
     public static bool RequiresRepeatConfirmation(CandidateScanResult scan)
     {
-        return scan != null && scan.Health == CandidateHealth.Transient;
+        return scan != null && (scan.Health == CandidateHealth.Transient ||
+            QualityPolicy.SeverelySlowService(scan).HasValue);
+    }
+
+    public static bool ConfirmsSevereLatency(CandidateScanResult confirmation, ServiceKind service)
+    {
+        if (confirmation == null || confirmation.Health == CandidateHealth.Unknown ||
+            confirmation.ServiceResults == null) return false;
+        ProbeResult result;
+        if (!confirmation.ServiceResults.TryGetValue(service, out result) || result == null ||
+            result.FailureKind == ProbeFailureKind.Unverified) return false;
+        return !result.Passed ||
+            result.ElapsedMilliseconds > QualityPolicy.SevereServiceResponseMilliseconds;
     }
 
     public static ServiceKind? FastFailoverService(CandidateScanResult scan)
