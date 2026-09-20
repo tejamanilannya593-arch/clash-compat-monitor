@@ -183,7 +183,7 @@ Run:
 & .\build.ps1
 node .\clash\enhancement.test.js
 node .\clash\pure-clash.test.js
-& .\Release.Tests.ps1
+& .\tests\Release.Tests.ps1
 git diff --check
 ```
 

@@ -383,8 +383,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     confirmation = scanner.ScanSelected(currentCandidate, new[] { failedService });
                     RememberRegionEligibility(memoryScope, confirmation);
                 }
-                currentFailureConfirmed = severeLatency ||
-                    (confirmation.Health != CandidateHealth.Unknown && !ConnectionAssurance.Passed(confirmation));
+                currentFailureConfirmed = severeLatency
+                    ? StartupRecovery.ConfirmsSevereLatency(confirmation, failedService)
+                    : confirmation.Health != CandidateHealth.Unknown && !ConnectionAssurance.Passed(confirmation);
                 logger.Write("current failure confirmation node=" + SafeName(current) + " service=" + failedService +
                     " health=" + confirmation.Health + " confirmed=" + currentFailureConfirmed.ToString().ToLowerInvariant());
                 if (currentFailureConfirmed)

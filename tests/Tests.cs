@@ -1758,6 +1758,8 @@ internal static class Tests
         ThreadPool.SetMinThreads(Math.Max(originalWorkerThreads, 32), Math.Max(originalIoThreads, 32));
         try
         {
+            RunRecoveredSevereLatencyOrchestration();
+            RunConfirmedSevereLatencyOrchestration();
             RunEligibleFastFailoverOrchestration();
             RunEightCandidateFastFailoverBound();
             RunAutomaticOpportunityOrchestration();
@@ -1768,6 +1770,77 @@ internal static class Tests
         finally
         {
             ThreadPool.SetMinThreads(originalWorkerThreads, originalIoThreads);
+        }
+    }
+
+    private static void RunRecoveredSevereLatencyOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-latency-recovery-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 3)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var probe = new SevereLatencyProbe(mihomo, 500);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo, probe,
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 20, 16, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal(2, probe.CurrentChatGptCalls,
+                "severe latency receives one focused current-node retry");
+            Equal(0, mihomo.DelayNodes(2500).Count,
+                "recovered retry avoids the all-node delay round");
+            Equal("current", mihomo.GetSelected("shared"),
+                "recovered retry keeps the current node");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunConfirmedSevereLatencyOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-latency-confirmed-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 3)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var probe = new SevereLatencyProbe(mihomo, 2100);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo, probe,
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 20, 16, 5, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal(2, probe.CurrentChatGptCalls,
+                "repeated severe latency performs one focused confirmation");
+            Equal(alternatives.Length, mihomo.DelayNodes(2500).Count,
+                "confirmed severe latency performs one all-node delay round");
+            Equal(alternatives.Length,
+                mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                "confirmed severe latency never repeats the all-node delay round");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "confirmed severe latency may switch after complete target validation");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
         }
     }
 
@@ -2286,6 +2359,34 @@ internal static class Tests
             int number;
             if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 9;
             return ProbeResult.Success(number * 100);
+        }
+    }
+
+    private sealed class SevereLatencyProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly long retryMilliseconds;
+        private int currentChatGptCalls;
+
+        public SevereLatencyProbe(OrchestratedMihomo mihomo, long retryMilliseconds)
+        {
+            this.mihomo = mihomo;
+            this.retryMilliseconds = retryMilliseconds;
+        }
+
+        public int CurrentChatGptCalls { get { return currentChatGptCalls; } }
+
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current" && service == ServiceKind.ChatGPT)
+            {
+                int call = Interlocked.Increment(ref currentChatGptCalls);
+                return ProbeResult.Success(call == 1 ? 2100 : retryMilliseconds);
+            }
+            return ProbeResult.Success(300);
         }
     }
 
