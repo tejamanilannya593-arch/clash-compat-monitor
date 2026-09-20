@@ -92,6 +92,17 @@ public static class StartupRecovery
             .Select(x => x.Name).ToArray();
     }
 
+    public static string[] RankPerformanceComparableTargets(
+        System.Collections.Generic.IEnumerable<CandidateScanResult> scans,
+        System.Collections.Generic.IDictionary<string, int> delays)
+    {
+        return (scans ?? new CandidateScanResult[0])
+            .OrderBy(x => QualityMeasurement.ResponseMilliseconds(x, 5000))
+            .ThenBy(x => delays != null && delays.ContainsKey(x.Name) ? delays[x.Name] : Int32.MaxValue)
+            .ThenBy(x => x.Name, StringComparer.Ordinal)
+            .Select(x => x.Name).ToArray();
+    }
+
     public static bool IsEligibleQuickScan(CandidateScanResult scan, ServiceKind failedService)
     {
         return scan != null && AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) &&

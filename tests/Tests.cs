@@ -1742,6 +1742,7 @@ internal static class Tests
         {
             RunEligibleFastFailoverOrchestration();
             RunEightCandidateFastFailoverBound();
+            RunAutomaticOpportunityOrchestration();
             RunActiveCircuitAutomaticFailover();
             RunConsensusCircuitDoesNotAttributeNodeFailure();
             RunCircuitRollbackRechecksAllRequiredServices();
@@ -1749,6 +1750,78 @@ internal static class Tests
         finally
         {
             ThreadPool.SetMinThreads(originalWorkerThreads, originalIoThreads);
+        }
+    }
+
+    private static void RunAutomaticOpportunityOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-opportunity-worker-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 20, 12, 0, 0, DateTimeKind.Utc);
+            string[] alternatives = Enumerable.Range(1, 6).Select(x => "node-" + x.ToString("D2")).ToArray();
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            var persisted = new ExperienceData {
+                ActiveScope = scope,
+                ActiveServicesKey = servicesKey,
+                ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                LastNode = "current",
+                Assurance = new ConnectionAssurance { Scope = scope, Standbys = new List<StandbyNode>() },
+                Nodes = new List<NodeExperience> {
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-3),
+                        LastUtc = now.AddMinutes(-1), Samples = 3, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, delays);
+            var clock = new FakeClock { UtcNow = now };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OpportunityServiceProbe(mihomo),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024), clock,
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot discovery = worker.Run(preferences);
+
+            Equal(alternatives.Length, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                "scheduled opportunity scan measures every alternative once");
+            Equal("node-01,node-02,node-03", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "scheduled opportunity scan stops after three comparable candidates");
+            Equal("current", mihomo.GetSelected("shared"),
+                "first opportunity scan prepares a target without switching");
+            ExperienceData afterDiscovery = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal("node-01", afterDiscovery.Assurance.PendingOptimization.Target,
+                "best real-service target is persisted for confirmation");
+            Equal(TimeSpan.FromSeconds(30), discovery.NextCheckUtc - discovery.CheckedUtc,
+                "pending target schedules a thirty-second confirmation");
+
+            int delayCount = mihomo.DelayNodes(2500).Count;
+            clock.UtcNow = now.AddSeconds(30);
+            MonitorSnapshot confirmation = worker.Run(preferences);
+
+            Equal(delayCount, mihomo.DelayNodes(2500).Count,
+                "confirmation performs no second all-node delay round");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "automatic confirmation switches the materially faster target");
+            ExperienceData afterConfirmation = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal("node-01", afterConfirmation.Assurance.Target,
+                "automatic optimization enters normal post-switch observation");
+            Equal<PendingOptimization>(null, afterConfirmation.Assurance.PendingOptimization,
+                "successful confirmation clears pending optimization");
+            Equal(TimeSpan.FromSeconds(30), confirmation.NextCheckUtc - confirmation.CheckedUtc,
+                "automatic switch keeps the observation interval");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
         }
     }
 
@@ -1768,6 +1841,20 @@ internal static class Tests
             "twenty percent faster target is material");
         Equal(false, OpportunityOptimizationPolicy.MateriallyBetter(1000, 801),
             "less than twenty percent is not material");
+        var pending = new PendingOptimization { Scope = "scope", Current = "current", Target = "target",
+            CreatedUtc = now.AddSeconds(-30) };
+        Equal(true, OpportunityOptimizationPolicy.IsFresh(pending, "scope", "current", now),
+            "matching pending target is fresh during confirmation window");
+        Equal(false, OpportunityOptimizationPolicy.IsFresh(pending, "scope", "manual", now),
+            "external selector change invalidates pending target");
+        Equal(false, OpportunityOptimizationPolicy.IsFresh(pending, "new-scope", "current", now),
+            "scope change invalidates pending target");
+        pending.CreatedUtc = now.AddMinutes(-2);
+        Equal(true, OpportunityOptimizationPolicy.IsFresh(pending, "scope", "current", now),
+            "pending target remains fresh at two-minute boundary");
+        pending.CreatedUtc = now.AddMinutes(-2).AddTicks(-1);
+        Equal(false, OpportunityOptimizationPolicy.IsFresh(pending, "scope", "current", now),
+            "pending target expires beyond two minutes");
 
         var required = new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google };
         var basic = new CandidateScanResult("basic", CandidateHealth.BasicCompatible, null, "reachable", 600, 3,
@@ -2204,6 +2291,25 @@ internal static class Tests
             if (failures.TryGetValue(scan.Node, out failed) && failed == service)
                 return ProbeResult.ServiceFailure("scripted service failure", 900);
             return ProbeResult.Success(100);
+        }
+    }
+
+    private sealed class OpportunityServiceProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        public OpportunityServiceProbe(OrchestratedMihomo mihomo) { this.mihomo = mihomo; }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current") return ProbeResult.Success(1000);
+            int number;
+            if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 9;
+            long elapsed = 100 + number * 50;
+            return service == ServiceKind.ChatGPT || service == ServiceKind.Gemini
+                ? ProbeResult.Partial("entry reachable", elapsed)
+                : ProbeResult.Success(elapsed);
         }
     }
 
