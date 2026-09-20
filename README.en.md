@@ -13,8 +13,8 @@ Clash Compatibility Monitor keeps a working node in place, performs conservative
 ## Why use it
 
 - Discovers actual leaf nodes from `proxies`, `proxy-providers`, and mixed subscription layouts without relying on region names.
-- Checks selected services including ChatGPT, Gemini, Google, GitHub, Steam, Discord, Spotify, and Epic.
-- The local v0.7.0-preview.4 build probes selected services concurrently and reports conservative P75 latency. On an explicit current-node failure it live-checks up to three replacements and switches to the first one that passes the failed service and the complete baseline, without waiting for a full quality-ranking round. This cannot guarantee account sign-in or AI generation and is not a formal GitHub release.
+- Always checks ChatGPT and Gemini together, with optional Google, GitHub, Steam, Discord, Spotify, Epic, and Z-Library web checks.
+- The local v0.7.0-preview.5 build treats ChatGPT and Gemini as a fixed core and admits candidates only when their actual exit is in the ChatGPT and Gemini official supported-region intersection. After an explicit current-node failure, all leaf-node Mihomo delays are measured concurrently; up to eight nodes are inspected in live-delay order, scanning stops after the three lowest-latency eligible candidates are found, and real-service P75 ranks the fully validated target and fallbacks. Healthy connections are checked automatically every 60 seconds, while failures and post-switch observation use 30-second intervals. This cannot guarantee account sign-in or AI generation and is not a formal GitHub release.
 - Requires five observations spanning at least 30 minutes with a success rate of 95% or higher before a performance-only switch.
 - Keeps two recent standbys, observes every automatic switch, and can safely roll back.
 - Does not modify Clash configuration files, take ownership of subscriptions, inspect browser history, or upload telemetry.
