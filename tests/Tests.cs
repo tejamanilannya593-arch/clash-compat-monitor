@@ -81,6 +81,7 @@ internal static class Tests
         DetailsTypographyBehavior();
         QualityScoringAndState();
         ThroughputAndTraffic();
+        OpportunityOptimizationBehavior();
         StabilityAndState();
         RuntimeGuards();
         SelectorFollowerBehavior();
@@ -1105,6 +1106,16 @@ internal static class Tests
         var restored = serializer.Deserialize<ConnectionAssurance>(serializer.Serialize(policy));
         Equal("b", restored.Target, "switch observation survives restart");
         Equal("a", restored.Previous, "rollback origin survives restart");
+        policy.Target = null;
+        policy.Previous = null;
+        policy.PendingOptimization = new PendingOptimization { Scope = "scope", Current = "b", Target = "c",
+            BaselineResponse = 1000, TargetResponse = 500, CreatedUtc = now };
+        policy.LastOpportunityScanUtc = now;
+        restored = serializer.Deserialize<ConnectionAssurance>(serializer.Serialize(policy));
+        Equal("c", restored.PendingOptimization.Target, "pending optimization survives restart");
+        Equal(null, restored.Target, "pending optimization is separate from switch observation");
+        restored.Begin("b", "c", 1000, true, false, now);
+        Equal(null, restored.PendingOptimization, "starting a real switch clears pending optimization");
     }
 
     private static void ServiceIncidentBehavior()
@@ -1739,6 +1750,40 @@ internal static class Tests
         {
             ThreadPool.SetMinThreads(originalWorkerThreads, originalIoThreads);
         }
+    }
+
+    private static void OpportunityOptimizationBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 20, 10, 0, 0, DateTimeKind.Utc);
+        Equal(true, OpportunityOptimizationPolicy.ShouldScan(true, false,
+            new[] { 900d, 850d, 801d }, DateTime.MinValue, now),
+            "slow current schedules automatic opportunity discovery");
+        Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
+            new[] { 900d, 800d, 700d }, DateTime.MinValue, now),
+            "good current does not schedule opportunity discovery");
+        Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
+            new[] { 900d, 850d, 801d }, now.AddMinutes(-2), now),
+            "opportunity discovery is limited to one round per three minutes");
+        Equal(true, OpportunityOptimizationPolicy.MateriallyBetter(1000, 800),
+            "twenty percent faster target is material");
+        Equal(false, OpportunityOptimizationPolicy.MateriallyBetter(1000, 801),
+            "less than twenty percent is not material");
+
+        var required = new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google };
+        var basic = new CandidateScanResult("basic", CandidateHealth.BasicCompatible, null, "reachable", 600, 3,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry reachable", 600) },
+                { ServiceKind.Gemini, ProbeResult.Partial("entry reachable", 500) },
+                { ServiceKind.Google, ProbeResult.Success(200) }
+            }, "0000000000000000000000000000000000000000000000000000000000000001", "JP");
+        Equal(true, OpportunityOptimizationPolicy.IsPerformanceComparable(basic, required),
+            "supported basic-compatible evidence can participate in proactive comparison");
+        Equal(false, OpportunityOptimizationPolicy.IsPerformanceComparable(basic, required.Concat(new[] { ServiceKind.GitHub })),
+            "proactive comparison requires every selected service");
+        var unsupported = new CandidateScanResult("hk", CandidateHealth.BasicCompatible, null, "reachable", 600, 3,
+            basic.ServiceResults, "0000000000000000000000000000000000000000000000000000000000000002", "HK");
+        Equal(false, OpportunityOptimizationPolicy.IsPerformanceComparable(unsupported, required),
+            "unsupported actual exit cannot participate in proactive comparison");
     }
 
     private static void RunEligibleFastFailoverOrchestration()

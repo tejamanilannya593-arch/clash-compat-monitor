@@ -24,13 +24,16 @@ public sealed class ConnectionAssurance
     public DateTime HoldUntilUtc { get; set; }
     public DateTime RefreshUtc { get; set; }
     public int StableCycles { get; set; }
+    public PendingOptimization PendingOptimization { get; set; }
+    public DateTime LastOpportunityScanUtc { get; set; }
     public ConnectionAssurance() { Standbys = new List<StandbyNode>(); }
     public static bool Passed(CandidateScanResult scan)
     { return ServiceEvidencePolicy.CanHold(scan); }
     public void SetScope(string scope)
     {
         if (Scope == scope) return;
-        Scope = scope; Standbys.Clear(); Target = null; Previous = null; StartedUtc = DateTime.MinValue; StableCycles = 0; RefreshUtc = DateTime.MinValue;
+        Scope = scope; Standbys.Clear(); Target = null; Previous = null; StartedUtc = DateTime.MinValue; StableCycles = 0;
+        RefreshUtc = DateTime.MinValue; PendingOptimization = null; LastOpportunityScanUtc = DateTime.MinValue;
     }
     public void Remember(CandidateScanResult scan, string current, DateTime now)
     {
@@ -45,7 +48,8 @@ public sealed class ConnectionAssurance
     }
     public void Begin(string previous, string target, double response, bool quality, bool provisional = false,
         DateTime? startedUtc = null)
-    { Previous = previous; Target = target; PreviousResponse = response; QualitySwitch = quality; ProvisionalSwitch = provisional; StartedUtc = startedUtc ?? DateTime.UtcNow; VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0; }
+    { Previous = previous; Target = target; PreviousResponse = response; QualitySwitch = quality; ProvisionalSwitch = provisional; StartedUtc = startedUtc ?? DateTime.UtcNow; VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0; PendingOptimization = null; }
+    public void ClearPendingOptimization() { PendingOptimization = null; }
     public bool CanUserFeedbackRollback(string current, DateTime now)
     {
         return !String.IsNullOrWhiteSpace(Previous) && String.Equals(Target, current, StringComparison.Ordinal) &&
