@@ -71,6 +71,6 @@ public sealed class ConnectionAssurance
     {
         StableCycles = Passed(scan) ? Math.Min(5, StableCycles + 1) : 0;
         if (!String.IsNullOrEmpty(Target) || !Passed(scan)) return TimeSpan.FromSeconds(30);
-        return TimeSpan.FromMinutes(StableCycles >= 3 ? 3 : 1);
+        return TimeSpan.FromMinutes(1);
     }
 }

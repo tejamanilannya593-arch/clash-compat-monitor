@@ -4,6 +4,38 @@ using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
 
+public static class ServiceTableLayout
+{
+    public static int[] ColumnWidths(int clientWidth, float dpiScale)
+    {
+        float scale = dpiScale > 0 ? dpiScale : 1F;
+        int available = Math.Max(0, clientWidth - (int)Math.Ceiling(20 * scale));
+        if (available == 0) return new[] { 0, 0, 0 };
+        int[] minimums = {
+            (int)Math.Ceiling(90 * scale),
+            (int)Math.Ceiling(180 * scale),
+            (int)Math.Ceiling(160 * scale)
+        };
+        int minimumTotal = minimums.Sum();
+        if (minimumTotal >= available)
+        {
+            int first = (int)Math.Floor(available * minimums[0] / (double)minimumTotal);
+            int second = (int)Math.Floor(available * minimums[1] / (double)minimumTotal);
+            int third = available - first - second;
+            return new[] { first, second, third };
+        }
+
+        int extra = available - minimumTotal;
+        int serviceExtra = (int)Math.Floor(extra * 0.15);
+        int statusExtra = (int)Math.Floor(extra * 0.35);
+        return new[] {
+            minimums[0] + serviceExtra,
+            minimums[1] + statusExtra,
+            minimums[2] + extra - serviceExtra - statusExtra
+        };
+    }
+}
+
 public sealed class DetailsForm : Form
 {
     private readonly Action<UserPreferences> savePreferences;
@@ -67,6 +99,7 @@ public sealed class DetailsForm : Form
 
     private void BuildSettings(UserPreferences preferences)
     {
+        preferences.RequiredServices = UserPreferencePolicy.NormalizeServices(preferences.RequiredServices);
         settingsPanel.Dock = DockStyle.Fill;
         settingsPanel.Padding = new Padding(28);
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown,
@@ -74,8 +107,8 @@ public sealed class DetailsForm : Form
         layout.Controls.Add(Heading("选择你长期需要使用的服务"));
         layout.Controls.Add(TextLabel("只需设置一次。程序会寻找同时兼容这些服务、长期稳定且综合体验更好的节点。"));
 
-        AddChoice(layout, "ChatGPT", new[] { ServiceKind.ChatGPT }, preferences);
-        AddChoice(layout, "Gemini", new[] { ServiceKind.Gemini }, preferences);
+        AddChoice(layout, "ChatGPT 与 Gemini（固定核心）",
+            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, preferences, false);
         AddChoice(layout, "Google", new[] { ServiceKind.Google }, preferences);
         AddChoice(layout, "GitHub", new[] { ServiceKind.GitHub }, preferences);
         AddChoice(layout, "Steam 商店、社区与 API", new[] { ServiceKind.SteamStore, ServiceKind.SteamCommunity, ServiceKind.SteamApi }, preferences);
@@ -98,10 +131,12 @@ public sealed class DetailsForm : Form
         settingsPanel.Controls.Add(layout);
     }
 
-    private void AddChoice(Control parent, string text, ServiceKind[] services, UserPreferences preferences)
+    private void AddChoice(Control parent, string text, ServiceKind[] services, UserPreferences preferences,
+        bool enabled = true)
     {
         var check = new CheckBox { Text = text, AutoSize = true, Checked = services.All(preferences.RequiredServices.Contains),
-            Padding = new Padding(4), Margin = new Padding(0, 7, 0, 0), Font = new Font(Font, FontStyle.Bold) };
+            Enabled = enabled, Padding = new Padding(4), Margin = new Padding(0, 7, 0, 0),
+            Font = new Font(Font, FontStyle.Bold) };
         choices.Add(new ServiceChoice(check, services));
         parent.Controls.Add(check);
     }
@@ -159,12 +194,14 @@ public sealed class DetailsForm : Form
         serviceList.FullRowSelect = true;
         serviceList.GridLines = true;
         serviceList.HeaderStyle = ColumnHeaderStyle.Nonclickable;
-        Size scaledColumns = ScaleForCurrentDpi(110, 270);
-        serviceList.Columns.Add("服务", scaledColumns.Width);
-        serviceList.Columns.Add("实测状态", scaledColumns.Height);
-        serviceList.Columns.Add("说明", ScaleForCurrentDpi(280, 0).Width);
+        serviceList.Columns.Add("服务", 1);
+        serviceList.Columns.Add("实测状态", 1);
+        serviceList.Columns.Add("说明", 1);
         serviceList.Dock = DockStyle.Fill;
         serviceList.Margin = new Padding(0, 12, 0, 12);
+        serviceList.ClientSizeChanged += delegate { ApplyServiceColumnLayout(); };
+        serviceList.FontChanged += delegate { ApplyServiceColumnLayout(); };
+        Resize += delegate { ApplyServiceColumnLayout(); };
         layout.Controls.Add(serviceList);
 
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
@@ -187,6 +224,15 @@ public sealed class DetailsForm : Form
         layout.Controls.Add(TextLabel("响应时间来自轻量 HTTP 探测，不代表网页渲染、AI 生成或游戏服务器延迟。"));
         layout.Controls.Add(ActionButton("退出节点守护", delegate { exitApplication(); }));
         statusPanel.Controls.Add(layout);
+    }
+
+    private void ApplyServiceColumnLayout()
+    {
+        if (serviceList.Columns.Count != 3 || serviceList.ClientSize.Width <= 0) return;
+        float scale;
+        using (var graphics = serviceList.CreateGraphics()) scale = graphics.DpiX / 96F;
+        int[] widths = ServiceTableLayout.ColumnWidths(serviceList.ClientSize.Width, scale);
+        for (int i = 0; i < widths.Length; i++) serviceList.Columns[i].Width = widths[i];
     }
 
     public void UpdateSnapshot(MonitorSnapshot snapshot)

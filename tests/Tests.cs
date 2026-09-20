@@ -419,6 +419,18 @@ internal static class Tests
 
     private static void DetailsTypographyBehavior()
     {
+        int[] narrow = ServiceTableLayout.ColumnWidths(280, 1F);
+        Equal(true, narrow.All(width => width > 0) && narrow.Sum() <= 280,
+            "narrow service table columns fit without a horizontal scrollbar");
+        int[] normal = ServiceTableLayout.ColumnWidths(700, 1F);
+        Equal(true, normal[0] >= 90 && normal[1] >= 180 && normal[2] >= 160,
+            "normal service table keeps readable minimum column widths");
+        Equal(true, normal.Sum() <= 700, "normal service table never exceeds its client width");
+        int[] highDpi = ServiceTableLayout.ColumnWidths(1050, 1.5F);
+        Equal(true, highDpi[0] >= 135 && highDpi[1] >= 270 && highDpi[2] >= 240,
+            "high DPI service table scales its readable minimum widths");
+        Equal(true, highDpi.Sum() <= 1050, "high DPI service table never exceeds its client width");
+
         using (var form = new DetailsForm(UserPreferences.Defaults(), delegate { },
             delegate { }, delegate { }, delegate { }, delegate { },
             delegate { }, delegate { }))
@@ -428,11 +440,11 @@ internal static class Tests
             var services = (ListView)typeof(DetailsForm).GetField("serviceList", fields).GetValue(form);
             Equal("Segoe UI", times.Font.Name, "timestamps use compact Latin digits");
             Equal("Segoe UI", services.Font.Name, "service latency uses compact Latin digits");
-            using (var graphics = form.CreateGraphics())
-            {
-                Equal((int)Math.Round(270 * graphics.DpiX / 96F), services.Columns[1].Width,
-                    "service status column follows display scaling");
-            }
+            form.Show();
+            form.Width = 640;
+            Application.DoEvents();
+            Equal(true, services.Columns.Cast<ColumnHeader>().Sum(column => column.Width) <= services.ClientSize.Width,
+                "live service table relayout fits its actual client width");
         }
     }
 
@@ -1086,7 +1098,7 @@ internal static class Tests
         Equal(TimeSpan.FromSeconds(30), policy.Interval(healthy), "pending switch uses short observation interval");
         policy.Target = null;
         policy.Interval(healthy); policy.Interval(healthy);
-        Equal(TimeSpan.FromMinutes(3), policy.Interval(healthy), "stable connection reduces probe frequency");
+        Equal(TimeSpan.FromMinutes(1), policy.Interval(healthy), "automatic guard rechecks a stable connection within one minute");
         Equal(TimeSpan.FromSeconds(30), policy.Interval(bad), "failure restores fast checks");
         var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
         policy.Begin("a", "b", 100, true);
@@ -1132,7 +1144,10 @@ internal static class Tests
         Equal("exit-fp", suppressed.ExitFingerprint, "service suppression preserves exit fingerprint");
         Equal("JP", suppressed.ExitCountryCode, "service suppression preserves exit country");
         CandidateScanResult suppressedOwnFailure = ServiceIncidentPolicy.AttachSuppressed(current, new[] { service });
-        Equal(CandidateHealth.Unknown, suppressedOwnFailure.Health, "suppressed endpoint clears its node failure attribution");
+        Equal(CandidateHealth.ServiceFailed, suppressedOwnFailure.Health,
+            "an active circuit does not erase a real current-cycle failure");
+        Equal(ProbeFailureKind.Service, suppressedOwnFailure.ServiceResults[service].FailureKind,
+            "an active circuit preserves real service evidence already probed");
         var unrelatedFailure = IncidentScan("current", ServiceKind.ChatGPT, ProbeFailureKind.Transient);
         CandidateScanResult preservedFailure = ServiceIncidentPolicy.AttachSuppressed(unrelatedFailure, new[] { service });
         Equal(CandidateHealth.Transient, preservedFailure.Health, "suppression preserves failures from other services");
@@ -1716,6 +1731,9 @@ internal static class Tests
         {
             RunEligibleFastFailoverOrchestration();
             RunEightCandidateFastFailoverBound();
+            RunActiveCircuitAutomaticFailover();
+            RunConsensusCircuitDoesNotAttributeNodeFailure();
+            RunCircuitRollbackRechecksAllRequiredServices();
         }
         finally
         {
@@ -1805,6 +1823,157 @@ internal static class Tests
         }
     }
 
+    private static void RunActiveCircuitAutomaticFailover()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-active-circuit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 19, 10, 0, 0, DateTimeKind.Utc);
+            var persisted = new ExperienceData();
+            ServiceIncidentPolicy.Open(persisted.ServiceIncidents, ServiceKind.ChatGPT,
+                ProbeFailureKind.Service, now.AddMinutes(-1), TimeSpan.FromMinutes(10));
+            ServiceIncidentPolicy.Open(persisted.ServiceIncidents, ServiceKind.Discord,
+                ProbeFailureKind.Service, now.AddMinutes(-1), TimeSpan.FromMinutes(10));
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+
+            string[] alternatives = Enumerable.Range(1, 4)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.RequiredServices.Add(ServiceKind.Discord);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedServiceProbe(mihomo, false),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot snapshot = worker.Run(preferences);
+
+            Equal(String.Join(",", preferences.RequiredServices.OrderBy(x => x)),
+                String.Join(",", mihomo.ScanServices("current", 1).Distinct().OrderBy(x => x)),
+                "automatic cycle rechecks every required service on the current node despite an active circuit");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "automatic cycle can fast-switch after the circuited service still fails on current and passes on a candidate");
+            Equal(true, mihomo.DelayNodes(2500).Count > 0,
+                "active-circuit automatic recovery reaches the live all-node delay round");
+            Equal(String.Join(",", preferences.RequiredServices.OrderBy(x => x)),
+                String.Join(",", snapshot.Services.Select(x => x.Service).Distinct().OrderBy(x => x)),
+                "completed snapshot shows every required service actually probed on the selected node");
+            Equal(false, snapshot.Services.Any(x => x.Evidence == ProbeFailureKind.Unverified),
+                "completed snapshot does not replace actual required-service results with circuit placeholders");
+            Equal(TimeSpan.FromSeconds(30), snapshot.NextCheckUtc - snapshot.CheckedUtc,
+                "successful automatic failover keeps the thirty-second observation interval");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunConsensusCircuitDoesNotAttributeNodeFailure()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-consensus-circuit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 19, 11, 0, 0, DateTimeKind.Utc);
+            string[] alternatives = { "node-01", "node-02" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var failures = new Dictionary<string, ServiceKind>(StringComparer.Ordinal) {
+                { "current", ServiceKind.ChatGPT }, { "node-01", ServiceKind.ChatGPT },
+                { "node-02", ServiceKind.ChatGPT }
+            };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now }, new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot snapshot = worker.Run(UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "three-node service consensus keeps the current node instead of switching");
+            Equal(ProbeFailureKind.Service,
+                snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT).Evidence,
+                "service consensus snapshot retains the real current-cycle failure evidence");
+            Equal(false, new StateStore(FastWorkerConfiguration(root).StatePath).Load().Records.ContainsKey("current"),
+                "shared service incident is not persisted as a current-node health failure");
+            Equal(0, new QualityStateStore(FastWorkerConfiguration(root).QualityStatePath).Load().Count,
+                "shared service incident is not persisted in node quality history");
+            Equal(0, new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load().Nodes.Count,
+                "shared service incident does not lower any node experience history");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunCircuitRollbackRechecksAllRequiredServices()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-circuit-rollback-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 19, 12, 0, 0, DateTimeKind.Utc);
+            var preferences = UserPreferences.Defaults();
+            string[] choices = { "node-01", "current" };
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            var persisted = new ExperienceData {
+                ActiveScope = scope,
+                ActiveServicesKey = servicesKey,
+                ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                LastNode = "node-01",
+                Assurance = new ConnectionAssurance {
+                    Scope = scope, Previous = "current", Target = "node-01", FailedChecks = 1,
+                    StartedUtc = now.AddMinutes(-1), Standbys = new List<StandbyNode>()
+                }
+            };
+            ServiceIncidentPolicy.Open(persisted.ServiceIncidents, ServiceKind.ChatGPT,
+                ProbeFailureKind.Service, now.AddMinutes(-1), TimeSpan.FromMinutes(10));
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+
+            var mihomo = new OrchestratedMihomo("node-01", choices,
+                new Dictionary<string, int>(StringComparer.Ordinal) { { "current", 10 } });
+            var failures = new Dictionary<string, ServiceKind>(StringComparer.Ordinal) {
+                { "node-01", ServiceKind.GitHub }, { "current", ServiceKind.ChatGPT }
+            };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now }, new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.Run(preferences);
+
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "observation rollback never returns to an old node that still fails a circuited required service");
+            Equal(true, mihomo.ScanServices("current", 2).Contains(ServiceKind.ChatGPT),
+                "old-node rollback verification probes all required services despite an active circuit");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static string WorkerScope(IEnumerable<string> candidates, string servicesKey)
+    {
+        byte[] source = Encoding.UTF8.GetBytes(String.Join("\n", candidates.Distinct(StringComparer.Ordinal)
+            .OrderBy(x => x, StringComparer.Ordinal)));
+        using (var hash = System.Security.Cryptography.SHA256.Create())
+            return Convert.ToBase64String(hash.ComputeHash(source)) + "|" + servicesKey;
+    }
+
     private static MonitorConfiguration FastWorkerConfiguration(string root)
     {
         return new MonitorConfiguration {
@@ -1821,6 +1990,7 @@ internal static class Tests
     {
         private readonly object gate = new object();
         private TimeSpan timeout;
+        private readonly List<ServiceKind> services = new List<ServiceKind>();
         public OrchestratedScanEvent(string node, int visit)
         {
             Node = node;
@@ -1830,6 +2000,8 @@ internal static class Tests
         public int Visit { get; private set; }
         public TimeSpan Timeout { get { lock (gate) return timeout; } }
         public void ObserveTimeout(TimeSpan value) { lock (gate) timeout = value; }
+        public void ObserveService(ServiceKind service) { lock (gate) services.Add(service); }
+        public ServiceKind[] Services() { lock (gate) return services.ToArray(); }
     }
 
     private sealed class OrchestratedMihomo : IMihomoClient
@@ -1930,6 +2102,15 @@ internal static class Tests
         {
             lock (gate) return scans.Where(x => x.Timeout == timeout).Select(x => x.Node).ToList();
         }
+
+        public ServiceKind[] ScanServices(string node, int visit)
+        {
+            lock (gate)
+            {
+                OrchestratedScanEvent scan = scans.FirstOrDefault(x => x.Node == node && x.Visit == visit);
+                return scan == null ? new ServiceKind[0] : scan.Services();
+            }
+        }
     }
 
     private sealed class OrchestratedServiceProbe : IServiceProbe
@@ -1946,6 +2127,7 @@ internal static class Tests
         {
             OrchestratedScanEvent scan = mihomo.ActiveScan();
             scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
             if (scan.Node == "current" && service == ServiceKind.ChatGPT)
                 return ProbeResult.ServiceFailure("current failed", 900);
             if (failFirstFullWinner && scan.Node == "node-01" && scan.Visit == 2 &&
@@ -1954,6 +2136,29 @@ internal static class Tests
             int number;
             if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 9;
             return ProbeResult.Success(number * 100);
+        }
+    }
+
+    private sealed class OrchestratedFailureProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly IDictionary<string, ServiceKind> failures;
+        public OrchestratedFailureProbe(OrchestratedMihomo mihomo,
+            IDictionary<string, ServiceKind> failures)
+        {
+            this.mihomo = mihomo;
+            this.failures = failures;
+        }
+
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            ServiceKind failed;
+            if (failures.TryGetValue(scan.Node, out failed) && failed == service)
+                return ProbeResult.ServiceFailure("scripted service failure", 900);
+            return ProbeResult.Success(100);
         }
     }
 
@@ -2401,7 +2606,8 @@ internal static class Tests
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
-        Equal(2, loaded.RequiredServices.Count, "service selection persisted");
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",", loaded.RequiredServices),
+            "saving one AI service keeps the fixed ChatGPT and Gemini core together");
         Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
         Equal(false, loaded.BrowserConversationVerification, "removed browser consent is not persisted");
         Equal(true, File.ReadAllText(path).Contains("version=3"), "preference schema upgraded");
@@ -2418,7 +2624,8 @@ internal static class Tests
             "version=1\r\nfirstRun=True\r\nautomatic=True\r\nservices=ChatGPT,JMComicWeb,GitHub\r\n", Encoding.UTF8);
         var migrationStore = new UserPreferenceStore(migrationPath);
         UserPreferences migrated = migrationStore.Load();
-        Equal("ChatGPT,GitHub", String.Join(",", migrated.RequiredServices), "legacy jmcomic preference ignored");
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",", migrated.RequiredServices),
+            "legacy preferences migrate to the fixed ChatGPT and Gemini core");
         Equal(false, migrated.AutomaticOptimization, "v1 optimization migrates to conservative mode");
         Equal(false, migrated.BrowserConversationVerification, "v1 browser proof requires consent");
         Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
@@ -2426,10 +2633,22 @@ internal static class Tests
         migrationStore.Save(migrated);
         Equal(false, File.ReadAllText(migrationPath).Contains("JMComic"), "saving removes legacy jmcomic value");
         File.WriteAllText(migrationPath,
-            "version=2\r\nfirstRun=True\r\nautomatic=True\r\nbrowserConversation=True\r\nservices=ChatGPT,GitHub\r\n", Encoding.UTF8);
+            "version=2\r\nfirstRun=True\r\nautomatic=True\r\nbrowserConversation=True\r\nservices=GitHub\r\n", Encoding.UTF8);
         UserPreferences browserLegacy = migrationStore.Load();
         Equal(true, browserLegacy.AutomaticOptimization, "version 2 browser consent is ignored without corrupting preferences");
-        Equal("ChatGPT,GitHub", String.Join(",", browserLegacy.RequiredServices), "version 2 services survive browser removal");
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",", browserLegacy.RequiredServices),
+            "version 2 services migrate to the fixed ChatGPT and Gemini core");
+
+        using (var form = new DetailsForm(new UserPreferences {
+            RequiredServices = new List<ServiceKind> { ServiceKind.Gemini, ServiceKind.GitHub }
+        }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }))
+        {
+            CheckBox core = FindCheckBox(form, "ChatGPT 与 Gemini（固定核心）");
+            Equal(true, core != null && core.Checked && !core.Enabled,
+                "settings display the AI intersection as one always-enabled core");
+            Equal(null, FindCheckBox(form, "ChatGPT"), "settings cannot disable ChatGPT independently");
+            Equal(null, FindCheckBox(form, "Gemini"), "settings cannot disable Gemini independently");
+        }
     }
 
     private static void MonitorCoordinatorBehavior()

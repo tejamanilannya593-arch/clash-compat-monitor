@@ -17,15 +17,27 @@ public sealed class UserPreferences
             AutomaticOptimization = false,
             BrowserConversationVerification = false,
             RequiredServices = new List<ServiceKind> {
-                ServiceKind.Google,
-                ServiceKind.GitHub,
                 ServiceKind.ChatGPT,
                 ServiceKind.Gemini,
+                ServiceKind.Google,
+                ServiceKind.GitHub,
                 ServiceKind.SteamStore,
                 ServiceKind.SteamCommunity,
                 ServiceKind.SteamApi
             }
         };
+    }
+}
+
+public static class UserPreferencePolicy
+{
+    public static List<ServiceKind> NormalizeServices(IEnumerable<ServiceKind> services)
+    {
+        var selected = (services ?? Enumerable.Empty<ServiceKind>()).Distinct().ToList();
+        var normalized = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini };
+        normalized.AddRange(selected.Where(service =>
+            service != ServiceKind.ChatGPT && service != ServiceKind.Gemini));
+        return normalized;
     }
 }
 
@@ -74,7 +86,7 @@ public sealed class UserPreferenceStore
                     throw new InvalidDataException("Preferences contain an unknown service.");
                 if (!services.Contains(service)) services.Add(service);
             }
-            if (services.Count == 0) throw new InvalidDataException("At least one service is required.");
+            services = UserPreferencePolicy.NormalizeServices(services);
             return new UserPreferences {
                 FirstRunComplete = firstRun,
                 AutomaticOptimization = automatic,
@@ -91,11 +103,12 @@ public sealed class UserPreferenceStore
 
     public void Save(UserPreferences value)
     {
-        if (value == null || value.RequiredServices == null || value.RequiredServices.Count == 0)
+        if (value == null || value.RequiredServices == null)
             throw new ArgumentException("At least one service is required.", "value");
         var services = value.RequiredServices.Distinct().ToList();
         if (services.Any(service => !Enum.IsDefined(typeof(ServiceKind), service)))
             throw new ArgumentException("Preferences contain an unknown service.", "value");
+        services = UserPreferencePolicy.NormalizeServices(services);
 
         string directory = Path.GetDirectoryName(path);
         if (!String.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);

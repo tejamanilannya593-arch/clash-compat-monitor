@@ -60,9 +60,11 @@ public static class ServiceIncidentPolicy
         var blocked = (suppressed ?? Enumerable.Empty<ServiceKind>()).Distinct().ToList();
         if (blocked.Count == 0) return scan;
         var results = new Dictionary<ServiceKind, ProbeResult>(scan.ServiceResults);
-        foreach (ServiceKind service in blocked)
+        var unprobed = blocked.Where(service => !results.ContainsKey(service)).ToList();
+        if (unprobed.Count == 0) return scan;
+        foreach (ServiceKind service in unprobed)
             results[service] = ProbeResult.Unverified("服务端点暂时熔断，本轮不归因于节点");
-        bool failedServiceIsSuppressed = scan.FailedService.HasValue && blocked.Contains(scan.FailedService.Value);
+        bool failedServiceIsSuppressed = scan.FailedService.HasValue && unprobed.Contains(scan.FailedService.Value);
         bool definiteNodeFailure = !failedServiceIsSuppressed && (scan.Health == CandidateHealth.RegionBlocked ||
             scan.Health == CandidateHealth.ServiceFailed || scan.Health == CandidateHealth.Transient);
         return new CandidateScanResult(scan.Name,
@@ -76,6 +78,15 @@ public static class ServiceIncidentPolicy
     {
         ProbeResult result;
         return TryDefiniteFailure(scan, service, out result) ? result.FailureKind : ProbeFailureKind.Unverified;
+    }
+
+    public static bool IsSuppressedFailure(CandidateScanResult scan,
+        IEnumerable<ServiceKind> suppressed)
+    {
+        if (scan == null || !scan.FailedService.HasValue ||
+            !(suppressed ?? Enumerable.Empty<ServiceKind>()).Contains(scan.FailedService.Value)) return false;
+        ProbeResult result;
+        return TryDefiniteFailure(scan, scan.FailedService.Value, out result);
     }
 
     private static bool TryDefiniteFailure(CandidateScanResult scan, ServiceKind service, out ProbeResult result)
