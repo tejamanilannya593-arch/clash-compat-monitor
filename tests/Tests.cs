@@ -2873,6 +2873,18 @@ internal static class Tests
             Equal(true, SpinWait.SpinUntil(() => coordinator.Latest.State == MonitorRunState.Running, 1000), "coordinator recovers after restore exception");
         }
 
+        var triggeredRunner = new TriggeredCycleRunner();
+        using (var coordinator = new MonitorCoordinator(triggeredRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, triggeredRunner.WaitForRunCount(1, 1000), "trigger runner receives startup cycle");
+            coordinator.RequestCheck();
+            Equal(true, triggeredRunner.WaitForRunCount(2, 1000), "trigger runner receives requested cycle");
+            Equal(true, triggeredRunner.WaitForRunCount(3, 1000), "trigger runner receives scheduled cycle");
+            Equal("Startup,Requested,Scheduled", String.Join(",", triggeredRunner.Triggers()),
+                "coordinator distinguishes startup, requested, and scheduled diagnostics");
+        }
+
     }
 
     private static void BrowserVerificationUiBehavior()
@@ -3034,6 +3046,24 @@ internal static class Tests
             return SpinWait.SpinUntil(() => RunCount >= expected, milliseconds);
         }
         public void Release() { released.Set(); }
+    }
+
+    private sealed class TriggeredCycleRunner : ITriggeredCycleRunner
+    {
+        private readonly object gate = new object();
+        private readonly List<MonitorCycleTrigger> triggers = new List<MonitorCycleTrigger>();
+        public MonitorSnapshot Run(UserPreferences preferences)
+        { return Run(preferences, MonitorCycleTrigger.Scheduled); }
+        public MonitorSnapshot Run(UserPreferences preferences, MonitorCycleTrigger trigger)
+        {
+            int count;
+            lock (gate) { triggers.Add(trigger); count = triggers.Count; }
+            DateTime next = count == 2 ? DateTime.UtcNow.AddMilliseconds(80) : DateTime.UtcNow.AddHours(1);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "ok", DateTime.UtcNow, next);
+        }
+        public bool WaitForRunCount(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => { lock (gate) return triggers.Count >= count; }, milliseconds); }
+        public MonitorCycleTrigger[] Triggers() { lock (gate) return triggers.ToArray(); }
     }
 
     private sealed class DegradedCycleRunner : IMonitorCycleRunner

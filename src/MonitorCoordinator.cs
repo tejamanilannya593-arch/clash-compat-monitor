@@ -9,6 +9,13 @@ public interface IMonitorCycleRunner
     MonitorSnapshot Run(UserPreferences preferences);
 }
 
+public enum MonitorCycleTrigger { Startup, Scheduled, Requested }
+
+public interface ITriggeredCycleRunner : IMonitorCycleRunner
+{
+    MonitorSnapshot Run(UserPreferences preferences, MonitorCycleTrigger trigger);
+}
+
 public interface IRestorableCycleRunner : IMonitorCycleRunner
 {
     bool RestorePrevious();
@@ -252,6 +259,7 @@ public sealed class MonitorCoordinator : IDisposable
     private void Loop()
     {
         DateTime nextRunUtc = DateTime.UtcNow;
+        bool firstCycle = true;
         while (Volatile.Read(ref stopping) == 0)
         {
             if (Volatile.Read(ref paused) != 0)
@@ -273,7 +281,10 @@ public sealed class MonitorCoordinator : IDisposable
                 continue;
             }
 
-            Interlocked.Exchange(ref checkRequested, 0);
+            bool explicitlyRequested = Interlocked.Exchange(ref checkRequested, 0) != 0;
+            MonitorCycleTrigger trigger = firstCycle ? MonitorCycleTrigger.Startup :
+                explicitlyRequested ? MonitorCycleTrigger.Requested : MonitorCycleTrigger.Scheduled;
+            firstCycle = false;
             bool restore = Interlocked.Exchange(ref restoreRequested, 0) != 0;
             Interlocked.Exchange(ref cancelCycle, 0);
             UserPreferences current;
@@ -287,7 +298,8 @@ public sealed class MonitorCoordinator : IDisposable
                     if (restorable == null || !restorable.RestorePrevious())
                         return Latest.WithState(MonitorRunState.Degraded, "上一个节点未通过复检或不存在，保留当前连接", DateTime.UtcNow.Add(interval));
                 }
-                return runner.Run(current);
+                var triggered = runner as ITriggeredCycleRunner;
+                return triggered == null ? runner.Run(current) : triggered.Run(current, trigger);
             },
                 CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
             var elapsed = System.Diagnostics.Stopwatch.StartNew();

@@ -39,7 +39,8 @@ public sealed class BoundedLogger
     }
 }
 
-public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner, IAccountVerificationRunner
+public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner, IAccountVerificationRunner,
+    ITriggeredCycleRunner
 {
     private readonly MonitorConfiguration config;
     private readonly IMihomoClient mihomo;
@@ -111,6 +112,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
     public MonitorSnapshot Run(UserPreferences preferences)
     {
+        return Run(preferences, MonitorCycleTrigger.Scheduled);
+    }
+
+    public MonitorSnapshot Run(UserPreferences preferences, MonitorCycleTrigger trigger)
+    {
+        logger.Write("cycle trigger=" + trigger.ToString().ToLowerInvariant());
         return RunOnce(false, preferences);
     }
 
