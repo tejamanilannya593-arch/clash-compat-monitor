@@ -857,17 +857,25 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 List<CandidateNode> opportunityPool = candidates.Where(x => x.Name != current).ToList();
                 Stopwatch opportunityTimer = Stopwatch.StartNew();
                 Dictionary<string, int> opportunityDelays = MeasureLiveDelays(opportunityPool);
-                string[] ranked = StartupRecovery.RankFastCandidates(opportunityPool, opportunityDelays,
-                    current, Int32.MaxValue);
+                OpportunityCandidatePlan candidatePlan = OpportunityCandidatePlanner.Create(
+                    opportunityPool, opportunityDelays, current, experience, memoryScope, clock.UtcNow);
+                logger.Write("opportunity candidate plan live=" + candidatePlan.LiveDelayCount +
+                    " historical=" + candidatePlan.HistoricalCount +
+                    " exploration=" + candidatePlan.ExplorationCount +
+                    " fill=" + candidatePlan.FillCount +
+                    " duplicate_removal=" + candidatePlan.DuplicateRemovalCount);
                 ServiceKind[] quickServices = StartupRecovery.FastProbeServices(requiredServices, ServiceKind.ChatGPT);
                 var comparableScans = new List<CandidateScanResult>();
                 int checkedCandidates = 0;
-                foreach (string candidateName in ranked)
+                foreach (OpportunityCandidateChoice planned in candidatePlan.Candidates)
                 {
                     if (StartupRecovery.ShouldStopAfterCheckedCandidates(checkedCandidates) ||
                         StartupRecovery.ShouldStopAfterEligibleCandidates(comparableScans.Count)) break;
+                    string candidateName = planned.Name;
                     CandidateNode candidate = candidates.First(x => x.Name == candidateName);
-                    Report("正在自动比较低延迟候选：" + candidateName, currentEvidence);
+                    Report("正在自动比较候选：" + candidateName, currentEvidence);
+                    logger.Write("opportunity candidate scan node=" + SafeName(candidateName) +
+                        " source=" + planned.Source.ToString().ToLowerInvariant());
                     CandidateScanResult quickScan = scanner.ScanSelected(candidate, quickServices,
                         TimeSpan.FromSeconds(2));
                     RememberRegionEligibility(memoryScope, quickScan);

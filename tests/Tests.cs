@@ -2139,7 +2139,7 @@ internal static class Tests
         try
         {
             DateTime now = new DateTime(2026, 9, 20, 12, 0, 0, DateTimeKind.Utc);
-            string[] alternatives = Enumerable.Range(1, 6).Select(x => "node-" + x.ToString("D2")).ToArray();
+            string[] alternatives = Enumerable.Range(1, 7).Select(x => "node-" + x.ToString("D2")).ToArray();
             string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
             var preferences = UserPreferences.Defaults();
             preferences.AutomaticOptimization = true;
@@ -2154,7 +2154,10 @@ internal static class Tests
                 Nodes = new List<NodeExperience> {
                     new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-3),
                         LastUtc = now.AddMinutes(-1), Samples = 3, Success = 1, LastPassed = true,
-                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } }
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } },
+                    new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddHours(-1),
+                        LastUtc = now.AddMinutes(-1), Samples = 6, Success = 1, LastPassed = true,
+                        ResponseMs = 400, RecentResponseMilliseconds = new List<double> { 400, 410, 390 } }
                 }
             };
             new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
@@ -2172,17 +2175,24 @@ internal static class Tests
 
             Equal(alternatives.Length, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
                 "scheduled opportunity scan measures every alternative once");
-            Equal("node-01,node-02,node-03", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
-                "scheduled opportunity scan stops after three comparable candidates");
+            Equal("node-01,node-06,node-07", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "scheduled opportunity scan includes live historical and exploration candidates before stopping");
             Equal("current", mihomo.GetSelected("shared"),
                 "first opportunity scan prepares a target without switching");
             ExperienceData afterDiscovery = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
             Equal("node-01", afterDiscovery.Assurance.PendingOptimization.Target,
-                "best real-service target is persisted for confirmation");
+                "fresh service response outranks historical candidate origin");
             Equal(AutomaticDecisionState.ConfirmingOptimization, afterDiscovery.Assurance.Decision.State,
                 "opportunity discovery enters optimization confirmation state");
             Equal(TimeSpan.FromSeconds(30), discovery.NextCheckUtc - discovery.CheckedUtc,
                 "pending target schedules a thirty-second confirmation");
+            string trace = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, trace.Contains("opportunity candidate plan live=5 historical=1 exploration=1 fill=0"),
+                "opportunity trace records source counts");
+            Equal(true, trace.Contains("source=historical") && trace.Contains("source=exploration"),
+                "opportunity trace records scanned source categories");
+            Equal(false, trace.Contains("node-06") || trace.Contains("node-07"),
+                "opportunity trace never exposes raw node names");
 
             int delayCount = mihomo.DelayNodes(2500).Count;
             clock.UtcNow = now.AddSeconds(30);
