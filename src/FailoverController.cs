@@ -113,19 +113,18 @@ public static class QualityPolicy
 
     public static bool CurrentNeedsOptimization(IEnumerable<double> responses)
     {
-        List<double> recent = Valid(responses).TakeLastCompat(3).OrderBy(x => x).ToList();
-        return recent.Count == 3 && Median(recent) > OptimizationResponseMilliseconds;
+        LatencyWindowSummary recent = LatencyWindowStatistics.Summarize(responses);
+        return recent.Count >= LatencyWindowStatistics.MinimumSamples &&
+            recent.MedianMilliseconds > OptimizationResponseMilliseconds;
     }
 
     public static bool CandidateLatencyIsPreferred(IEnumerable<double> responses)
     {
-        List<double> recent = Valid(responses).TakeLastCompat(5).OrderBy(x => x).ToList();
-        if (recent.Count < 5) return false;
-        double median = Median(recent);
-        double maximum = recent[recent.Count - 1];
-        List<double> deviations = recent.Select(x => Math.Abs(x - median)).OrderBy(x => x).ToList();
-        return median <= PreferredResponseMilliseconds && maximum <= MaximumServiceResponseMilliseconds &&
-            Median(deviations) <= MaximumJitterMilliseconds;
+        LatencyWindowSummary recent = LatencyWindowStatistics.Summarize(responses);
+        return recent.Count >= LatencyWindowStatistics.MinimumSamples &&
+            recent.MedianMilliseconds <= PreferredResponseMilliseconds &&
+            recent.MaximumMilliseconds <= MaximumServiceResponseMilliseconds &&
+            recent.JitterMilliseconds <= MaximumJitterMilliseconds;
     }
 
     public static bool ServicesWithinLimit(CandidateScanResult scan)
@@ -147,16 +146,6 @@ public static class QualityPolicy
         return slowest.Value == null ? (ServiceKind?)null : slowest.Key;
     }
 
-    private static IEnumerable<double> Valid(IEnumerable<double> responses)
-    {
-        return (responses ?? Enumerable.Empty<double>()).Where(x => !Double.IsNaN(x) && !Double.IsInfinity(x) && x > 0);
-    }
-
-    private static double Median(IList<double> sorted)
-    {
-        return sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] :
-            (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2.0;
-    }
 }
 
 internal static class EnumerableCompatibility

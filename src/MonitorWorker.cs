@@ -719,7 +719,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
             bool opportunityActivity = false;
             bool opportunitySwitched = false;
-            IList<double> recentCurrentResponses = experience.RecentResponses(memoryScope, current, 3);
+            IList<double> recentCurrentResponses = experience.RecentResponses(memoryScope, current,
+                LatencyWindowStatistics.MaximumSamples);
             PendingOptimization pendingOptimization = assurance.PendingOptimization;
             if (pendingOptimization != null)
             {
@@ -1128,7 +1129,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     {
                         FailoverDecision qualityDecision = controller.DecideQuality(currentScore.Score, best.Value.Score, false,
                             freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, best.Key, clock.UtcNow),
-                            experience.RecentResponses(memoryScope, current, 3), experience.RecentResponses(memoryScope, best.Key, 5), selectedTargetScan);
+                            experience.RecentResponses(memoryScope, current, LatencyWindowStatistics.MaximumSamples),
+                            experience.RecentResponses(memoryScope, best.Key, LatencyWindowStatistics.MaximumSamples), selectedTargetScan);
                         shouldSwitch = qualityDecision.ShouldSwitch;
                         reason = qualityDecision.Reason;
                     }
@@ -1434,17 +1436,17 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private static double MedianResponse(IEnumerable<QualitySample> samples, string name, double current)
     {
         var values = samples.Where(x => x.Name == name && x.ResponseMedianMs > 0).OrderByDescending(x => x.CheckedUtc)
-            .Take(4).Select(x => x.ResponseMedianMs).Concat(new[] { current }).OrderBy(x => x).ToList();
-        return values.Count % 2 == 1 ? values[values.Count / 2] : (values[values.Count / 2 - 1] + values[values.Count / 2]) / 2.0;
+            .Take(LatencyWindowStatistics.MaximumSamples - 1).Select(x => x.ResponseMedianMs).Reverse()
+            .Concat(new[] { current });
+        return LatencyWindowStatistics.Summarize(values).MedianMilliseconds;
     }
 
     private static double Jitter(IEnumerable<QualitySample> samples, string name, double current)
     {
         var values = samples.Where(x => x.Name == name && x.ResponseMedianMs > 0).OrderByDescending(x => x.CheckedUtc)
-            .Take(4).Select(x => x.ResponseMedianMs).Concat(new[] { current }).ToList();
-        if (values.Count < 2) return 0;
-        double mean = values.Average();
-        return Math.Sqrt(values.Sum(x => (x - mean) * (x - mean)) / values.Count);
+            .Take(LatencyWindowStatistics.MaximumSamples - 1).Select(x => x.ResponseMedianMs).Reverse()
+            .Concat(new[] { current });
+        return LatencyWindowStatistics.Summarize(values).JitterMilliseconds;
     }
 }
 

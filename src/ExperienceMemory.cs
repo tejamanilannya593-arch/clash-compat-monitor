@@ -25,7 +25,8 @@ public sealed class NodeExperience
     public double Rank(DateTime now)
     {
         double speed = SpeedUtc >= now.AddDays(-1) && Throughput > 0 ? 10 * Throughput / (Throughput + 1048576) : 0;
-        return 65 * Success + 20 * 300 / (300 + Math.Max(0, ResponseMs)) +
+        double observedSuccess = OutcomeSamples > 0 ? SuccessfulSamples / (double)OutcomeSamples : Success;
+        return 65 * observedSuccess + 20 * 300 / (300 + Math.Max(0, ResponseMs)) +
             5 * 100 / (100 + Math.Max(0, JitterMs)) + speed;
     }
 }
@@ -131,11 +132,13 @@ public sealed class ExperienceData
         double weight = node.Samples == 0 ? 1 : 0.2;
         node.Success = (1 - weight) * node.Success + weight * (passed ? 1 : 0);
         double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
-        node.JitterMs = (1 - weight) * node.JitterMs + weight * (node.Samples == 0 ? 0 : Math.Abs(response - node.ResponseMs));
-        node.ResponseMs = (1 - weight) * node.ResponseMs + weight * response;
         node.RecentResponseMilliseconds.Add(response);
-        if (node.RecentResponseMilliseconds.Count > 20)
-            node.RecentResponseMilliseconds.RemoveRange(0, node.RecentResponseMilliseconds.Count - 20);
+        if (node.RecentResponseMilliseconds.Count > LatencyWindowStatistics.MaximumSamples)
+            node.RecentResponseMilliseconds.RemoveRange(0,
+                node.RecentResponseMilliseconds.Count - LatencyWindowStatistics.MaximumSamples);
+        LatencyWindowSummary latency = LatencyWindowStatistics.Summarize(node.RecentResponseMilliseconds);
+        node.ResponseMs = latency.MedianMilliseconds;
+        node.JitterMs = latency.JitterMilliseconds;
         node.LastUtc = now; node.Samples = Math.Min(1000000, node.Samples + 1); node.LastPassed = passed;
         if (node.OutcomeSamples == 0) node.FirstOutcomeUtc = now;
         node.LastOutcomeUtc = now;
@@ -146,8 +149,10 @@ public sealed class ExperienceData
     public IEnumerable<NodeExperience> Recommend(string scope, IEnumerable<string> eligible, DateTime now)
     {
         var allowed = new HashSet<string>(eligible, StringComparer.Ordinal);
-        return Nodes.Where(x => x.Scope == scope && allowed.Contains(x.Node) && x.Samples >= 3 &&
-            x.LastUtc - x.FirstUtc >= TimeSpan.FromMinutes(10) && x.LastUtc >= now.AddDays(-7) && x.LastPassed && x.Success >= 0.8)
+        return Nodes.Where(x => x.Scope == scope && allowed.Contains(x.Node) &&
+            x.Samples >= LatencyWindowStatistics.MinimumSamples &&
+            x.LastUtc - x.FirstUtc >= TimeSpan.FromMinutes(10) && x.LastUtc >= now.AddDays(-7) && x.LastPassed &&
+            (x.OutcomeSamples > 0 ? x.SuccessfulSamples / (double)x.OutcomeSamples : x.Success) >= 0.8)
             .OrderByDescending(x => x.Rank(now)).ToList();
     }
 

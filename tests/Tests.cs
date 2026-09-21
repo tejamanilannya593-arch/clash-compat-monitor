@@ -1509,10 +1509,11 @@ internal static class Tests
         memory.Observe("scope", scan, null, now.AddMinutes(5));
         memory.Observe("scope", scan, null, now.AddMinutes(10));
         Equal(false, memory.IsProvenStable("scope", "stable", now.AddMinutes(10)), "short history cannot authorize quality switch");
-        Equal(1, memory.Recommend("scope", new[] { "stable" }, now.AddMinutes(10)).Count(), "repeated stable history becomes recommendation");
+        Equal(0, memory.Recommend("scope", new[] { "stable" }, now.AddMinutes(10)).Count(), "three samples remain below recommendation minimum");
         memory.Observe("scope", scan, null, now.AddMinutes(20));
         memory.Observe("scope", scan, null, now.AddMinutes(30));
         Equal(true, memory.IsProvenStable("scope", "stable", now.AddMinutes(30)), "cross-time stable history authorizes quality switch");
+        Equal(1, memory.Recommend("scope", new[] { "stable" }, now.AddMinutes(30)).Count(), "five stable samples become recommendation");
         var ninetyPercent = new ExperienceData();
         var ninetyFivePercent = new ExperienceData();
         for (int i = 0; i < 20; i++)
@@ -1524,10 +1525,16 @@ internal static class Tests
         Equal(false, ninetyPercent.IsProvenStable("scope", "ninety", now.AddMinutes(38)), "ninety percent history cannot authorize quality switch");
         Equal(true, ninetyFivePercent.IsProvenStable("scope", "ninety-five", now.AddMinutes(38)), "ninety-five percent history authorizes quality switch");
         var latencyMemory = new ExperienceData();
-        for (int i = 1; i <= 6; i++)
+        for (int i = 1; i <= 12; i++)
             latencyMemory.Observe("scope", new CandidateScanResult("latency", CandidateHealth.Compatible, null, "ok", i * 100, 1), null, now.AddMinutes(i));
-        Equal("200,300,400,500,600", String.Join(",", latencyMemory.RecentResponses("scope", "latency", 5).Select(x => x.ToString("F0"))), "recent response history keeps newest samples");
-        Equal(true, latencyMemory.StabilitySummary("scope", "latency", now.AddMinutes(6)).Contains("6/5 次"), "stability summary exposes sample progress");
+        Equal("800,900,1000,1100,1200", String.Join(",", latencyMemory.RecentResponses("scope", "latency", 5).Select(x => x.ToString("F0"))), "recent response history keeps newest samples");
+        Equal(10, latencyMemory.Nodes[0].RecentResponseMilliseconds.Count, "recent response history is capped at ten samples");
+        Equal(750.0, latencyMemory.Nodes[0].ResponseMs, "experience response uses recent-window median");
+        Equal(350.0, latencyMemory.Nodes[0].JitterMs, "experience jitter uses P90 minus median");
+        Equal(true, latencyMemory.StabilitySummary("scope", "latency", now.AddMinutes(12)).Contains("12/5 次"), "stability summary exposes sample progress");
+        var reliableRank = new NodeExperience { Success = 1, ResponseMs = 300, JitterMs = 20, OutcomeSamples = 10, SuccessfulSamples = 10 };
+        var failureRank = new NodeExperience { Success = 1, ResponseMs = 300, JitterMs = 20, OutcomeSamples = 10, SuccessfulSamples = 8 };
+        Equal(true, reliableRank.Rank(now) > failureRank.Rank(now), "node rank uses observed failure rate");
         Equal(0, memory.Recommend("different services", new[] { "stable" }, now.AddMinutes(10)).Count(), "memory isolated by service and subscription scope");
         Equal(0, memory.Recommend("scope", new[] { "removed" }, now.AddMinutes(10)).Count(), "removed node not recommended");
         Equal(0, memory.Recommend("scope", new[] { "stable" }, now.AddDays(8)).Count(), "stale history not recommended");
@@ -2152,9 +2159,9 @@ internal static class Tests
                 LastNode = "current",
                 Assurance = new ConnectionAssurance { Scope = scope, Standbys = new List<StandbyNode>() },
                 Nodes = new List<NodeExperience> {
-                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-3),
-                        LastUtc = now.AddMinutes(-1), Samples = 3, Success = 1, LastPassed = true,
-                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } },
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } },
                     new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddHours(-1),
                         LastUtc = now.AddMinutes(-1), Samples = 6, Success = 1, LastPassed = true,
                         ResponseMs = 400, RecentResponseMilliseconds = new List<double> { 400, 410, 390 } }
@@ -2244,9 +2251,9 @@ private static void RunRecentSwitchOpportunityHysteresisOrchestration()
                     }
                 },
                 Nodes = new List<NodeExperience> {
-                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-3),
-                        LastUtc = now.AddMinutes(-1), Samples = 3, Success = 1, LastPassed = true,
-                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } }
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } }
                 }
             };
             new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
@@ -2308,9 +2315,9 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                     }
                 },
                 Nodes = new List<NodeExperience> {
-                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-3),
-                        LastUtc = now.AddMinutes(-1), Samples = 3, Success = 1, LastPassed = true,
-                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } }
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } }
                 }
             };
             new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
@@ -2343,13 +2350,13 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
     {
         DateTime now = new DateTime(2026, 9, 20, 10, 0, 0, DateTimeKind.Utc);
         Equal(true, OpportunityOptimizationPolicy.ShouldScan(true, false,
-            new[] { 900d, 850d, 801d }, DateTime.MinValue, now),
+            new[] { 900d, 850d, 801d, 900d, 900d }, DateTime.MinValue, now),
             "slow current schedules automatic opportunity discovery");
         Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
-            new[] { 900d, 800d, 700d }, DateTime.MinValue, now),
+            new[] { 900d, 900d, 800d, 700d, 700d }, DateTime.MinValue, now),
             "good current does not schedule opportunity discovery");
         Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
-            new[] { 900d, 850d, 801d }, now.AddMinutes(-2), now),
+            new[] { 900d, 850d, 801d, 900d, 900d }, now.AddMinutes(-2), now),
             "opportunity discovery is limited to one round per three minutes");
         Equal(true, OpportunityOptimizationPolicy.MateriallyBetter(1000, 800),
             "twenty percent faster target is material");
@@ -3353,27 +3360,35 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal("良好", QualityPolicy.LatencyBand(500), "good latency band boundary");
         Equal("可用但偏慢", QualityPolicy.LatencyBand(800), "usable but slow latency band boundary");
         Equal("较慢", QualityPolicy.LatencyBand(801), "slow latency band starts above 800");
-        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 1000.0 }), "current latency needs three samples");
-        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 800.0, 900.0 }), "current median at 800 holds");
-        Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 900.0 }), "current median above 800 may optimize");
+        LatencyWindowSummary spikyWindow = LatencyWindowStatistics.Summarize(new[] { 250.0, 260.0, 270.0, 280.0, 1500.0 });
+        Equal(5, spikyWindow.Count, "latency statistics retain the recent sample count");
+        Equal(270.0, spikyWindow.MedianMilliseconds, "latency statistics expose median");
+        Equal(280.0, spikyWindow.P75Milliseconds, "latency statistics expose P75");
+        Equal(1500.0, spikyWindow.P90Milliseconds, "latency statistics expose P90");
+        Equal(1230.0, spikyWindow.JitterMilliseconds, "latency jitter uses P90 minus median");
+        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 900.0, 900.0, 900.0 }), "current latency needs five samples");
+        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 700.0, 800.0, 900.0, 900.0 }), "current median at 800 holds");
+        Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 801.0, 900.0, 900.0 }), "current median above 800 may optimize");
+        Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 100.0, 100.0, 100.0, 100.0 }), "current evaluation uses the complete recent ten-sample window");
         Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 500.0, 500.0 }), "candidate median 500 and jitter pass");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 501.0, 501.0, 501.0 }), "candidate median above 500 is not preferred");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0 }), "candidate latency needs five samples");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }), "candidate maximum above 1500 fails");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 100.0, 300.0, 500.0, 700.0, 800.0 }), "candidate jitter above 150 fails");
+        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 250.0, 260.0, 270.0, 280.0, 1500.0 }), "candidate tail spike fails robust jitter gate");
         var responsiveServices = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1400, 2,
             new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1500) } });
         var slowService = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1401, 2,
             new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1501) } });
         Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1500 passes");
         Equal(false, QualityPolicy.ServicesWithinLimit(slowService), "single slow service rejects quality candidate");
-        double[] slowCurrent = { 700, 801, 900 };
+        double[] slowCurrent = { 700, 801, 801, 900, 900 };
         double[] preferredTarget = { 300, 400, 500, 500, 500 };
         Equal(false, controller.DecideQuality(70, 82, false, true, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "under 20 percent holds");
         Equal(true, controller.DecideQuality(70, 85, false, true, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "over 20 percent switches to preferred latency");
         Equal(false, controller.DecideQuality(70, 90, false, false, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "fresh verification required");
         Equal(false, controller.DecideQuality(70, 90, false, true, false, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "proven stable history required");
-        Equal(false, controller.DecideQuality(70, 90, false, true, true, new[] { 700.0, 800.0, 900.0 }, preferredTarget, responsiveServices).ShouldSwitch, "current latency not persistently slow holds");
+        Equal(false, controller.DecideQuality(70, 90, false, true, true, new[] { 700.0, 700.0, 800.0, 900.0, 900.0 }, preferredTarget, responsiveServices).ShouldSwitch, "current latency not persistently slow holds");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }, responsiveServices).ShouldSwitch, "candidate history outside preferred latency cannot switch");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, preferredTarget, slowService).ShouldSwitch, "single slow service cannot quality switch");
         var reachableTarget = new CandidateScanResult("target", CandidateHealth.BasicCompatible, null, "challenge", 100, 1,
