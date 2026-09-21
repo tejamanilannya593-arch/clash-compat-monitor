@@ -84,6 +84,7 @@ internal static class Tests
         QualityScoringAndState();
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
+        OpportunityCandidatePlanningBehavior();
         AutomaticDecisionPolicyBehavior();
         AutomaticDecisionStateMachineBehavior();
         StabilityAndState();
@@ -3434,6 +3435,65 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         private readonly ExitIdentity identity;
         public FakeExitIdentityProbe(ExitIdentity identity) { this.identity = identity; }
         public ExitIdentity Probe(TimeSpan timeout) { return identity; }
+    }
+
+    private static void OpportunityCandidatePlanningBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 21, 11, 0, 0, DateTimeKind.Utc);
+        string scope = "scope";
+        CandidateNode[] candidates = new[] { "current" }
+            .Concat(Enumerable.Range(1, 9).Select(x => "node-" + x.ToString("D2")))
+            .Select(x => new CandidateNode(x, null)).ToArray();
+        Dictionary<string, int> delays = Enumerable.Range(1, 9)
+            .ToDictionary(x => "node-" + x.ToString("D2"), x => x * 10, StringComparer.Ordinal);
+        var experience = new ExperienceData {
+            Nodes = new List<NodeExperience> {
+                new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddHours(-1),
+                    LastUtc = now.AddMinutes(-1), Samples = 6, Success = 1, LastPassed = true,
+                    ResponseMs = 300, RecentResponseMilliseconds = new List<double> { 300, 310, 290 } },
+                new NodeExperience { Scope = scope, Node = "node-07", FirstUtc = now.AddHours(-1),
+                    LastUtc = now.AddMinutes(-2), Samples = 5, Success = 1, LastPassed = true,
+                    ResponseMs = 350, RecentResponseMilliseconds = new List<double> { 350, 340, 360 } }
+            }
+        };
+
+        OpportunityCandidatePlan plan = OpportunityCandidatePlanner.Create(
+            candidates, delays, "current", experience, scope, now);
+
+        Equal("node-01:LiveDelay,node-06:Historical,node-08:Exploration,node-02:LiveDelay," +
+            "node-07:Historical,node-03:LiveDelay,node-04:LiveDelay,node-05:LiveDelay",
+            String.Join(",", plan.Candidates.Select(x => x.Name + ":" + x.Source)),
+            "opportunity plan interleaves five live two historical and one exploration candidate");
+        Equal(8, plan.Candidates.Count, "opportunity plan remains bounded to eight candidates");
+        Equal(5, plan.LiveDelayCount, "opportunity plan carries five live-delay candidates");
+        Equal(2, plan.HistoricalCount, "opportunity plan carries two historical candidates");
+        Equal(1, plan.ExplorationCount, "opportunity plan carries one under-tested candidate");
+        Equal(0, plan.FillCount, "complete source quotas need no fill");
+        Equal(false, plan.Candidates.Any(x => x.Name == "current"),
+            "opportunity plan excludes the current node");
+
+        experience.Nodes.Insert(0, new NodeExperience { Scope = scope, Node = "node-02",
+            FirstUtc = now.AddHours(-1), LastUtc = now.AddMinutes(-1), Samples = 8,
+            Success = 1, LastPassed = true, ResponseMs = 100,
+            RecentResponseMilliseconds = new List<double> { 100, 100, 100 } });
+        OpportunityCandidatePlan overlap = OpportunityCandidatePlanner.Create(
+            candidates, delays, "current", experience, scope, now);
+        Equal(true, overlap.DuplicateRemovalCount > 0,
+            "historical overlap is recorded and never duplicates a live candidate");
+        Equal(overlap.Candidates.Count, overlap.Candidates.Select(x => x.Name).Distinct(StringComparer.Ordinal).Count(),
+            "opportunity plan contains distinct nodes");
+
+        OpportunityCandidatePlan fallback = OpportunityCandidatePlanner.Create(
+            candidates.Take(8), delays, "current", new ExperienceData(), scope, now);
+        Equal("node-01:LiveDelay,node-06:Exploration,node-02:LiveDelay,node-03:LiveDelay," +
+            "node-04:LiveDelay,node-05:LiveDelay,node-07:Fill",
+            String.Join(",", fallback.Candidates.Select(x => x.Name + ":" + x.Source)),
+            "missing history safely falls back to exploration and live-delay fill");
+
+        string[] recovery = StartupRecovery.RankFastCandidates(candidates, delays, "current", 8);
+        Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08",
+            String.Join(",", recovery),
+            "failure recovery remains strict live-delay order");
     }
 
     private sealed class FakeExitAsnResolver : IExitAsnResolver
