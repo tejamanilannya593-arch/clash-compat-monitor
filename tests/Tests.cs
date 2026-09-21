@@ -3504,6 +3504,34 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08",
             String.Join(",", recovery),
             "failure recovery remains strict live-delay order");
+
+        OpportunityCandidatePlan empty = OpportunityCandidatePlanner.Create(
+            null, null, "current", null, scope, now);
+        Equal(0, empty.Candidates.Count, "empty opportunity input produces an empty safe plan");
+
+        var stale = new ExperienceData { Nodes = new List<NodeExperience> {
+            new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddDays(-9),
+                LastUtc = now.AddDays(-8), Samples = 20, Success = 1, LastPassed = true,
+                ResponseMs = 1, RecentResponseMilliseconds = new List<double> { 1, 1, 1 } },
+            new NodeExperience { Scope = "other-scope", Node = "node-07", FirstUtc = now.AddHours(-1),
+                LastUtc = now.AddMinutes(-1), Samples = 20, Success = 1, LastPassed = true,
+                ResponseMs = 1, RecentResponseMilliseconds = new List<double> { 1, 1, 1 } }
+        } };
+        OpportunityCandidatePlan stalePlan = OpportunityCandidatePlanner.Create(
+            candidates, delays, "current", stale, scope, now);
+        Equal(0, stalePlan.HistoricalCount,
+            "stale and foreign-scope history cannot enter opportunity history slots");
+        Equal("node-07", stalePlan.Candidates.First(x => x.Source == OpportunityCandidateSource.Exploration).Name,
+            "foreign-scope history is treated as unseen for deterministic exploration");
+
+        Dictionary<string, int> tiedDelays = candidates.Where(x => x.Name != "current")
+            .ToDictionary(x => x.Name, x => 100, StringComparer.Ordinal);
+        OpportunityCandidatePlan tied = OpportunityCandidatePlanner.Create(
+            candidates, tiedDelays, "current", new ExperienceData(), scope, now);
+        Equal("node-01", tied.Candidates.First().Name,
+            "ordinal node name resolves equal live-delay ordering deterministically");
+        Equal(true, tied.Candidates.Count <= OpportunityCandidatePlanner.MaximumCandidates,
+            "every opportunity plan respects the hard maximum");
     }
 
     private sealed class FakeExitAsnResolver : IExitAsnResolver
