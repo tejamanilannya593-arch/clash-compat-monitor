@@ -1319,6 +1319,51 @@ internal static class Tests
         Equal(false, ServiceIncidentPolicy.HasConsensus(current, new[] { IncidentScan("current", service, ProbeFailureKind.Service), sameA }, service),
             "current node cannot be counted as a backup confirmation");
 
+        ServiceIncidentConsensus sameExit = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('A'), "SG", 64530, service),
+                IncidentObservationScan("node-3", TestFingerprint('A'), "SG", 64530, service)
+            }, service);
+        Equal(false, sameExit.Passed, "three names on one exit cannot open incident");
+        Equal(1, sameExit.DistinctFingerprintCount, "duplicate exits are counted once");
+
+        ServiceIncidentConsensus oneAsn = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "SG", 64530, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "JP", 64530, service)
+            }, service);
+        Equal(false, oneAsn.Passed, "one known ASN cannot establish diversity");
+
+        ServiceIncidentConsensus twoAsns = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "SG", 64531, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "JP", 64531, service)
+            }, service);
+        Equal(true, twoAsns.Passed, "two known ASNs establish independent consensus");
+        Equal(3, twoAsns.DistinctFingerprintCount, "consensus counts three independent exits");
+        Equal(2, twoAsns.DistinctAsnCount, "consensus counts distinct ASNs");
+
+        ServiceIncidentConsensus countryFallback = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "JP", null, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "SG", 64530, service)
+            }, service);
+        Equal(true, countryFallback.Passed, "country fallback applies when ASN is incomplete");
+
+        ServiceIncidentConsensus noDiversity = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "SG", null, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "SG", null, service)
+            }, service);
+        Equal(false, noDiversity.Passed, "incomplete ASN with one country is rejected");
+        Equal("insufficient-country-diversity", noDiversity.RejectionReason,
+            "consensus rejection is explainable without node names");
+
         var incidents = new List<ServiceIncidentRecord>();
         ServiceIncidentPolicy.Open(incidents, service, ProbeFailureKind.Service, now, TimeSpan.FromMinutes(10));
         Equal(true, ServiceIncidentPolicy.IsActive(incidents, service, now.AddMinutes(9)), "service circuit active before expiry");
@@ -1353,12 +1398,31 @@ internal static class Tests
 
     private static CandidateScanResult IncidentScan(string node, ServiceKind service, ProbeFailureKind kind)
     {
+        long asn = node == "current" ? 64530 : 64531;
+        string country = node == "current" ? "SG" : "JP";
+        return IncidentObservationScan(node, TestNodeFingerprint(node), country, asn, service, kind);
+    }
+
+    private static CandidateScanResult IncidentObservationScan(string node, string fingerprint,
+        string country, long? asn, ServiceKind service, ProbeFailureKind kind = ProbeFailureKind.Service)
+    {
         ProbeResult result = kind == ProbeFailureKind.Region ? ProbeResult.RegionFailure("same", 20) :
             kind == ProbeFailureKind.Transient ? ProbeResult.TransientFailure("same", 20) : ProbeResult.ServiceFailure("same", 20);
         CandidateHealth health = kind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             kind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
+        DateTime observed = new DateTime(2026, 9, 21, 4, 0, 0, DateTimeKind.Utc);
+        var observations = new Dictionary<ServiceKind, ServiceObservation> {
+            { service, ServiceObservation.FromProbe(service, result, observed, fingerprint, country, asn) }
+        };
         return new CandidateScanResult(node, health, service, "same", 20, 1,
-            new Dictionary<ServiceKind, ProbeResult> { { service, result } });
+            new Dictionary<ServiceKind, ProbeResult> { { service, result } }, fingerprint, country,
+            observations, asn);
+    }
+
+    private static string TestNodeFingerprint(string node)
+    {
+        using (var hash = System.Security.Cryptography.SHA256.Create())
+            return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(node ?? ""))).Replace("-", "");
     }
 
     private static void ExperienceBehavior()
@@ -3047,7 +3111,9 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             int number;
             if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 999;
             string country = unsupportedAlternatives && scan.Node != "current" ? "HK" : "JP";
-            return new ExitIdentity(((long)number + 10000).ToString("X64"), country, "ok");
+            long asn = scan.Node == "current" ? 64530 : 64531;
+            return new ExitIdentity(((long)number + 10000).ToString("X64"), country, "ok", asn,
+                new DateTime(2026, 9, 21, 4, 0, 0, DateTimeKind.Utc));
         }
     }
 
