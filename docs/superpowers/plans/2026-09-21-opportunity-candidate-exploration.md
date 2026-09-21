@@ -403,8 +403,8 @@ OpportunityCandidatePlan stalePlan = OpportunityCandidatePlanner.Create(
     candidates, delays, "current", stale, scope, now);
 Equal(0, stalePlan.HistoricalCount,
     "stale and foreign-scope history cannot enter opportunity history slots");
-Equal("node-08", stalePlan.Candidates.First(x => x.Source == OpportunityCandidateSource.Exploration).Name,
-    "an unseen in-scope candidate wins deterministic exploration over stale history");
+Equal("node-07", stalePlan.Candidates.First(x => x.Source == OpportunityCandidateSource.Exploration).Name,
+    "foreign-scope history is treated as unseen for deterministic exploration");
 
 Dictionary<string, int> tiedDelays = candidates.Where(x => x.Name != "current")
     .ToDictionary(x => x.Name, x => 100, StringComparer.Ordinal);
