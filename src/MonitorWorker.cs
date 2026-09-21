@@ -681,12 +681,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
                 experienceStore.Save(experience, clock.UtcNow);
             }
-            bool sharedIncidentFailure = serviceIncidentDecision != null &&
-                ServiceIncidentPolicy.IsSuppressedFailure(currentScan, suppressedServices);
-            if (currentScan.Health != CandidateHealth.Unknown && !sharedIncidentFailure)
+            CandidateScanResult currentHistoryScan = ServiceIncidentPolicy.ForNodeHealth(
+                ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices));
+            if (currentHistoryScan.Health != CandidateHealth.Unknown)
             {
-                state.Records[currentScan.Name] = Record(currentScan);
-                state.RememberPreferred(currentScan.Name, currentScan.Health, clock.UtcNow);
+                state.Records[currentHistoryScan.Name] = Record(currentHistoryScan);
+                state.RememberPreferred(currentHistoryScan.Name, currentHistoryScan.Health, clock.UtcNow);
             }
             scans[currentScan.Name] = currentScan;
             scanTimes[currentScan.Name] = clock.UtcNow;
@@ -697,10 +697,14 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
             QualitySample priorCurrent = Latest(qualityHistory, current);
             double currentResponse = QualityMeasurement.ResponseMilliseconds(currentScan, priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
-            if (currentScan.Health != CandidateHealth.Unknown && !sharedIncidentFailure) qualityHistory.Add(new QualitySample(currentScan.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(currentScan),
-                currentResponse, Jitter(qualityHistory, currentScan.Name, currentResponse), priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
+            double currentHistoryResponse = QualityMeasurement.ResponseMilliseconds(currentHistoryScan,
+                priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
+            if (currentHistoryScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(
+                currentHistoryScan.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(currentHistoryScan),
+                currentHistoryResponse, Jitter(qualityHistory, currentHistoryScan.Name, currentHistoryResponse),
+                priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
                 currentCandidate == null ? (double?)null : currentCandidate.Multiplier));
-            if (!sharedIncidentFailure) experience.Observe(memoryScope, currentScan, null, clock.UtcNow);
+            experience.Observe(memoryScope, currentHistoryScan, null, clock.UtcNow);
 
             bool opportunityActivity = false;
             bool opportunitySwitched = false;
@@ -946,7 +950,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     RememberRegionEligibility(memoryScope, standbyScan);
                     scans[standby] = standbyScan;
                     scanTimes[standby] = clock.UtcNow;
-                    if (suppressedServices.Count == 0) assurance.Remember(standbyScan, current, clock.UtcNow);
+                    CandidateScanResult standbyHistory = ServiceIncidentPolicy.ForNodeHealth(
+                        ServiceIncidentPolicy.AttachSuppressed(standbyScan, suppressedServices));
+                    if (standbyHistory.Health != CandidateHealth.Unknown)
+                        assurance.Remember(standbyHistory, current, clock.UtcNow);
                     if (ServiceEvidencePolicy.CanEmergencySwitch(standbyScan)) delays[standby] = (int)Math.Min(Int32.MaxValue, QualityMeasurement.ResponseMilliseconds(standbyScan, 5000));
                 }
                 foreach (var remembered in experience.Recommend(memoryScope, candidates.Select(x => x.Name), clock.UtcNow).Take(3))
@@ -980,13 +987,16 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         scanTimes[candidate.Name] = clock.UtcNow;
                     }
                     scans[candidate.Name] = scan;
-                    if (suppressedServices.Count == 0) assurance.Remember(scan, current, clock.UtcNow);
-                    CandidateScanResult historicalScan = ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices);
+                    CandidateScanResult historicalScan = ServiceIncidentPolicy.ForNodeHealth(
+                        ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices));
+                    if (historicalScan.Health != CandidateHealth.Unknown)
+                        assurance.Remember(historicalScan, current, clock.UtcNow);
                     if (historicalScan.Health != CandidateHealth.Unknown) state.Records[candidate.Name] = Record(historicalScan);
                     if (ServiceEvidencePolicy.CanEmergencySwitch(scan)) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
                     QualitySample previous = Latest(qualityHistory, candidate.Name);
-                    double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
-                    if (suppressedServices.Count == 0 && scan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(scan),
+                    double response = QualityMeasurement.ResponseMilliseconds(historicalScan, 5000);
+                    if (historicalScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(
+                        candidate.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(historicalScan),
                         MedianResponse(qualityHistory, candidate.Name, response), Jitter(qualityHistory, candidate.Name, response),
                         previous == null ? 0 : previous.ThroughputBytesPerSecond, candidate.Multiplier));
                     experience.Observe(memoryScope, historicalScan, null, clock.UtcNow);
@@ -1203,11 +1213,11 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             experience.RecordChange(experience.LastNode, actual, "检测期间发现外部选择变更", clock.UtcNow);
             foreach (var scan in scans.Values)
             {
-                if (serviceIncidentDecision != null &&
-                    ServiceIncidentPolicy.IsSuppressedFailure(scan, suppressedServices)) continue;
                 QualitySample speed;
                 speedSamples.TryGetValue(scan.Name, out speed);
-                experience.Observe(memoryScope, ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices), speed, clock.UtcNow);
+                CandidateScanResult historicalScan = ServiceIncidentPolicy.ForNodeHealth(
+                    ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices));
+                experience.Observe(memoryScope, historicalScan, speed, clock.UtcNow);
             }
             TimeSpan nextInterval = assurance.Interval(actualScan);
             if (assurance.PendingOptimization != null) nextInterval = OpportunityOptimizationPolicy.ConfirmationInterval;

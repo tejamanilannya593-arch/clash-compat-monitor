@@ -1382,6 +1382,38 @@ internal static class Tests
             "an active circuit does not erase a real current-cycle failure");
         Equal(ProbeFailureKind.Service, suppressedOwnFailure.ServiceResults[service].FailureKind,
             "an active circuit preserves real service evidence already probed");
+        Equal(ServiceOutcome.Failure, suppressedOwnFailure.ServiceObservations[service].Outcome,
+            "suppression preserves raw failure outcome");
+        Equal(false, suppressedOwnFailure.ServiceObservations[service].CountedForNodeHealth,
+            "suppressed failure is excluded from node history");
+        CandidateScanResult suppressedHealth = ServiceIncidentPolicy.ForNodeHealth(suppressedOwnFailure);
+        Equal(CandidateHealth.Unknown, suppressedHealth.Health,
+            "only suppressed evidence produces unknown node-health view");
+        Equal(0, suppressedHealth.ServiceResults.Count,
+            "node-health view excludes suppressed service measurements");
+
+        ProbeResult chatFailure = ProbeResult.ServiceFailure("shared outage", 900);
+        ProbeResult githubSuccess = ProbeResult.Success(100);
+        var mixedResults = new Dictionary<ServiceKind, ProbeResult> {
+            { ServiceKind.ChatGPT, chatFailure }, { ServiceKind.GitHub, githubSuccess }
+        };
+        var mixedObservations = new Dictionary<ServiceKind, ServiceObservation> {
+            { ServiceKind.ChatGPT, ServiceObservation.FromProbe(ServiceKind.ChatGPT, chatFailure,
+                now, TestFingerprint('A'), "SG", 64530) },
+            { ServiceKind.GitHub, ServiceObservation.FromProbe(ServiceKind.GitHub, githubSuccess,
+                now, TestFingerprint('A'), "SG", 64530) }
+        };
+        var mixed = new CandidateScanResult("mixed", CandidateHealth.ServiceFailed, ServiceKind.ChatGPT,
+            "shared outage", 1000, 2, mixedResults, TestFingerprint('A'), "SG", mixedObservations, 64530);
+        CandidateScanResult mixedSuppressed = ServiceIncidentPolicy.AttachSuppressed(mixed,
+            new[] { ServiceKind.ChatGPT });
+        CandidateScanResult mixedHealth = ServiceIncidentPolicy.ForNodeHealth(mixedSuppressed);
+        Equal(CandidateHealth.Compatible, mixedHealth.Health,
+            "unsuppressed success remains usable for node history");
+        Equal(1, mixedHealth.ServiceResults.Count,
+            "history measurements contain only attributable services");
+        Equal(true, mixedHealth.ServiceResults.ContainsKey(ServiceKind.GitHub),
+            "history retains the attributable service measurement");
         var unrelatedFailure = IncidentScan("current", ServiceKind.ChatGPT, ProbeFailureKind.Transient);
         CandidateScanResult preservedFailure = ServiceIncidentPolicy.AttachSuppressed(unrelatedFailure, new[] { service });
         Equal(CandidateHealth.Transient, preservedFailure.Health, "suppression preserves failures from other services");
@@ -2772,12 +2804,21 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             Equal(ProbeFailureKind.Service,
                 snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT).Evidence,
                 "service consensus snapshot retains the real current-cycle failure evidence");
-            Equal(false, new StateStore(FastWorkerConfiguration(root).StatePath).Load().Records.ContainsKey("current"),
-                "shared service incident is not persisted as a current-node health failure");
-            Equal(0, new QualityStateStore(FastWorkerConfiguration(root).QualityStatePath).Load().Count,
-                "shared service incident is not persisted in node quality history");
-            Equal(0, new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load().Nodes.Count,
-                "shared service incident does not lower any node experience history");
+            HealthState history = new StateStore(FastWorkerConfiguration(root).StatePath).Load();
+            Equal(true, history.Records.ContainsKey("current"),
+                "unaffected services still contribute current-node health history");
+            Equal(CandidateHealth.Compatible, history.Records["current"].Health,
+                "shared failure is excluded from the current-node health result");
+            QualitySample currentQuality = new QualityStateStore(
+                FastWorkerConfiguration(root).QualityStatePath).Load().Last(x => x.Name == "current");
+            Equal(100.0, currentQuality.ResponseMedianMs,
+                "shared failure latency is excluded from node quality history");
+            NodeExperience currentExperience = new ExperienceStore(
+                Path.Combine(root, "state", "experience.json")).Load().Nodes.Last(x => x.Node == "current");
+            Equal(true, currentExperience.LastPassed,
+                "shared failure does not lower current-node experience history");
+            Equal(100.0, currentExperience.ResponseMs,
+                "experience response uses only attributable services");
         }
         finally
         {

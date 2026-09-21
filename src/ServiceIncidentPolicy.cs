@@ -102,18 +102,72 @@ public static class ServiceIncidentPolicy
         var blocked = (suppressed ?? Enumerable.Empty<ServiceKind>()).Distinct().ToList();
         if (blocked.Count == 0) return scan;
         var results = new Dictionary<ServiceKind, ProbeResult>(scan.ServiceResults);
+        var observations = new Dictionary<ServiceKind, ServiceObservation>(scan.ServiceObservations);
+        DateTime observedUtc = observations.Count == 0 ? DateTime.UtcNow :
+            observations.Values.Where(x => x != null).Select(x => x.ObservedUtc)
+                .DefaultIfEmpty(DateTime.UtcNow).Max();
+        foreach (var item in results)
+            if (!observations.ContainsKey(item.Key)) observations[item.Key] = ServiceObservation.FromProbe(
+                item.Key, item.Value, observedUtc, scan.ExitFingerprint, scan.ExitCountryCode, scan.ExitAsn);
         var unprobed = blocked.Where(service => !results.ContainsKey(service)).ToList();
-        if (unprobed.Count == 0) return scan;
-        foreach (ServiceKind service in unprobed)
-            results[service] = ProbeResult.Unverified("服务端点暂时熔断，本轮不归因于节点");
+        foreach (ServiceKind service in blocked)
+        {
+            ServiceObservation observation;
+            if (observations.TryGetValue(service, out observation) && observation != null)
+                observations[service] = observation.WithNodeHealthCounting(false);
+            else
+            {
+                ProbeResult notProbed = ProbeResult.Unverified("服务端点暂时熔断，本轮未探测，不归因于节点");
+                results[service] = notProbed;
+                observations[service] = ServiceObservation.FromProbe(service, notProbed, observedUtc,
+                    scan.ExitFingerprint, scan.ExitCountryCode, scan.ExitAsn).WithNodeHealthCounting(false);
+            }
+        }
         bool failedServiceIsSuppressed = scan.FailedService.HasValue && unprobed.Contains(scan.FailedService.Value);
         bool definiteNodeFailure = !failedServiceIsSuppressed && (scan.Health == CandidateHealth.RegionBlocked ||
             scan.Health == CandidateHealth.ServiceFailed || scan.Health == CandidateHealth.Transient);
         return new CandidateScanResult(scan.Name,
-            definiteNodeFailure ? scan.Health : CandidateHealth.Unknown,
-            definiteNodeFailure ? scan.FailedService : null,
-            definiteNodeFailure ? scan.Detail : "服务端点暂时熔断，已继续检测其他服务",
-            scan.TotalMilliseconds, scan.ProbeCount, results, scan.ExitFingerprint, scan.ExitCountryCode);
+            unprobed.Count == 0 || definiteNodeFailure ? scan.Health : CandidateHealth.Unknown,
+            unprobed.Count == 0 || definiteNodeFailure ? scan.FailedService : null,
+            unprobed.Count == 0 || definiteNodeFailure ? scan.Detail : "服务端点暂时熔断，已继续检测其他服务",
+            scan.TotalMilliseconds, scan.ProbeCount, results, scan.ExitFingerprint, scan.ExitCountryCode,
+            observations, scan.ExitAsn);
+    }
+
+    public static CandidateScanResult ForNodeHealth(CandidateScanResult scan)
+    {
+        if (scan == null) throw new ArgumentNullException("scan");
+        if (scan.ServiceObservations == null || scan.ServiceObservations.Count == 0) return scan;
+        var counted = scan.ServiceObservations.Where(x => x.Value != null &&
+            x.Value.CountedForNodeHealth).ToDictionary(x => x.Key, x => x.Value);
+        var results = scan.ServiceResults.Where(x => counted.ContainsKey(x.Key))
+            .ToDictionary(x => x.Key, x => x.Value);
+        ServiceObservation failure = counted.Values.Where(x => x.Outcome == ServiceOutcome.Failure)
+            .OrderBy(x => x.Service).FirstOrDefault();
+        CandidateHealth health;
+        ServiceKind? failedService = null;
+        string detail;
+        if (failure != null)
+        {
+            failedService = failure.Service;
+            health = failure.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
+                failure.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient :
+                CandidateHealth.ServiceFailed;
+            detail = failure.Detail;
+        }
+        else if (counted.Count == 0 || counted.Values.Any(x => x.Outcome == ServiceOutcome.Unknown))
+        {
+            health = CandidateHealth.Unknown;
+            detail = "没有可归因于节点的完整服务证据";
+        }
+        else
+        {
+            health = CandidateHealth.Compatible;
+            detail = "ok";
+        }
+        return new CandidateScanResult(scan.Name, health, failedService, detail,
+            results.Values.Sum(x => x.ElapsedMilliseconds), results.Count, results,
+            scan.ExitFingerprint, scan.ExitCountryCode, scan.ServiceObservations, scan.ExitAsn);
     }
 
     public static ProbeFailureKind FailureKind(CandidateScanResult scan, ServiceKind service)
