@@ -82,6 +82,7 @@ internal static class Tests
         QualityScoringAndState();
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
+        AutomaticDecisionPolicyBehavior();
         StabilityAndState();
         RuntimeGuards();
         SelectorFollowerBehavior();
@@ -1962,6 +1963,62 @@ internal static class Tests
             basic.ServiceResults, "0000000000000000000000000000000000000000000000000000000000000002", "HK");
         Equal(false, OpportunityOptimizationPolicy.IsPerformanceComparable(unsupported, required),
             "unsupported actual exit cannot participate in proactive comparison");
+    }
+
+    private static void AutomaticDecisionPolicyBehavior()
+    {
+        var regionBlocked = new CandidateScanResult("current", CandidateHealth.RegionBlocked,
+            ServiceKind.ChatGPT, "unsupported", 100, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.RegionFailure("unsupported", 100) }
+            });
+        var serviceFailed = new CandidateScanResult("current", CandidateHealth.ServiceFailed,
+            ServiceKind.Gemini, "rejected", 100, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.Gemini, ProbeResult.ServiceFailure("rejected", 100) }
+            });
+        var stillSlowButPassed = new CandidateScanResult("current", CandidateHealth.Compatible,
+            null, "slow", 2100, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(2100) }
+            });
+        var unknown = new CandidateScanResult("current", CandidateHealth.Unknown, null, "unknown");
+        var healthy = new CandidateScanResult("current", CandidateHealth.Compatible, null, "ok", 500, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(500) }
+            });
+        var normallySlow = new CandidateScanResult("current", CandidateHealth.Compatible, null, "slow", 900, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(900) }
+            });
+
+        Equal(DecisionEvidenceClass.HardFailure,
+            DecisionEvidencePolicy.Classify(regionBlocked, false),
+            "region rejection is a hard failure");
+        Equal(DecisionEvidenceClass.HardFailure,
+            DecisionEvidencePolicy.Classify(serviceFailed, false),
+            "definite service rejection is a hard failure");
+        Equal(DecisionEvidenceClass.SevereDegradation,
+            DecisionEvidencePolicy.Classify(stillSlowButPassed, true),
+            "confirmed two-second latency is degradation not failure");
+        Equal(DecisionEvidenceClass.Unknown,
+            DecisionEvidencePolicy.Classify(unknown, false),
+            "missing evidence remains unknown");
+        Equal(DecisionEvidenceClass.Healthy,
+            DecisionEvidencePolicy.Classify(healthy, false),
+            "usable bounded evidence is healthy");
+        Equal(DecisionEvidenceClass.NormalDegradation,
+            DecisionEvidencePolicy.Classify(normallySlow, false),
+            "usable response above the experience target is normal degradation");
+
+        Equal(false, MaterialImprovementPolicy.Evaluate(200, 150, false).Accepted,
+            "small absolute gain cannot switch despite relative gain");
+        Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, false).Accepted,
+            "normal improvement requires twenty percent and two hundred milliseconds");
+        Equal(false, MaterialImprovementPolicy.Evaluate(1200, 850, true).Accepted,
+            "recent switch raises relative requirement to thirty percent");
+        Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, true).Accepted,
+            "recent switch accepts a thirty-percent material improvement");
     }
 
     private static void RunEligibleFastFailoverOrchestration()
