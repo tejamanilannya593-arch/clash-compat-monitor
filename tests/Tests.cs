@@ -70,6 +70,7 @@ internal static class Tests
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
         ServiceObservationBehavior();
+        ExitNetworkEvidenceBehavior();
         RegionEligibilityCaching();
         CandidateFiltering();
         PipeHttpDecoding();
@@ -143,6 +144,67 @@ internal static class Tests
     private static string TestFingerprint(char value)
     {
         return new string(value, 64);
+    }
+
+    private static void ExitNetworkEvidenceBehavior()
+    {
+        byte[] key = Enumerable.Range(1, 32).Select(x => (byte)x).ToArray();
+        string rawIp = "203.0.113.9";
+        string expected = ExitIdentityKey.Fingerprint(rawIp, key);
+        ExitAsnResolution matched = IpWhoExitAsnParser.Parse(
+            "{\"success\":true,\"ip\":\"203.0.113.9\",\"country_code\":\"SG\",\"connection\":{\"asn\":64520}}",
+            key, expected, "SG");
+        Equal(true, matched.Matched, "IPWho identity matches Cloudflare evidence");
+        Equal(64520L, matched.Asn, "IPWho ASN is parsed");
+        Equal(false, matched.Detail.Contains(rawIp), "ASN diagnostics omit raw IP");
+
+        Equal(false, IpWhoExitAsnParser.Parse(
+            "{\"success\":true,\"ip\":\"203.0.113.10\",\"country_code\":\"SG\",\"connection\":{\"asn\":64520}}",
+            key, expected, "SG").Matched, "fingerprint mismatch is rejected");
+        Equal(false, IpWhoExitAsnParser.Parse(
+            "{\"success\":true,\"ip\":\"203.0.113.9\",\"country_code\":\"US\",\"connection\":{\"asn\":64520}}",
+            key, expected, "SG").Matched, "country mismatch is rejected");
+        Equal(false, IpWhoExitAsnParser.Parse("not-json", key, expected, "SG").Matched,
+            "malformed ASN response is unavailable evidence");
+
+        DateTime now = new DateTime(2026, 9, 21, 3, 0, 0, DateTimeKind.Utc);
+        var cache = new ExitNetworkEvidenceCache();
+        cache.Remember(expected, "SG", 64520, now, TimeSpan.FromMinutes(60));
+        long asn;
+        Equal(true, cache.TryGet(expected, "SG", now.AddMinutes(59), out asn),
+            "ASN cache is valid before sixty minutes");
+        Equal(64520L, asn, "ASN cache returns the verified network");
+        Equal(false, cache.TryGet(expected, "SG", now.AddMinutes(60), out asn),
+            "ASN cache expires at sixty minutes");
+        Equal(false, cache.TryGet(TestFingerprint('E'), "SG", now.AddMinutes(1), out asn),
+            "different fingerprint misses cache");
+
+        string root = Path.Combine(Path.GetTempPath(), "ccm-asn-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(root, "exit-network.state");
+        try
+        {
+            var store = new ExitNetworkEvidenceStore(path);
+            store.Save(cache, now.AddMinutes(1));
+            string json = File.ReadAllText(path);
+            Equal(false, json.Contains(rawIp), "ASN cache never persists raw IP");
+            ExitNetworkEvidenceCache loaded = store.Load(now.AddMinutes(1));
+            Equal(1, loaded.Records.Count, "valid ASN cache survives restart");
+            File.WriteAllText(path,
+                "{\"Records\":[{\"ExitFingerprint\":\"bad\",\"CountryCode\":\"S\",\"Asn\":0}]}");
+            Equal(0, store.Load(now).Records.Count, "malformed ASN records are rejected");
+
+            var failedResolver = new FakeExitAsnResolver(new ExitAsnResolution {
+                Matched = false, Asn = 0, Detail = "provider unavailable"
+            });
+            var enricher = new ExitNetworkEvidenceEnricher(failedResolver,
+                new ExitNetworkEvidenceStore(Path.Combine(root, "provider-failure.state")));
+            ExitIdentity original = new ExitIdentity(expected, "SG", "ok", null, now);
+            ExitIdentity unchanged = enricher.Enrich(original, now, TimeSpan.FromSeconds(1));
+            Equal(expected, unchanged.Fingerprint, "ASN provider failure preserves exit fingerprint");
+            Equal("SG", unchanged.CountryCode, "ASN provider failure preserves exit country");
+            Equal<long?>(null, unchanged.Asn, "ASN provider failure remains unknown evidence");
+        }
+        finally { DeleteDirectoryEventually(root); }
     }
 
     private static void RegionEligibilityCaching()
@@ -3261,6 +3323,18 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         private readonly ExitIdentity identity;
         public FakeExitIdentityProbe(ExitIdentity identity) { this.identity = identity; }
         public ExitIdentity Probe(TimeSpan timeout) { return identity; }
+    }
+
+    private sealed class FakeExitAsnResolver : IExitAsnResolver
+    {
+        private readonly ExitAsnResolution resolution;
+        public int Calls { get; private set; }
+        public FakeExitAsnResolver(ExitAsnResolution resolution) { this.resolution = resolution; }
+        public ExitAsnResolution Resolve(ExitIdentity expected, TimeSpan timeout)
+        {
+            Calls++;
+            return resolution;
+        }
     }
 
     private sealed class FakeClock : IClock

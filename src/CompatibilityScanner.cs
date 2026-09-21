@@ -111,18 +111,18 @@ public sealed class CompatibilityScanner
         }
         DateTime observedUtc = clock.UtcNow;
         var observations = measurements.ToDictionary(x => x.Key, x => ServiceObservation.FromProbe(
-            x.Key, x.Value, observedUtc, identity.Fingerprint, identity.CountryCode, null));
+            x.Key, x.Value, observedUtc, identity.Fingerprint, identity.CountryCode, identity.Asn));
         if (failedService.HasValue)
             return Failure(candidate.Name, failedService.Value, failedResult, totalMilliseconds, probeCount,
                 measurements, observations, identity);
         if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null,
             String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint,
-            identity.CountryCode, observations);
+            identity.CountryCode, observations, identity.Asn);
         if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null,
             String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint,
-            identity.CountryCode, observations);
+            identity.CountryCode, observations, identity.Asn);
         return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds,
-            probeCount, measurements, identity.Fingerprint, identity.CountryCode, observations);
+            probeCount, measurements, identity.Fingerprint, identity.CountryCode, observations, identity.Asn);
     }
 
     private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result,
@@ -132,7 +132,8 @@ public sealed class CompatibilityScanner
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
         return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements,
-            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode, observations);
+            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode,
+            observations, identity == null ? (long?)null : identity.Asn);
     }
 }
 

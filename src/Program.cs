@@ -38,7 +38,7 @@ public static class Program
                     using (var probe = new HttpServiceProbe(config.ProbeProxy))
                     {
                         var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
-                            Path.Combine(config.RootPath, "state", "identity.key"));
+                            Path.Combine(config.RootPath, "state", "identity.key"), config.ExitNetworkEvidencePath);
                         var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock(), exitProbe,
                             new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"));
                         worker.RunOnce(options.DryRun, new UserPreferenceStore(config.PreferencesPath).Load());
@@ -58,7 +58,7 @@ public static class Program
                 using (var probe = new HttpServiceProbe(config.ProbeProxy))
                 {
                     var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
-                        Path.Combine(config.RootPath, "state", "identity.key"));
+                        Path.Combine(config.RootPath, "state", "identity.key"), config.ExitNetworkEvidencePath);
                     var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe,
                         new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"));
                     using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
@@ -127,6 +127,7 @@ public sealed class MonitorConfiguration
     public string StatePath;
     public string QualityStatePath;
     public string PreferencesPath;
+    public string ExitNetworkEvidencePath;
     public string LogPath;
     public string ClashConfigPath;
     public string DelayProbeUrl = "https://www.gstatic.com/generate_204";
@@ -144,6 +145,7 @@ public sealed class MonitorConfiguration
             StatePath = Path.Combine(root, "state", "health.state"),
             QualityStatePath = Path.Combine(root, "state", "quality.state"),
             PreferencesPath = Path.Combine(root, "state", "preferences.state"),
+            ExitNetworkEvidencePath = Path.Combine(root, "state", "exit-network.state"),
             LogPath = Path.Combine(root, "logs", "monitor.log"),
             ClashConfigPath = Path.Combine(roaming, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml")
         };
