@@ -2819,6 +2819,10 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "shared failure does not lower current-node experience history");
             Equal(100.0, currentExperience.ResponseMs,
                 "experience response uses only attributable services");
+            string log = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, log.Contains("service incident consensus service=ChatGPT fingerprints=3 " +
+                "countries=1 asns=2 passed=True reason=none"),
+                "incident trace contains only safe aggregate diversity evidence");
         }
         finally
         {

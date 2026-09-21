@@ -574,26 +574,37 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         " checked=" + comparedCandidates + " eligible=" + verifiedTargets.Length +
                         " selected_response_ms=" + selectedResponseForLog.ToString("F0",
                             System.Globalization.CultureInfo.InvariantCulture));
-                    if (!fastSwitched && !severeLatency && ServiceIncidentPolicy.HasConsensus(confirmation, incidentChecks, failedService))
+                    if (!fastSwitched && !severeLatency)
                     {
-                        ProbeFailureKind kind = ServiceIncidentPolicy.FailureKind(confirmation, failedService);
-                        ServiceIncidentPolicy.Open(experience.ServiceIncidents, failedService, kind,
-                            clock.UtcNow, TimeSpan.FromMinutes(10));
-                        if (!suppressedServices.Contains(failedService)) suppressedServices.Add(failedService);
-                        servicesToProbe = ServiceIncidentPolicy.ServicesToProbe(requiredServices,
-                            experience.ServiceIncidents, clock.UtcNow);
-                        currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
-                        scans[currentScan.Name] = currentScan;
-                        currentEvidence = MonitorSnapshot.CreateRunning(current, currentScan, null,
-                            "已识别服务端异常", clock.UtcNow, DateTime.MaxValue)
-                            .WithSelectionReason(experience.SelectionSummary(current, firstCompletedCycle && current == cycleStartNode));
-                        currentFailureConfirmed = false;
-                        if (!observing) controller.Decide(true, false, current, null);
-                        serviceIncidentDecision = MonitorPresentation.ServiceLabel(failedService) +
-                            " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟";
-                        logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
-                            " confirmations=3 duration_minutes=10");
-                        experienceStore.Save(experience, clock.UtcNow);
+                        ServiceIncidentConsensus consensus = ServiceIncidentPolicy.EvaluateConsensus(
+                            confirmation, incidentChecks, failedService);
+                        logger.Write("service incident consensus service=" + failedService +
+                            " fingerprints=" + consensus.DistinctFingerprintCount +
+                            " countries=" + consensus.DistinctCountryCount +
+                            " asns=" + consensus.DistinctAsnCount +
+                            " passed=" + consensus.Passed +
+                            " reason=" + consensus.RejectionReason);
+                        if (consensus.Passed)
+                        {
+                            ProbeFailureKind kind = ServiceIncidentPolicy.FailureKind(confirmation, failedService);
+                            ServiceIncidentPolicy.Open(experience.ServiceIncidents, failedService, kind,
+                                clock.UtcNow, TimeSpan.FromMinutes(10));
+                            if (!suppressedServices.Contains(failedService)) suppressedServices.Add(failedService);
+                            servicesToProbe = ServiceIncidentPolicy.ServicesToProbe(requiredServices,
+                                experience.ServiceIncidents, clock.UtcNow);
+                            currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
+                            scans[currentScan.Name] = currentScan;
+                            currentEvidence = MonitorSnapshot.CreateRunning(current, currentScan, null,
+                                "已识别服务端异常", clock.UtcNow, DateTime.MaxValue)
+                                .WithSelectionReason(experience.SelectionSummary(current, firstCompletedCycle && current == cycleStartNode));
+                            currentFailureConfirmed = false;
+                            if (!observing) controller.Decide(true, false, current, null);
+                            serviceIncidentDecision = MonitorPresentation.ServiceLabel(failedService) +
+                                " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟";
+                            logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
+                                " confirmations=3 duration_minutes=10");
+                            experienceStore.Save(experience, clock.UtcNow);
+                        }
                     }
                 }
                 else
