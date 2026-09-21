@@ -89,7 +89,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     {
         this.config = config;
         this.mihomo = mihomo;
-        this.scanner = new CompatibilityScanner(mihomo, probe, config.ProbeGroup, exitIdentityProbe);
+        this.scanner = new CompatibilityScanner(mihomo, probe, config.ProbeGroup, exitIdentityProbe, clock);
         scanner.ShouldStop = StopRequired;
         this.logger = logger;
         this.clock = clock;

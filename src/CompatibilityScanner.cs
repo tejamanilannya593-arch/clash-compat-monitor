@@ -24,6 +24,7 @@ public sealed class CompatibilityScanner
     private readonly IServiceProbe probe;
     private readonly string probeGroup;
     private readonly IExitIdentityProbe exitIdentityProbe;
+    private readonly IClock clock;
     public Func<bool> ShouldStop { get; set; }
 
     public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup)
@@ -33,11 +34,18 @@ public sealed class CompatibilityScanner
 
     public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup,
         IExitIdentityProbe exitIdentityProbe)
+        : this(mihomo, probe, probeGroup, exitIdentityProbe, new SystemClock())
+    {
+    }
+
+    public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup,
+        IExitIdentityProbe exitIdentityProbe, IClock clock)
     {
         this.mihomo = mihomo;
         this.probe = probe;
         this.probeGroup = probeGroup;
         this.exitIdentityProbe = exitIdentityProbe;
+        this.clock = clock ?? new SystemClock();
     }
 
     public CandidateScanResult Scan(CandidateNode candidate, IEnumerable<ServiceKind> optionalServices)
@@ -101,20 +109,30 @@ public sealed class CompatibilityScanner
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
             else if (!result.Passed && !failedService.HasValue) { failedService = service; failedResult = result; }
         }
+        DateTime observedUtc = clock.UtcNow;
+        var observations = measurements.ToDictionary(x => x.Key, x => ServiceObservation.FromProbe(
+            x.Key, x.Value, observedUtc, identity.Fingerprint, identity.CountryCode, null));
         if (failedService.HasValue)
-            return Failure(candidate.Name, failedService.Value, failedResult, totalMilliseconds, probeCount, measurements, identity);
-        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
-        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
-        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
+            return Failure(candidate.Name, failedService.Value, failedResult, totalMilliseconds, probeCount,
+                measurements, observations, identity);
+        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null,
+            String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint,
+            identity.CountryCode, observations);
+        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null,
+            String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint,
+            identity.CountryCode, observations);
+        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds,
+            probeCount, measurements, identity.Fingerprint, identity.CountryCode, observations);
     }
 
     private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result,
-        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements, ExitIdentity identity)
+        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements,
+        IDictionary<ServiceKind, ServiceObservation> observations, ExitIdentity identity)
     {
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
         return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements,
-            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode);
+            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode, observations);
     }
 }
 

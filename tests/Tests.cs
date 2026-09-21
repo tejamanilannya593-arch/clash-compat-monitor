@@ -1671,12 +1671,21 @@ internal static class Tests
         Equal(TimeSpan.FromSeconds(2), probe.Timeouts.Single(), "fast candidate scan uses its shorter probe timeout");
 
         probe = new FakeProbe { DefaultResult = ProbeResult.Success(75) };
+        DateTime observed = new DateTime(2026, 9, 21, 2, 0, 0, DateTimeKind.Utc);
         scanner = new CompatibilityScanner(mihomo, probe, "probe",
-            new FakeExitIdentityProbe(new ExitIdentity("selected-fp", "JP", "ok")));
+            new FakeExitIdentityProbe(new ExitIdentity("selected-fp", "JP", "ok")),
+            new FakeClock { UtcNow = observed });
         CandidateScanResult selected = scanner.ScanSelected(new CandidateNode("selected", 1),
             new[] { ServiceKind.ChatGPT, ServiceKind.GitHub });
         Equal(2, probe.Calls.Count, "only selected services probed");
         Equal(75L, selected.ServiceResults[ServiceKind.ChatGPT].ElapsedMilliseconds, "service latency retained");
+        Equal(2, selected.ServiceObservations.Count, "one observation per selected service");
+        Equal(observed, selected.ServiceObservations[ServiceKind.GitHub].ObservedUtc,
+            "scanner uses injected clock for observation time");
+        Equal(ServiceOutcome.Success, selected.ServiceObservations[ServiceKind.ChatGPT].Outcome,
+            "scanner records final service outcome");
+        Equal("selected-fp", selected.ServiceObservations[ServiceKind.ChatGPT].ExitFingerprint,
+            "scanner attaches exit fingerprint to raw observation");
         DateTime snapshotTime = new DateTime(2026, 9, 8, 8, 0, 0, DateTimeKind.Utc);
         MonitorSnapshot snapshot = MonitorSnapshot.CreateRunning("selected", selected, 82.5,
             "保持当前节点", snapshotTime, snapshotTime.AddMinutes(1));
