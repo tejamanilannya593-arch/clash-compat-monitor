@@ -69,6 +69,7 @@ internal static class Tests
             "IPv6 flag alone cannot disable monitoring or trigger configuration rewrites");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
+        ServiceObservationBehavior();
         RegionEligibilityCaching();
         CandidateFiltering();
         PipeHttpDecoding();
@@ -105,6 +106,43 @@ internal static class Tests
         BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void ServiceObservationBehavior()
+    {
+        DateTime observed = new DateTime(2026, 9, 21, 1, 2, 3, DateTimeKind.Utc);
+        ServiceObservation success = ServiceObservation.FromProbe(ServiceKind.Google,
+            ProbeResult.Success(123), observed, TestFingerprint('A'), "SG", 64500);
+        Equal(ServiceOutcome.Success, success.Outcome, "definite pass maps to success");
+        Equal(true, success.CountedForNodeHealth, "raw pass counts for node health");
+        Equal(64500L, success.ExitAsn, "observation carries ASN");
+
+        ServiceObservation failure = ServiceObservation.FromProbe(ServiceKind.ChatGPT,
+            ProbeResult.RegionFailure("blocked", 456), observed, TestFingerprint('B'), "US", 64501);
+        Equal(ServiceOutcome.Failure, failure.Outcome, "definite failure maps to failure");
+        Equal(ProbeFailureKind.Region, failure.FailureKind, "failure kind is preserved");
+
+        ServiceObservation partial = ServiceObservation.FromProbe(ServiceKind.Gemini,
+            ProbeResult.Partial("reachable only", 78), observed, TestFingerprint('C'), "JP", null);
+        Equal(ServiceOutcome.Unknown, partial.Outcome, "partial reachability maps to unknown");
+        Equal(ProbeFailureKind.Partial, partial.FailureKind, "partial kind is preserved");
+
+        ServiceObservation unverified = ServiceObservation.FromProbe(ServiceKind.Discord,
+            ProbeResult.Unverified("not probed"), observed, "", "", null);
+        Equal(ServiceOutcome.Unknown, unverified.Outcome, "unverified maps to unknown");
+        Equal(false, unverified.WithNodeHealthCounting(false).CountedForNodeHealth,
+            "history attribution can be disabled without changing outcome");
+        Equal(ServiceOutcome.Unknown, unverified.WithNodeHealthCounting(false).Outcome,
+            "history attribution leaves raw outcome unchanged");
+
+        var legacy = new CandidateScanResult("legacy", CandidateHealth.Compatible, null, "ok");
+        Equal(0, legacy.ServiceObservations.Count, "legacy scan defaults to no observations");
+        Equal<long?>(null, legacy.ExitAsn, "legacy scan defaults to unknown ASN");
+    }
+
+    private static string TestFingerprint(char value)
+    {
+        return new string(value, 64);
     }
 
     private static void RegionEligibilityCaching()
