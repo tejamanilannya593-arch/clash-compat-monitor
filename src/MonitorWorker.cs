@@ -592,6 +592,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 assurance.Target = null;
                 assurance.HoldUntilUtc = experience.ServiceIncidents.Where(x => x != null &&
                     suppressedServices.Contains(x.Service)).Select(x => x.UntilUtc).DefaultIfEmpty(clock.UtcNow.AddMinutes(10)).Max();
+                assurance.Apply(AutomaticDecisionEvent.OutageDetected,
+                    new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                        ExpiresUtc = assurance.HoldUntilUtc,
+                        Reason = "service incident interrupted observation" });
                 observing = false;
                 assuranceDecision = serviceIncidentDecision;
             }
@@ -599,6 +603,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             {
                 if (assurance.Target != current)
                 {
+                    assurance.Apply(AutomaticDecisionEvent.ManualNodeChanged,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            ExpiresUtc = clock.UtcNow.AddMinutes(10),
+                            Reason = "selector changed during observation" });
                     assurance.Target = null;
                     assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(10);
                     assuranceDecision = "检测到外部切换，取消自动回退";
@@ -616,16 +624,30 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             (!ConnectionAssurance.Passed(currentScan) || QualityMeasurement.ResponseMilliseconds(oldScan, 5000) < QualityMeasurement.ResponseMilliseconds(currentScan, 5000) * 0.8) &&
                             mihomo.GetSelected(config.SharedGroup) == current)
                         {
-                            SelectRecorded(current, old.Name, "切换后效果不佳，旧节点复检通过，自动回退");
-                            current = old.Name; currentCandidate = old; currentScan = oldScan;
-                            controller.RecordSwitch();
-                            assuranceDecision = "已安全回退，暂停性能寻优 30 分钟";
+                            DecisionTransition rollbackAuthorization = assurance.Apply(
+                                AutomaticDecisionEvent.RollbackRequired,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Previous = current, Target = old.Name,
+                                    BaselineResponse = QualityMeasurement.ResponseMilliseconds(currentScan, 5000),
+                                    TargetResponse = QualityMeasurement.ResponseMilliseconds(oldScan, 5000),
+                                    Reason = "observation rollback target verified" });
+                            if (ApplyAutomaticSwitch(assurance, rollbackAuthorization, current,
+                                old.Name, "切换后效果不佳，旧节点复检通过，自动回退",
+                                QualityMeasurement.ResponseMilliseconds(currentScan, 5000), false, false))
+                            {
+                                current = old.Name; currentCandidate = old; currentScan = oldScan;
+                                assuranceDecision = "已安全回退，继续观察连接稳定性";
+                            }
                         }
                         else assuranceDecision = "切换效果不佳，旧节点不满足安全回退条件；暂停寻优";
                     }
                     if (assurance.VerificationCount >= 2)
                     {
                         if (!rollback) assuranceDecision = ConnectionAssurance.Passed(currentScan) ? "切换后复检通过，保持连接" : "切换后证据不足，暂缓寻优";
+                        assurance.Apply(AutomaticDecisionEvent.ObservationComplete,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                ExpiresUtc = clock.UtcNow.AddMinutes(30),
+                                Reason = "switch observation completed" });
                         assurance.Target = null;
                         assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
                     }
@@ -675,6 +697,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 if (cancelReason != null)
                 {
                     logger.Write("opportunity pending cancelled reason=" + cancelReason);
+                    assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            Target = pendingOptimization.Target, Reason = cancelReason });
                     assurance.ClearPendingOptimization();
                     assuranceDecision = "自动寻优已取消：" + cancelReason;
                 }
@@ -683,6 +708,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     CandidateNode pendingCandidate = candidates.FirstOrDefault(x => x.Name == pendingOptimization.Target);
                     if (pendingCandidate == null)
                     {
+                        assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Target = pendingOptimization.Target,
+                                Reason = "pending target removed" });
                         assurance.ClearPendingOptimization();
                         assuranceDecision = "自动寻优目标已不在候选列表";
                     }
@@ -697,39 +726,70 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             pendingOptimization.BaselineResponse);
                         double confirmedTarget = QualityMeasurement.ResponseMilliseconds(targetScan,
                             pendingOptimization.TargetResponse);
-                        bool confirmed = OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices) &&
-                            OpportunityOptimizationPolicy.MateriallyBetter(confirmedBaseline, confirmedTarget) &&
+                        bool comparable = OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices);
+                        MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
+                            confirmedBaseline, confirmedTarget,
+                            assurance.HasRecentAutomaticSwitch(clock.UtcNow));
+                        bool confirmed = comparable && improvement.Accepted &&
                             String.Equals(mihomo.GetSelected(config.SharedGroup), pendingOptimization.Current,
                                 StringComparison.Ordinal);
                         if (confirmed && !dryRun)
                         {
                             string oldCurrent = current;
-                            SelectRecorded(oldCurrent, pendingCandidate.Name,
-                                "自动寻优：30 秒复检确认目标至少快 20% 且不超过 800 ms");
-                            bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(targetScan);
-                            assurance.Begin(oldCurrent, pendingCandidate.Name, confirmedBaseline, true,
-                                provisional, clock.UtcNow);
-                            previousSelectedNode = oldCurrent;
-                            controller.RecordSwitch();
-                            current = pendingCandidate.Name;
-                            currentCandidate = pendingCandidate;
-                            currentScan = targetScan;
-                            currentResponse = confirmedTarget;
-                            observing = true;
-                            opportunitySwitched = true;
-                            assuranceDecision = "自动寻优复检通过，已切换到实测更快节点";
-                            logger.Write("opportunity switched from=" + SafeName(oldCurrent) + " to=" +
-                                SafeName(current) + " baseline_ms=" + confirmedBaseline.ToString("F0") +
-                                " target_ms=" + confirmedTarget.ToString("F0"));
+                            SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
+                            if (!budget.Allowed)
+                            {
+                                assurance.Apply(AutomaticDecisionEvent.BudgetExhausted,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = current, ExpiresUtc = budget.AllowedAtUtc,
+                                        Reason = budget.Reason });
+                                assurance.PendingOptimization = null;
+                                assuranceDecision = "自动寻优达到切换预算，进入稳定观察";
+                            }
+                            else
+                            {
+                                DecisionTransition authorization = assurance.Apply(
+                                    AutomaticDecisionEvent.SwitchAuthorized,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = oldCurrent, Previous = oldCurrent,
+                                        Target = pendingCandidate.Name,
+                                        BaselineResponse = confirmedBaseline,
+                                        TargetResponse = confirmedTarget,
+                                        Reason = "confirmed material optimization" });
+                                bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(targetScan);
+                                string switchReason = "自动寻优：30 秒复检通过相对与绝对改善阈值";
+                                if (ApplyAutomaticSwitch(assurance, authorization, oldCurrent,
+                                    pendingCandidate.Name, switchReason, confirmedBaseline, true, provisional))
+                                {
+                                    current = pendingCandidate.Name;
+                                    currentCandidate = pendingCandidate;
+                                    currentScan = targetScan;
+                                    currentResponse = confirmedTarget;
+                                    observing = true;
+                                    opportunitySwitched = true;
+                                    assuranceDecision = "自动寻优复检通过，已切换到实测更快节点";
+                                    logger.Write("opportunity switched from=" + SafeName(oldCurrent) + " to=" +
+                                        SafeName(current) + " baseline_ms=" + confirmedBaseline.ToString("F0") +
+                                        " target_ms=" + confirmedTarget.ToString("F0"));
+                                }
+                            }
                         }
                         else
                         {
+                            assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                    Target = pendingCandidate.Name,
+                                    BaselineResponse = confirmedBaseline,
+                                    TargetResponse = confirmedTarget,
+                                    Reason = "optimization confirmation rejected" });
                             assurance.ClearPendingOptimization();
                             assuranceDecision = dryRun ? "自动寻优演练完成，未切换" : "自动寻优目标复检未达到切换标准";
                             logger.Write("opportunity pending rejected target=" + SafeName(pendingCandidate.Name) +
                                 " baseline_ms=" + confirmedBaseline.ToString("F0") + " target_ms=" +
-                                confirmedTarget.ToString("F0") + " comparable=" +
-                                OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices).ToString().ToLowerInvariant());
+                                confirmedTarget.ToString("F0") + " comparable=" + comparable.ToString().ToLowerInvariant() +
+                                " relative=" + improvement.RelativeImprovement.ToString("P1") +
+                                " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                                " reason=" + improvement.Reason);
                         }
                     }
                 }
@@ -738,12 +798,17 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
             bool opportunityDue = !opportunityActivity && !fastSwitched && serviceIncidentDecision == null &&
                 suppressedServices.Count == 0 && trafficIdle && (pathHealth == null || pathHealth.CanAutoSwitch) &&
+                (assurance.Decision.State == AutomaticDecisionState.Healthy ||
+                 assurance.Decision.State == AutomaticDecisionState.Degraded) &&
                 clock.UtcNow >= assurance.HoldUntilUtc && OpportunityOptimizationPolicy.ShouldScan(
                     preferences.AutomaticOptimization, observing, recentCurrentResponses,
                     assurance.LastOpportunityScanUtc, clock.UtcNow);
             if (opportunityDue)
             {
                 opportunityActivity = true;
+                assurance.Apply(AutomaticDecisionEvent.OptimizationDue,
+                    new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                        Reason = "scheduled opportunity scan" });
                 assurance.LastOpportunityScanUtc = clock.UtcNow;
                 List<CandidateNode> opportunityPool = candidates.Where(x => x.Name != current).ToList();
                 Stopwatch opportunityTimer = Stopwatch.StartNew();
@@ -783,19 +848,40 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     double baseline = orderedResponses.Count == 0 ? currentResponse :
                         orderedResponses[orderedResponses.Count / 2];
                     double targetResponse = QualityMeasurement.ResponseMilliseconds(fullTargetScan, 5000);
+                    MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
+                        baseline, targetResponse, assurance.HasRecentAutomaticSwitch(clock.UtcNow));
                     if (OpportunityOptimizationPolicy.IsPerformanceComparable(fullTargetScan, requiredServices) &&
-                        OpportunityOptimizationPolicy.MateriallyBetter(baseline, targetResponse))
+                        improvement.Accepted)
                     {
                         assurance.PendingOptimization = new PendingOptimization { Scope = memoryScope,
                             Current = current, Target = target, BaselineResponse = baseline,
                             TargetResponse = targetResponse, CreatedUtc = clock.UtcNow };
+                        assurance.Apply(AutomaticDecisionEvent.OptimizationTargetPrepared,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
+                                Current = current, Target = target, BaselineResponse = baseline,
+                                TargetResponse = targetResponse,
+                                ExpiresUtc = clock.UtcNow.Add(OpportunityOptimizationPolicy.PendingLifetime),
+                                Reason = "material optimization target prepared" });
                         assuranceDecision = "已找到更快候选，30 秒后自动确认";
                         logger.Write("opportunity pending target=" + SafeName(target) + " baseline_ms=" +
                             baseline.ToString("F0") + " target_ms=" + targetResponse.ToString("F0"));
                     }
-                    else assurance.ClearPendingOptimization();
+                    else
+                    {
+                        assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Target = target, BaselineResponse = baseline,
+                                TargetResponse = targetResponse, Reason = improvement.Reason });
+                        assurance.ClearPendingOptimization();
+                    }
                 }
-                else assurance.ClearPendingOptimization();
+                else
+                {
+                    assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            Reason = "no comparable optimization target" });
+                    assurance.ClearPendingOptimization();
+                }
                 opportunityTimer.Stop();
                 logger.Write("opportunity scan elapsed_ms=" + opportunityTimer.ElapsedMilliseconds +
                     " checked=" + checkedCandidates + " eligible=" + comparableScans.Count);
@@ -1022,15 +1108,42 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     bool provisional = !ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan,
                         experience, memoryScope, requiredServices, clock.UtcNow);
                     if (!currentCompatible && provisional) reason = "provisional emergency failover";
-                    SelectRecorded(current, best.Key, "自动切换：" + StatusReport.DecisionText(reason));
-                    assurance.Begin(current, best.Key, currentResponse, currentCompatible, provisional, clock.UtcNow);
-                    experienceStore.Save(experience, clock.UtcNow);
-                    previousSelectedNode = current;
-                    controller.RecordSwitch();
-                    switched = true;
-                    reportedScore = suppressedServices.Count == 0 ? (double?)best.Value.Score : null;
-                    decision = "已切换：" + reason;
-                    logger.Write("switched node=" + SafeName(best.Key) + " score=" + best.Value.Score.ToString("F1") + " reason=" + reason);
+                    if (currentCompatible)
+                    {
+                        shouldSwitch = false;
+                        decision = "性能寻优需经过两阶段确认，保留当前节点";
+                    }
+                    else
+                    {
+                        if (assurance.Decision.State != AutomaticDecisionState.Recovering)
+                        {
+                            assurance.Apply(AutomaticDecisionEvent.HardFailure,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Evidence = DecisionEvidenceClass.HardFailure,
+                                    Reason = "confirmed failure fallback" });
+                            assurance.Apply(AutomaticDecisionEvent.FailureConfirmed,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Evidence = DecisionEvidenceClass.HardFailure });
+                        }
+                        DecisionTransition authorization = assurance.Apply(
+                            AutomaticDecisionEvent.RecoveryTargetReady,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = current, Previous = current, Target = best.Key,
+                                Evidence = DecisionEvidenceClass.HardFailure,
+                                BaselineResponse = currentResponse,
+                                TargetResponse = QualityMeasurement.ResponseMilliseconds(selectedTargetScan, 5000),
+                                Reason = reason });
+                        if (ApplyAutomaticSwitch(assurance, authorization, current, best.Key,
+                            "自动切换：" + StatusReport.DecisionText(reason), currentResponse,
+                            false, provisional))
+                        {
+                            experienceStore.Save(experience, clock.UtcNow);
+                            switched = true;
+                            reportedScore = suppressedServices.Count == 0 ? (double?)best.Value.Score : null;
+                            decision = "已切换：" + reason;
+                            logger.Write("switched node=" + SafeName(best.Key) + " score=" + best.Value.Score.ToString("F1") + " reason=" + reason);
+                        }
+                    }
                 }
             }
             if (dryRun) logger.Write("dry-run quality evaluation completed; shared selector unchanged");
