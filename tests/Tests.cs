@@ -83,6 +83,7 @@ internal static class Tests
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
         AutomaticDecisionPolicyBehavior();
+        AutomaticDecisionStateMachineBehavior();
         StabilityAndState();
         RuntimeGuards();
         SelectorFollowerBehavior();
@@ -2019,6 +2020,129 @@ internal static class Tests
             "recent switch raises relative requirement to thirty percent");
         Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, true).Accepted,
             "recent switch accepts a thirty-percent material improvement");
+    }
+
+    private static void AutomaticDecisionStateMachineBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 21, 8, 0, 0, DateTimeKind.Utc);
+        var current = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.Healthy,
+            Scope = "scope",
+            Current = "current",
+            StartedUtc = now
+        };
+        DecisionTransition transition = AutomaticDecisionStateMachine.Transition(current,
+            AutomaticDecisionEvent.NormalDegradation,
+            new AutomaticDecisionContext { NowUtc = now, Evidence = DecisionEvidenceClass.NormalDegradation });
+        Equal(AutomaticDecisionState.Degraded, transition.Transaction.State,
+            "normal degradation enters degraded state");
+        Equal(AutomaticDecisionDirective.None, transition.Directive,
+            "normal degradation does not start an automatic transaction");
+
+        transition = AutomaticDecisionStateMachine.Transition(current,
+            AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now, Evidence = DecisionEvidenceClass.HardFailure,
+                Service = ServiceKind.ChatGPT, Reason = "region blocked" });
+        Equal(AutomaticDecisionState.ConfirmingFailure, transition.Transaction.State,
+            "hard failure preempts healthy state");
+        Equal(AutomaticDecisionDirective.ConfirmCurrent, transition.Directive,
+            "hard failure requests focused confirmation");
+
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.FailureConfirmed,
+            new AutomaticDecisionContext { NowUtc = now.AddSeconds(1),
+                Evidence = DecisionEvidenceClass.HardFailure });
+        Equal(AutomaticDecisionState.Recovering, transition.Transaction.State,
+            "confirmed hard failure enters recovery");
+        Equal(AutomaticDecisionDirective.SearchRecovery, transition.Directive,
+            "confirmed hard failure requests candidate recovery");
+
+        var optimization = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.SearchingOptimization,
+            Scope = "scope", Current = "current", StartedUtc = now
+        };
+        transition = AutomaticDecisionStateMachine.Transition(optimization,
+            AutomaticDecisionEvent.OptimizationTargetPrepared,
+            new AutomaticDecisionContext { NowUtc = now, Target = "target", BaselineResponse = 1200,
+                TargetResponse = 700, Reason = "candidate ready" });
+        Equal(AutomaticDecisionState.ConfirmingOptimization, transition.Transaction.State,
+            "prepared optimization target enters confirmation");
+        Equal(AutomaticDecisionDirective.ConfirmOptimization, transition.Directive,
+            "prepared target requests delayed confirmation");
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now.AddSeconds(2),
+                Evidence = DecisionEvidenceClass.HardFailure, Service = ServiceKind.Gemini });
+        Equal(AutomaticDecisionState.ConfirmingFailure, transition.Transaction.State,
+            "hard failure cancels pending optimization");
+        Equal<string>(null, transition.Transaction.Target,
+            "hard failure clears stale optimization target");
+
+        var switching = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.Switching, Current = "current", Target = "target",
+            Previous = "current", StartedUtc = now
+        };
+        transition = AutomaticDecisionStateMachine.Transition(switching,
+            AutomaticDecisionEvent.SwitchSucceeded,
+            new AutomaticDecisionContext { NowUtc = now.AddSeconds(3) });
+        Equal(AutomaticDecisionState.Observing, transition.Transaction.State,
+            "successful switch enters observation");
+        Equal(AutomaticDecisionDirective.Observe, transition.Directive,
+            "successful switch requests observation");
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.ObservationComplete,
+            new AutomaticDecisionContext { NowUtc = now.AddMinutes(2),
+                ExpiresUtc = now.AddMinutes(32) });
+        Equal(AutomaticDecisionState.Cooldown, transition.Transaction.State,
+            "completed observation enters cooldown");
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.CooldownExpired,
+            new AutomaticDecisionContext { NowUtc = now.AddMinutes(32) });
+        Equal(AutomaticDecisionState.Healthy, transition.Transaction.State,
+            "expired cooldown returns to healthy state");
+
+        transition = AutomaticDecisionStateMachine.Transition(optimization,
+            AutomaticDecisionEvent.ManualNodeChanged,
+            new AutomaticDecisionContext { NowUtc = now, Current = "manual" });
+        Equal(AutomaticDecisionState.Cooldown, transition.Transaction.State,
+            "manual selection cancels automatic transaction into cooldown");
+        Equal(AutomaticDecisionDirective.Cancel, transition.Directive,
+            "manual selection emits cancellation directive");
+        Equal<string>(null, transition.Transaction.Target,
+            "manual selection clears pending target");
+
+        var stabilizing = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.Stabilization, Current = "current",
+            ExpiresUtc = now.AddMinutes(5)
+        };
+        transition = AutomaticDecisionStateMachine.Transition(stabilizing,
+            AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now,
+                Evidence = DecisionEvidenceClass.HardFailure, Service = ServiceKind.ChatGPT });
+        Equal(AutomaticDecisionState.ConfirmingFailure, transition.Transaction.State,
+            "hard failure bypasses stabilization");
+
+        var oneRecent = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "a", To = "b" }
+        };
+        Equal(true, SwitchBudgetPolicy.CanSwitch(oneRecent, now).Allowed,
+            "second switch inside ten minutes remains allowed");
+        var twoRecent = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "c" }
+        };
+        Equal(false, SwitchBudgetPolicy.CanSwitch(twoRecent, now).Allowed,
+            "third switch inside ten minutes enters stabilization");
+        var fourRecent = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-29), From = "a", To = "b" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-20), From = "b", To = "c" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-11), From = "c", To = "d" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "d", To = "e" }
+        };
+        Equal(false, SwitchBudgetPolicy.CanSwitch(fourRecent, now).Allowed,
+            "fifth switch inside thirty minutes enters stabilization");
+        Equal(true, SwitchBudgetPolicy.CanSwitch(twoRecent, now.AddMinutes(2)).Allowed,
+            "budget automatically releases when the rolling slot expires");
     }
 
     private static void RunEligibleFastFailoverOrchestration()
