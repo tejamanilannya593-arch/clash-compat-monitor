@@ -329,6 +329,22 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             var qualityStore = new QualityStateStore(config.QualityStatePath);
             List<QualitySample> qualityHistory = qualityStore.Load();
             string current = mihomo.GetSelected(config.SharedGroup);
+            string previouslyObservedNode = experience.LastNode;
+            assurance.EnsureDecisionState(current, clock.UtcNow);
+            if (!String.IsNullOrEmpty(previouslyObservedNode) &&
+                !String.Equals(previouslyObservedNode, current, StringComparison.Ordinal) &&
+                assurance.Decision.State != AutomaticDecisionState.Healthy &&
+                assurance.Decision.State != AutomaticDecisionState.Degraded &&
+                assurance.Decision.State != AutomaticDecisionState.Cooldown)
+            {
+                assurance.Apply(AutomaticDecisionEvent.ManualNodeChanged,
+                    new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                        ExpiresUtc = clock.UtcNow.AddMinutes(10), Reason = "external selector change" });
+                assurance.Target = null;
+                assurance.Previous = null;
+                assurance.PendingOptimization = null;
+                assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(10);
+            }
             ProxyPathHealth pathHealth = null;
             string cycleStartNode = current;
             experience.RecordChange(experience.LastNode, current, "检测到外部变更（Clash 手动选择或核心重载）", clock.UtcNow);
@@ -351,7 +367,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             logger.Write("current check completed elapsed_seconds=" + cycleTimer.Elapsed.TotalSeconds.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) +
                 " health=" + currentScan.Health);
             string assuranceDecision = null;
-            bool observing = !String.IsNullOrEmpty(assurance.Target);
+            bool observing = assurance.Decision.State == AutomaticDecisionState.Observing;
             string serviceIncidentDecision = suppressedServices.Count == 0 || currentScan.Health != CandidateHealth.Unknown ? null :
                 ServiceIncidentText(suppressedServices) + " 多节点同类异常，熔断观察中，不归因于节点";
             var scans = new Dictionary<string, CandidateScanResult>(StringComparer.Ordinal);
@@ -386,10 +402,31 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 currentFailureConfirmed = severeLatency
                     ? StartupRecovery.ConfirmsSevereLatency(confirmation, failedService)
                     : confirmation.Health != CandidateHealth.Unknown && !ConnectionAssurance.Passed(confirmation);
+                DecisionEvidenceClass evidenceClass = DecisionEvidencePolicy.Classify(
+                    confirmation, severeLatency && currentFailureConfirmed);
                 logger.Write("current failure confirmation node=" + SafeName(current) + " service=" + failedService +
-                    " health=" + confirmation.Health + " confirmed=" + currentFailureConfirmed.ToString().ToLowerInvariant());
+                    " health=" + confirmation.Health + " confirmed=" + currentFailureConfirmed.ToString().ToLowerInvariant() +
+                    " evidence=" + evidenceClass);
                 if (currentFailureConfirmed)
                 {
+                    assurance.ClearPendingOptimization();
+                    if (evidenceClass == DecisionEvidenceClass.HardFailure)
+                    {
+                        assurance.Apply(AutomaticDecisionEvent.HardFailure,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Service = failedService, Evidence = evidenceClass,
+                                Reason = "confirmed hard failure" });
+                        assurance.Apply(AutomaticDecisionEvent.FailureConfirmed,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Service = failedService, Evidence = evidenceClass });
+                    }
+                    else
+                    {
+                        assurance.Apply(AutomaticDecisionEvent.SevereDegradation,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Service = failedService, Evidence = evidenceClass,
+                                Reason = "confirmed severe degradation" });
+                    }
                     var incidentChecks = new List<CandidateScanResult>();
                     List<CandidateNode> delayPool = candidates.Where(x => x.Name != current).ToList();
                     Stopwatch delayTimer = Stopwatch.StartNew();
@@ -445,13 +482,45 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(replacementScan);
                         double selectedResponse = QualityMeasurement.ResponseMilliseconds(replacementScan, 5000);
                         selectedResponseForLog = selectedResponse;
+                        if (severeLatency)
+                        {
+                            ProbeResult slowResult;
+                            double severeBaseline = confirmation.ServiceResults.TryGetValue(failedService, out slowResult) &&
+                                slowResult != null ? slowResult.ElapsedMilliseconds : failedNodeResponse;
+                            MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
+                                severeBaseline, selectedResponse,
+                                assurance.HasRecentAutomaticSwitch(clock.UtcNow));
+                            logger.Write("severe degradation target=" + SafeName(standby) +
+                                " baseline_ms=" + severeBaseline.ToString("F0") +
+                                " target_ms=" + selectedResponse.ToString("F0") +
+                                " relative=" + improvement.RelativeImprovement.ToString("P1") +
+                                " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                                " accepted=" + improvement.Accepted.ToString().ToLowerInvariant() +
+                                " reason=" + improvement.Reason);
+                            if (!improvement.Accepted) break;
+                            SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
+                            if (!budget.Allowed)
+                            {
+                                assurance.Apply(AutomaticDecisionEvent.BudgetExhausted,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = current, ExpiresUtc = budget.AllowedAtUtc,
+                                        Evidence = evidenceClass, Reason = budget.Reason });
+                                assuranceDecision = "自动切换次数达到预算，进入稳定观察";
+                                break;
+                            }
+                        }
+                        DecisionTransition switchTransition = assurance.Apply(
+                            AutomaticDecisionEvent.RecoveryTargetReady,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = failedNode, Previous = failedNode, Target = standby,
+                                Service = failedService, Evidence = evidenceClass,
+                                BaselineResponse = failedNodeResponse,
+                                TargetResponse = selectedResponse });
                         string fastSelectionSummary = StartupRecovery.FastSelectionSummary(selectedResponse);
                         string fastReason = severeLatency ? "当前节点单项响应超过 2000 ms，" + fastSelectionSummary + "完整验证通过" :
                             "当前节点故障，" + fastSelectionSummary + "完整验证通过，快速切换";
-                        SelectRecorded(failedNode, standby, fastReason);
-                        assurance.Begin(failedNode, standby, failedNodeResponse, false, provisional, clock.UtcNow);
-                        previousSelectedNode = failedNode;
-                        controller.RecordSwitch();
+                        if (!ApplyAutomaticSwitch(assurance, switchTransition, failedNode,
+                            standby, fastReason, failedNodeResponse, false, provisional)) continue;
                         current = standby;
                         currentCandidate = standbyCandidate;
                         currentScan = replacementScan;
@@ -465,6 +534,14 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             " failed_service=" + failedService + " target_health=" + replacementScan.Health +
                             " response_ms=" + selectedResponse.ToString("F0"));
                         break;
+                    }
+                    if (!fastSwitched && severeLatency &&
+                        assurance.Decision.State != AutomaticDecisionState.Stabilization)
+                    {
+                        assurance.Apply(AutomaticDecisionEvent.NoRecoveryTarget,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Evidence = DecisionEvidenceClass.SevereDegradation,
+                                Reason = "no materially better severe-degradation target" });
                     }
                     logger.Write("fast selection delay_ms=" + delayTimer.ElapsedMilliseconds +
                         " checked=" + comparedCandidates + " eligible=" + verifiedTargets.Length +
@@ -494,6 +571,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
                 else
                 {
+                    assurance.Apply(AutomaticDecisionEvent.FailureRecovered,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            Evidence = DecisionEvidenceClass.Healthy,
+                            Reason = "focused confirmation recovered" });
                     currentScan = StartupRecovery.ApplySuccessfulConfirmation(currentScan, confirmation, failedService);
                     scans[currentScan.Name] = currentScan;
                     scanTimes[currentScan.Name] = clock.UtcNow;
@@ -1053,6 +1134,44 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     {
         try { logger.Write("region eligibility save failed " + error.GetType().Name); }
         catch { }
+    }
+
+private bool ApplyAutomaticSwitch(ConnectionAssurance assurance,
+        DecisionTransition authorization, string expectedSource, string target,
+        string reason, double baselineResponse, bool quality, bool provisional)
+    {
+        if (authorization == null || !authorization.Accepted ||
+            (authorization.Directive != AutomaticDecisionDirective.Switch &&
+             authorization.Directive != AutomaticDecisionDirective.Rollback))
+            return false;
+        if (!String.Equals(mihomo.GetSelected(config.SharedGroup), expectedSource,
+            StringComparison.Ordinal))
+        {
+            assurance.Apply(AutomaticDecisionEvent.SwitchFailed,
+                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                    Current = expectedSource, Target = target,
+                    Reason = "selector changed before authorized switch" });
+            return false;
+        }
+
+        try
+        {
+            SelectRecorded(expectedSource, target, reason);
+            assurance.RecordAutomaticSwitch(expectedSource, target, reason, clock.UtcNow);
+            assurance.Begin(expectedSource, target, baselineResponse, quality,
+                provisional, clock.UtcNow);
+            previousSelectedNode = expectedSource;
+            controller.RecordSwitch();
+            return true;
+        }
+        catch
+        {
+            assurance.Apply(AutomaticDecisionEvent.SwitchFailed,
+                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                    Current = expectedSource, Target = target,
+                    Reason = "authorized selector write failed" });
+            throw;
+        }
     }
 
     private void SelectRecorded(string from, string to, string reason)

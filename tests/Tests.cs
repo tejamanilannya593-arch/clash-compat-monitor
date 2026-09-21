@@ -1158,6 +1158,19 @@ internal static class Tests
             new ConnectionAssurance().EnsureDecisionState("b", now).State,
             "empty legacy assurance starts healthy");
 
+        var activeRecovery = new ConnectionAssurance();
+        activeRecovery.EnsureDecisionState("a", now);
+        activeRecovery.Apply(AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now, Current = "a" });
+        activeRecovery.Apply(AutomaticDecisionEvent.FailureConfirmed,
+            new AutomaticDecisionContext { NowUtc = now, Current = "a" });
+        DecisionTransition recoveryReady = activeRecovery.Apply(AutomaticDecisionEvent.RecoveryTargetReady,
+            new AutomaticDecisionContext { NowUtc = now, Current = "a", Previous = "a", Target = "b" });
+        Equal(true, recoveryReady.Accepted,
+            "active recovery events are not normalized as interrupted persistence");
+        Equal(AutomaticDecisionState.Switching, activeRecovery.Decision.State,
+            "active recovery reaches switching through assurance events");
+
         var interrupted = new ConnectionAssurance {
             Decision = new AutomaticDecisionTransaction {
                 State = AutomaticDecisionState.SearchingOptimization,
@@ -1825,6 +1838,8 @@ internal static class Tests
         {
             RunRecoveredSevereLatencyOrchestration();
             RunConfirmedSevereLatencyOrchestration();
+            RunUnhelpfulSevereLatencyOrchestration();
+            RunBudgetedSevereLatencyOrchestration();
             RunEligibleFastFailoverOrchestration();
             RunEightCandidateFastFailoverBound();
             RunAutomaticOpportunityOrchestration();
@@ -2027,6 +2042,83 @@ internal static class Tests
             basic.ServiceResults, "0000000000000000000000000000000000000000000000000000000000000002", "HK");
         Equal(false, OpportunityOptimizationPolicy.IsPerformanceComparable(unsupported, required),
             "unsupported actual exit cannot participate in proactive comparison");
+    }
+
+    private static void RunUnhelpfulSevereLatencyOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-latency-unhelpful-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 3)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var probe = new SevereLatencyProbe(mihomo, 2100, 1950);
+            DateTime now = new DateTime(2026, 9, 21, 9, 0, 0, DateTimeKind.Utc);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo, probe,
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "severe degradation keeps current when absolute improvement is too small");
+            ExperienceData persisted = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal(AutomaticDecisionState.Degraded, persisted.Assurance.Decision.State,
+                "rejected severe degradation ends in degraded state");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunBudgetedSevereLatencyOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-latency-budget-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 21, 9, 10, 0, DateTimeKind.Utc);
+            var persisted = new ExperienceData {
+                Assurance = new ConnectionAssurance {
+                    AutomaticSwitches = new List<AutomaticSwitchRecord> {
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b" },
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "current" }
+                    }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            string[] alternatives = Enumerable.Range(1, 3)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new SevereLatencyProbe(mihomo, 2100, 300),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "switch budget blocks severe degradation churn");
+            ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal(AutomaticDecisionState.Stabilization, after.Assurance.Decision.State,
+                "exhausted switch budget enters stabilization");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
     }
 
     private static void AutomaticDecisionPolicyBehavior()
@@ -2610,12 +2702,20 @@ internal static class Tests
     {
         private readonly OrchestratedMihomo mihomo;
         private readonly long retryMilliseconds;
+        private readonly long alternativeMilliseconds;
         private int currentChatGptCalls;
 
         public SevereLatencyProbe(OrchestratedMihomo mihomo, long retryMilliseconds)
+            : this(mihomo, retryMilliseconds, 300)
+        {
+        }
+
+        public SevereLatencyProbe(OrchestratedMihomo mihomo, long retryMilliseconds,
+            long alternativeMilliseconds)
         {
             this.mihomo = mihomo;
             this.retryMilliseconds = retryMilliseconds;
+            this.alternativeMilliseconds = alternativeMilliseconds;
         }
 
         public int CurrentChatGptCalls { get { return currentChatGptCalls; } }
@@ -2630,7 +2730,7 @@ internal static class Tests
                 int call = Interlocked.Increment(ref currentChatGptCalls);
                 return ProbeResult.Success(call == 1 ? 2100 : retryMilliseconds);
             }
-            return ProbeResult.Success(300);
+            return ProbeResult.Success(alternativeMilliseconds);
         }
     }
 

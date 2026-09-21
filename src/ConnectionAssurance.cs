@@ -63,6 +63,20 @@ public sealed class ConnectionAssurance
         ProvisionalSwitch = provisional; StartedUtc = startedUtc ?? DateTime.UtcNow;
         VerificationCount = 0; FailedChecks = 0; SlowerChecks = 0; StableCycles = 0;
         PendingOptimization = null;
+        if (Decision != null && Decision.State == AutomaticDecisionState.Switching)
+        {
+            DecisionTransition completed = AutomaticDecisionStateMachine.Transition(Decision,
+                AutomaticDecisionEvent.SwitchSucceeded, new AutomaticDecisionContext {
+                    NowUtc = StartedUtc, Current = target, Previous = previous, Target = target,
+                    BaselineResponse = response,
+                    Reason = quality ? "quality switch observing" : "recovery switch observing"
+                });
+            if (completed.Accepted)
+            {
+                Decision = completed.Transaction;
+                return;
+            }
+        }
         long revision = Decision == null ? 1 : Decision.Revision + 1;
         Decision = new AutomaticDecisionTransaction {
             State = AutomaticDecisionState.Observing, Scope = Scope, Current = target,
@@ -159,7 +173,11 @@ public sealed class ConnectionAssurance
     {
         DateTime now = context == null || context.NowUtc == DateTime.MinValue
             ? DateTime.UtcNow : context.NowUtc;
-        EnsureDecisionState(context == null ? null : context.Current, now);
+        bool needsInitialization = Decision == null || (Decision.Revision == 0 &&
+            Decision.State == AutomaticDecisionState.Healthy &&
+            Decision.StartedUtc == DateTime.MinValue && String.IsNullOrEmpty(Decision.Reason));
+        if (needsInitialization)
+            EnsureDecisionState(context == null ? null : context.Current, now);
         DecisionTransition transition = AutomaticDecisionStateMachine.Transition(Decision, value, context);
         if (transition.Accepted) Decision = transition.Transaction;
         return transition;
