@@ -1118,6 +1118,69 @@ internal static class Tests
         Equal(null, restored.Target, "pending optimization is separate from switch observation");
         restored.Begin("b", "c", 1000, true, false, now);
         Equal(null, restored.PendingOptimization, "starting a real switch clears pending optimization");
+
+        policy.Decision = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.ConfirmingOptimization,
+            Scope = "scope", Current = "b", Target = "c",
+            BaselineResponse = 1000, TargetResponse = 500,
+            StartedUtc = now, ExpiresUtc = now.AddMinutes(2), Revision = 7
+        };
+        policy.AutomaticSwitches = new List<AutomaticSwitchRecord> {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b", Reason = "recovery" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "c", Reason = "optimization" }
+        };
+        restored = serializer.Deserialize<ConnectionAssurance>(serializer.Serialize(policy));
+        Equal(AutomaticDecisionState.ConfirmingOptimization, restored.Decision.State,
+            "automatic decision state survives restart");
+        Equal("c", restored.Decision.Target,
+            "automatic decision target survives restart");
+        Equal(7L, restored.Decision.Revision,
+            "automatic decision revision survives restart");
+        Equal(2, restored.AutomaticSwitches.Count,
+            "automatic switch budget history survives restart");
+
+        var legacyPending = new ConnectionAssurance {
+            PendingOptimization = new PendingOptimization { Scope = "scope", Current = "b", Target = "c",
+                BaselineResponse = 1000, TargetResponse = 500, CreatedUtc = now }
+        };
+        Equal(AutomaticDecisionState.ConfirmingOptimization,
+            legacyPending.EnsureDecisionState("b", now.AddSeconds(30)).State,
+            "legacy pending optimization migrates to confirmation state");
+        var legacyObservation = new ConnectionAssurance { Target = "b", Previous = "a", StartedUtc = now };
+        Equal(AutomaticDecisionState.Observing,
+            legacyObservation.EnsureDecisionState("b", now.AddSeconds(30)).State,
+            "legacy switch target migrates to observation state");
+        var legacyHold = new ConnectionAssurance { HoldUntilUtc = now.AddMinutes(5) };
+        Equal(AutomaticDecisionState.Cooldown,
+            legacyHold.EnsureDecisionState("b", now).State,
+            "legacy future hold migrates to cooldown state");
+        Equal(AutomaticDecisionState.Healthy,
+            new ConnectionAssurance().EnsureDecisionState("b", now).State,
+            "empty legacy assurance starts healthy");
+
+        var interrupted = new ConnectionAssurance {
+            Decision = new AutomaticDecisionTransaction {
+                State = AutomaticDecisionState.SearchingOptimization,
+                Current = "b", StartedUtc = now.AddSeconds(-10)
+            }
+        };
+        Equal(AutomaticDecisionState.Degraded,
+            interrupted.EnsureDecisionState("b", now).State,
+            "interrupted search normalizes to degraded after restart");
+        var expiredCooldown = new ConnectionAssurance {
+            Decision = new AutomaticDecisionTransaction {
+                State = AutomaticDecisionState.Cooldown,
+                Current = "b", ExpiresUtc = now.AddSeconds(-1)
+            }
+        };
+        Equal(AutomaticDecisionState.Healthy,
+            expiredCooldown.EnsureDecisionState("b", now).State,
+            "expired cooldown normalizes to healthy after restart");
+        policy.SetScope("another scope");
+        Equal(AutomaticDecisionState.Healthy, policy.Decision.State,
+            "scope change resets automatic decision state");
+        Equal<string>(null, policy.Decision.Target,
+            "scope change clears automatic decision target");
     }
 
     private static void ServiceIncidentBehavior()
