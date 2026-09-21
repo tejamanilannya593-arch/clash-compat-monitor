@@ -2198,6 +2198,15 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             ExperienceData persisted = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
             Equal(AutomaticDecisionState.Degraded, persisted.Assurance.Decision.State,
                 "rejected severe degradation ends in degraded state");
+            string log = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, log.Contains("state_from=") && log.Contains("state_to=") &&
+                log.Contains("event=") && log.Contains("evidence=") &&
+                log.Contains("directive=") && log.Contains("switches_10m=") &&
+                log.Contains("switches_30m="),
+                "decision trace records bounded transition fields");
+            Equal(true, log.Contains("required_relative=") &&
+                log.Contains("required_absolute_ms=") && log.Contains("accepted=false"),
+                "decision trace records active improvement thresholds and rejection");
         }
         finally
         {

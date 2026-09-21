@@ -133,6 +133,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         CheckStop();
         if (mihomo.GetSelected(config.SharedGroup) != current) return false;
         SelectRecorded(current, target, "用户恢复上一个节点（已复检）");
+        ConnectionAssurance assurance = experience.Assurance;
+        assurance.EnsureDecisionState(target, clock.UtcNow);
+        ApplyDecision(assurance, AutomaticDecisionEvent.ManualNodeChanged,
+            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = target,
+                ExpiresUtc = clock.UtcNow.AddMinutes(10),
+                Reason = "user restored previous node" });
         previousSelectedNode = current;
         controller.RecordSwitch();
         logger.Write("restored previous node=" + SafeName(target));
@@ -193,12 +199,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 if (ServiceEvidencePolicy.CanEmergencySwitch(verified) && mihomo.GetSelected(config.SharedGroup) == current &&
                     assurance.CanUserFeedbackRollback(current, clock.UtcNow))
                 {
-                    SelectRecorded(current, previous, "用户反馈 AI 服务失败，旧节点复检通过，自动回退");
-                    previousSelectedNode = current;
-                    assurance.Target = null;
-                    assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
-                    controller.RecordSwitch();
-                    logger.Write("user feedback rollback node=" + SafeName(previous));
+                    DecisionTransition authorization = ApplyDecision(assurance,
+                        AutomaticDecisionEvent.RollbackRequired,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                            Current = current, Previous = current, Target = previous,
+                            Reason = "user feedback rollback verified" });
+                    if (ApplyAutomaticSwitch(assurance, authorization, current, previous,
+                        "用户反馈 AI 服务失败，旧节点复检通过，自动回退",
+                        assurance.PreviousResponse, false, false))
+                    {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.ObservationComplete,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = previous, ExpiresUtc = clock.UtcNow.AddMinutes(30),
+                                Reason = "user feedback rollback completed" });
+                        assurance.Target = null;
+                        assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
+                        logger.Write("user feedback rollback node=" + SafeName(previous));
+                    }
                 }
             }
             finally
@@ -246,12 +263,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             mihomo.GetSelected(config.SharedGroup) == current &&
                             assurance.ShouldRecheckPreviousAfterBrowserResult(current, outcome, messageSent, clock.UtcNow))
                         {
-                            SelectRecorded(current, previous, "浏览器真实对话失败，旧节点复检通过，自动回退");
-                            previousSelectedNode = current;
-                            assurance.Target = null;
-                            assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
-                            controller.RecordSwitch();
-                            logger.Write("browser proof rollback node=" + SafeName(previous));
+                            DecisionTransition authorization = ApplyDecision(assurance,
+                                AutomaticDecisionEvent.RollbackRequired,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Previous = current, Target = previous,
+                                    Reason = "browser proof rollback verified" });
+                            if (ApplyAutomaticSwitch(assurance, authorization, current, previous,
+                                "浏览器真实对话失败，旧节点复检通过，自动回退",
+                                assurance.PreviousResponse, false, false))
+                            {
+                                ApplyDecision(assurance, AutomaticDecisionEvent.ObservationComplete,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = previous, ExpiresUtc = clock.UtcNow.AddMinutes(30),
+                                        Reason = "browser proof rollback completed" });
+                                assurance.Target = null;
+                                assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
+                                logger.Write("browser proof rollback node=" + SafeName(previous));
+                            }
                         }
                     }
                 }
@@ -332,12 +360,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             string previouslyObservedNode = experience.LastNode;
             assurance.EnsureDecisionState(current, clock.UtcNow);
             if (!String.IsNullOrEmpty(previouslyObservedNode) &&
-                !String.Equals(previouslyObservedNode, current, StringComparison.Ordinal) &&
-                assurance.Decision.State != AutomaticDecisionState.Healthy &&
-                assurance.Decision.State != AutomaticDecisionState.Degraded &&
-                assurance.Decision.State != AutomaticDecisionState.Cooldown)
+                !String.Equals(previouslyObservedNode, current, StringComparison.Ordinal))
             {
-                assurance.Apply(AutomaticDecisionEvent.ManualNodeChanged,
+                ApplyDecision(assurance, AutomaticDecisionEvent.ManualNodeChanged,
                     new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                         ExpiresUtc = clock.UtcNow.AddMinutes(10), Reason = "external selector change" });
                 assurance.Target = null;
@@ -412,17 +437,17 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     assurance.ClearPendingOptimization();
                     if (evidenceClass == DecisionEvidenceClass.HardFailure)
                     {
-                        assurance.Apply(AutomaticDecisionEvent.HardFailure,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.HardFailure,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 Service = failedService, Evidence = evidenceClass,
                                 Reason = "confirmed hard failure" });
-                        assurance.Apply(AutomaticDecisionEvent.FailureConfirmed,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.FailureConfirmed,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 Service = failedService, Evidence = evidenceClass });
                     }
                     else
                     {
-                        assurance.Apply(AutomaticDecisionEvent.SevereDegradation,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.SevereDegradation,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 Service = failedService, Evidence = evidenceClass,
                                 Reason = "confirmed severe degradation" });
@@ -495,13 +520,15 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                                 " target_ms=" + selectedResponse.ToString("F0") +
                                 " relative=" + improvement.RelativeImprovement.ToString("P1") +
                                 " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                                " required_relative=" + improvement.RequiredRelativeImprovement.ToString("P0") +
+                                " required_absolute_ms=" + improvement.RequiredAbsoluteImprovementMilliseconds.ToString("F0") +
                                 " accepted=" + improvement.Accepted.ToString().ToLowerInvariant() +
                                 " reason=" + improvement.Reason);
                             if (!improvement.Accepted) break;
                             SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
                             if (!budget.Allowed)
                             {
-                                assurance.Apply(AutomaticDecisionEvent.BudgetExhausted,
+                                ApplyDecision(assurance, AutomaticDecisionEvent.BudgetExhausted,
                                     new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                         Current = current, ExpiresUtc = budget.AllowedAtUtc,
                                         Evidence = evidenceClass, Reason = budget.Reason });
@@ -509,7 +536,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                                 break;
                             }
                         }
-                        DecisionTransition switchTransition = assurance.Apply(
+                        DecisionTransition switchTransition = ApplyDecision(assurance,
                             AutomaticDecisionEvent.RecoveryTargetReady,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                 Current = failedNode, Previous = failedNode, Target = standby,
@@ -538,7 +565,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     if (!fastSwitched && severeLatency &&
                         assurance.Decision.State != AutomaticDecisionState.Stabilization)
                     {
-                        assurance.Apply(AutomaticDecisionEvent.NoRecoveryTarget,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.NoRecoveryTarget,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 Evidence = DecisionEvidenceClass.SevereDegradation,
                                 Reason = "no materially better severe-degradation target" });
@@ -571,7 +598,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
                 else
                 {
-                    assurance.Apply(AutomaticDecisionEvent.FailureRecovered,
+                    ApplyDecision(assurance, AutomaticDecisionEvent.FailureRecovered,
                         new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                             Evidence = DecisionEvidenceClass.Healthy,
                             Reason = "focused confirmation recovered" });
@@ -592,7 +619,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 assurance.Target = null;
                 assurance.HoldUntilUtc = experience.ServiceIncidents.Where(x => x != null &&
                     suppressedServices.Contains(x.Service)).Select(x => x.UntilUtc).DefaultIfEmpty(clock.UtcNow.AddMinutes(10)).Max();
-                assurance.Apply(AutomaticDecisionEvent.OutageDetected,
+                ApplyDecision(assurance, AutomaticDecisionEvent.OutageDetected,
                     new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                         ExpiresUtc = assurance.HoldUntilUtc,
                         Reason = "service incident interrupted observation" });
@@ -603,7 +630,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             {
                 if (assurance.Target != current)
                 {
-                    assurance.Apply(AutomaticDecisionEvent.ManualNodeChanged,
+                    ApplyDecision(assurance, AutomaticDecisionEvent.ManualNodeChanged,
                         new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                             ExpiresUtc = clock.UtcNow.AddMinutes(10),
                             Reason = "selector changed during observation" });
@@ -624,7 +651,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             (!ConnectionAssurance.Passed(currentScan) || QualityMeasurement.ResponseMilliseconds(oldScan, 5000) < QualityMeasurement.ResponseMilliseconds(currentScan, 5000) * 0.8) &&
                             mihomo.GetSelected(config.SharedGroup) == current)
                         {
-                            DecisionTransition rollbackAuthorization = assurance.Apply(
+                            DecisionTransition rollbackAuthorization = ApplyDecision(assurance,
                                 AutomaticDecisionEvent.RollbackRequired,
                                 new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                     Current = current, Previous = current, Target = old.Name,
@@ -644,7 +671,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     if (assurance.VerificationCount >= 2)
                     {
                         if (!rollback) assuranceDecision = ConnectionAssurance.Passed(currentScan) ? "切换后复检通过，保持连接" : "切换后证据不足，暂缓寻优";
-                        assurance.Apply(AutomaticDecisionEvent.ObservationComplete,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.ObservationComplete,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 ExpiresUtc = clock.UtcNow.AddMinutes(30),
                                 Reason = "switch observation completed" });
@@ -697,7 +724,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 if (cancelReason != null)
                 {
                     logger.Write("opportunity pending cancelled reason=" + cancelReason);
-                    assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                    ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
                         new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                             Target = pendingOptimization.Target, Reason = cancelReason });
                     assurance.ClearPendingOptimization();
@@ -708,7 +735,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     CandidateNode pendingCandidate = candidates.FirstOrDefault(x => x.Name == pendingOptimization.Target);
                     if (pendingCandidate == null)
                     {
-                        assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 Target = pendingOptimization.Target,
                                 Reason = "pending target removed" });
@@ -739,7 +766,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
                             if (!budget.Allowed)
                             {
-                                assurance.Apply(AutomaticDecisionEvent.BudgetExhausted,
+                                ApplyDecision(assurance, AutomaticDecisionEvent.BudgetExhausted,
                                     new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                         Current = current, ExpiresUtc = budget.AllowedAtUtc,
                                         Reason = budget.Reason });
@@ -748,7 +775,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             }
                             else
                             {
-                                DecisionTransition authorization = assurance.Apply(
+                                DecisionTransition authorization = ApplyDecision(assurance,
                                     AutomaticDecisionEvent.SwitchAuthorized,
                                     new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                         Current = oldCurrent, Previous = oldCurrent,
@@ -776,7 +803,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         }
                         else
                         {
-                            assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                            ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
                                 new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                     Target = pendingCandidate.Name,
                                     BaselineResponse = confirmedBaseline,
@@ -789,6 +816,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                                 confirmedTarget.ToString("F0") + " comparable=" + comparable.ToString().ToLowerInvariant() +
                                 " relative=" + improvement.RelativeImprovement.ToString("P1") +
                                 " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                                " required_relative=" + improvement.RequiredRelativeImprovement.ToString("P0") +
+                                " required_absolute_ms=" + improvement.RequiredAbsoluteImprovementMilliseconds.ToString("F0") +
                                 " reason=" + improvement.Reason);
                         }
                     }
@@ -806,7 +835,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             if (opportunityDue)
             {
                 opportunityActivity = true;
-                assurance.Apply(AutomaticDecisionEvent.OptimizationDue,
+                ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationDue,
                     new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                         Reason = "scheduled opportunity scan" });
                 assurance.LastOpportunityScanUtc = clock.UtcNow;
@@ -856,7 +885,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         assurance.PendingOptimization = new PendingOptimization { Scope = memoryScope,
                             Current = current, Target = target, BaselineResponse = baseline,
                             TargetResponse = targetResponse, CreatedUtc = clock.UtcNow };
-                        assurance.Apply(AutomaticDecisionEvent.OptimizationTargetPrepared,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
                                 Current = current, Target = target, BaselineResponse = baseline,
                                 TargetResponse = targetResponse,
@@ -864,11 +893,15 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                                 Reason = "material optimization target prepared" });
                         assuranceDecision = "已找到更快候选，30 秒后自动确认";
                         logger.Write("opportunity pending target=" + SafeName(target) + " baseline_ms=" +
-                            baseline.ToString("F0") + " target_ms=" + targetResponse.ToString("F0"));
+                            baseline.ToString("F0") + " target_ms=" + targetResponse.ToString("F0") +
+                            " relative=" + improvement.RelativeImprovement.ToString("P1") +
+                            " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                            " required_relative=" + improvement.RequiredRelativeImprovement.ToString("P0") +
+                            " required_absolute_ms=" + improvement.RequiredAbsoluteImprovementMilliseconds.ToString("F0"));
                     }
                     else
                     {
-                        assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 Target = target, BaselineResponse = baseline,
                                 TargetResponse = targetResponse, Reason = improvement.Reason });
@@ -877,7 +910,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
                 else
                 {
-                    assurance.Apply(AutomaticDecisionEvent.OptimizationRejected,
+                    ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
                         new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                             Reason = "no comparable optimization target" });
                     assurance.ClearPendingOptimization();
@@ -1117,15 +1150,15 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     {
                         if (assurance.Decision.State != AutomaticDecisionState.Recovering)
                         {
-                            assurance.Apply(AutomaticDecisionEvent.HardFailure,
+                            ApplyDecision(assurance, AutomaticDecisionEvent.HardFailure,
                                 new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                     Current = current, Evidence = DecisionEvidenceClass.HardFailure,
                                     Reason = "confirmed failure fallback" });
-                            assurance.Apply(AutomaticDecisionEvent.FailureConfirmed,
+                            ApplyDecision(assurance, AutomaticDecisionEvent.FailureConfirmed,
                                 new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                     Current = current, Evidence = DecisionEvidenceClass.HardFailure });
                         }
-                        DecisionTransition authorization = assurance.Apply(
+                        DecisionTransition authorization = ApplyDecision(assurance,
                             AutomaticDecisionEvent.RecoveryTargetReady,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                                 Current = current, Previous = current, Target = best.Key,
@@ -1249,7 +1282,30 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         catch { }
     }
 
-private bool ApplyAutomaticSwitch(ConnectionAssurance assurance,
+    private DecisionTransition ApplyDecision(ConnectionAssurance assurance,
+        AutomaticDecisionEvent value, AutomaticDecisionContext context)
+    {
+        DecisionTransition transition = assurance.Apply(value, context);
+        DateTime now = context == null || context.NowUtc == DateTime.MinValue
+            ? clock.UtcNow : context.NowUtc;
+        IList<AutomaticSwitchRecord> history = assurance.AutomaticSwitches ??
+            new List<AutomaticSwitchRecord>();
+        int switches10 = history.Count(x => x != null && x.Utc <= now &&
+            x.Utc > now.AddMinutes(-10));
+        int switches30 = history.Count(x => x != null && x.Utc <= now &&
+            x.Utc > now.AddMinutes(-30));
+        AutomaticDecisionTransaction transaction = transition.Transaction ??
+            assurance.Decision ?? new AutomaticDecisionTransaction();
+        logger.Write("decision transition state_from=" + transition.PreviousState +
+            " state_to=" + transaction.State + " event=" + value +
+            " evidence=" + transaction.Evidence + " directive=" + transition.Directive +
+            " accepted=" + transition.Accepted.ToString().ToLowerInvariant() +
+            " switches_10m=" + switches10 + " switches_30m=" + switches30 +
+            " reason=" + transition.Reason);
+        return transition;
+    }
+
+    private bool ApplyAutomaticSwitch(ConnectionAssurance assurance,
         DecisionTransition authorization, string expectedSource, string target,
         string reason, double baselineResponse, bool quality, bool provisional)
     {
@@ -1260,7 +1316,7 @@ private bool ApplyAutomaticSwitch(ConnectionAssurance assurance,
         if (!String.Equals(mihomo.GetSelected(config.SharedGroup), expectedSource,
             StringComparison.Ordinal))
         {
-            assurance.Apply(AutomaticDecisionEvent.SwitchFailed,
+            ApplyDecision(assurance, AutomaticDecisionEvent.SwitchFailed,
                 new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                     Current = expectedSource, Target = target,
                     Reason = "selector changed before authorized switch" });
@@ -1279,7 +1335,7 @@ private bool ApplyAutomaticSwitch(ConnectionAssurance assurance,
         }
         catch
         {
-            assurance.Apply(AutomaticDecisionEvent.SwitchFailed,
+            ApplyDecision(assurance, AutomaticDecisionEvent.SwitchFailed,
                 new AutomaticDecisionContext { NowUtc = clock.UtcNow,
                     Current = expectedSource, Target = target,
                     Reason = "authorized selector write failed" });
