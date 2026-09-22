@@ -54,6 +54,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly INodeIdentitySource nodeIdentitySource;
     private IDictionary<string, CandidateNode> activeCandidatesByName =
         new Dictionary<string, CandidateNode>(StringComparer.Ordinal);
+    private IDictionary<string, string> activeStrongIdsByName =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+    private IDictionary<string, string> activeNamesByStrongId =
+        new Dictionary<string, string>(StringComparer.Ordinal);
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
     private int accountCommandRunning;
@@ -172,7 +176,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal)) return false;
             AccountVerificationMemory.MarkBrowserConversation(experience, experience.ActiveScope, node,
                 fresh.ExitFingerprint, service, verifiedUtc, protocolVersion);
-            experienceStore.Save(experience, verifiedUtc);
+            SaveExperience(verifiedUtc);
             logger.Write("browser conversation proof recorded node=" + SafeName(node) + " service=" + service);
             return true;
         }
@@ -230,7 +234,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 System.Threading.Volatile.Write(ref accountCommandRunning, 0);
             }
         }
-        experienceStore.Save(experience, reportedUtc);
+        SaveExperience(reportedUtc);
     }
 
     public void ReportBrowserConversationFailure(string node, string exitFingerprint, ServiceKind service,
@@ -296,7 +300,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 System.Threading.Volatile.Write(ref accountCommandRunning, 0);
             }
         }
-        experienceStore.Save(experience, reportedUtc);
+        SaveExperience(reportedUtc);
     }
 
     public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)
@@ -349,6 +353,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             IList<CandidateNode> candidates = CandidateCatalog.Filter(
                 discovered.Select(x => x.Name), runtimeTypes, resolvedIdentities);
             activeCandidatesByName = candidates.ToDictionary(x => x.Name, x => x, StringComparer.Ordinal);
+            activeStrongIdsByName = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+                NodeIdentity.IsStrong(x.NodeId)).ToDictionary(x => x.Name, x => x.NodeId, StringComparer.Ordinal);
+            activeNamesByStrongId = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+                NodeIdentity.IsStrong(x.NodeId)).GroupBy(x => x.NodeId, StringComparer.Ordinal)
+                .ToDictionary(x => x.Key, x => x.OrderBy(y => y.Name.Length)
+                    .ThenBy(y => y.Name, StringComparer.Ordinal).First().Name, StringComparer.Ordinal);
             if (candidates.Count == 0)
             {
                 logger.Write("no eligible candidates");
@@ -357,6 +367,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             }
             var store = new StateStore(config.StatePath);
             HealthState state = store.Load();
+            if (nodeIdentitySource != null) ReconcileHealthState(state);
             string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
             IList<string> strongNodeIds = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
                 NodeIdentity.IsStrong(x.NodeId)).Select(x => x.NodeId).Distinct(StringComparer.Ordinal).ToList();
@@ -368,6 +379,11 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 " continuity=" + experience.ScopeContinuityReason);
             ConnectionAssurance assurance = experience.Assurance;
             assurance.SetScope(memoryScope);
+            if (nodeIdentitySource != null)
+            {
+                assurance.ReconcileIdentities(activeNamesByStrongId, clock.UtcNow);
+                ReconcileAccountVerifications();
+            }
             var requiredServices = preferences.RequiredServices.Distinct().ToList();
             var suppressedServices = requiredServices.Where(x =>
                 ServiceIncidentPolicy.IsActive(experience.ServiceIncidents, x, clock.UtcNow)).ToList();
@@ -396,7 +412,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             ProxyPathHealth pathHealth = null;
             string cycleStartNode = current;
             experience.RecordChange(experience.LastNode, current, "检测到外部变更（Clash 手动选择或核心重载）", clock.UtcNow);
-            experienceStore.Save(experience, clock.UtcNow);
+            SaveExperience(clock.UtcNow);
             Report("正在检测当前节点：" + current, null);
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, requiredServices);
@@ -626,7 +642,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                                 " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟";
                             logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
                                 " confirmations=3 duration_minutes=10");
-                            experienceStore.Save(experience, clock.UtcNow);
+                            SaveExperience(clock.UtcNow);
                         }
                     }
                 }
@@ -713,14 +729,15 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
                     }
                 }
-                experienceStore.Save(experience, clock.UtcNow);
+                SaveExperience(clock.UtcNow);
             }
             CandidateScanResult currentHistoryScan = ServiceIncidentPolicy.ForNodeHealth(
                 ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices));
             if (currentHistoryScan.Health != CandidateHealth.Unknown)
             {
                 state.Records[currentHistoryScan.Name] = Record(currentHistoryScan);
-                state.RememberPreferred(currentHistoryScan.Name, currentHistoryScan.Health, clock.UtcNow);
+                state.RememberPreferred(currentHistoryScan.Name, EvidenceKey(currentHistoryScan.Name),
+                    currentHistoryScan.Health, clock.UtcNow);
             }
             scans[currentScan.Name] = currentScan;
             scanTimes[currentScan.Name] = clock.UtcNow;
@@ -934,7 +951,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         improvement.Accepted)
                     {
                         assurance.PendingOptimization = new PendingOptimization { Scope = memoryScope,
-                            Current = current, Target = target, BaselineResponse = baseline,
+                            Current = current, CurrentNodeId = EvidenceKey(current),
+                            Target = target, TargetNodeId = EvidenceKey(target), BaselineResponse = baseline,
                             TargetResponse = targetResponse, CreatedUtc = clock.UtcNow };
                         ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
@@ -1000,7 +1018,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     CandidateScanResult standbyHistory = ServiceIncidentPolicy.ForNodeHealth(
                         ServiceIncidentPolicy.AttachSuppressed(standbyScan, suppressedServices));
                     if (standbyHistory.Health != CandidateHealth.Unknown)
+                    {
                         assurance.Remember(standbyHistory, current, clock.UtcNow);
+                        if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
+                    }
                     if (ServiceEvidencePolicy.CanEmergencySwitch(standbyScan)) delays[standby] = (int)Math.Min(Int32.MaxValue, QualityMeasurement.ResponseMilliseconds(standbyScan, 5000));
                 }
                 foreach (var remembered in experience.Recommend(memoryScope,
@@ -1038,7 +1059,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     CandidateScanResult historicalScan = ServiceIncidentPolicy.ForNodeHealth(
                         ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices));
                     if (historicalScan.Health != CandidateHealth.Unknown)
+                    {
                         assurance.Remember(historicalScan, current, clock.UtcNow);
+                        if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
+                    }
                     if (historicalScan.Health != CandidateHealth.Unknown) state.Records[candidate.Name] = Record(historicalScan);
                     if (ServiceEvidencePolicy.CanEmergencySwitch(scan)) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
                     string candidateEvidenceKey = EvidenceKey(candidate.Name);
@@ -1240,7 +1264,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             "自动切换：" + StatusReport.DecisionText(reason), currentResponse,
                             false, provisional))
                         {
-                            experienceStore.Save(experience, clock.UtcNow);
+                            SaveExperience(clock.UtcNow);
                             switched = true;
                             reportedScore = suppressedServices.Count == 0 ? (double?)best.Value.Score : null;
                             decision = "已切换：" + reason;
@@ -1284,7 +1308,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             TimeSpan nextInterval = assurance.Interval(actualScan);
             if (assurance.PendingOptimization != null) nextInterval = OpportunityOptimizationPolicy.ConfirmationInterval;
             decision = StatusReport.DecisionText(decision) + " · 近期备用 " + assurance.Available(candidates.Select(x => x.Name), actual, clock.UtcNow).Length + "/2";
-            experienceStore.Save(experience, clock.UtcNow);
+            SaveExperience(clock.UtcNow);
             if (!dryRun)
             {
                 CandidateHealth status = actualScan.Health;
@@ -1363,6 +1387,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         AutomaticDecisionEvent value, AutomaticDecisionContext context)
     {
         DecisionTransition transition = assurance.Apply(value, context);
+        if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
         DateTime now = context == null || context.NowUtc == DateTime.MinValue
             ? clock.UtcNow : context.NowUtc;
         IList<AutomaticSwitchRecord> history = assurance.AutomaticSwitches ??
@@ -1386,6 +1411,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         DecisionTransition authorization, string expectedSource, string target,
         string reason, double baselineResponse, bool quality, bool provisional)
     {
+        if (nodeIdentitySource != null && !NodeIdentity.IsStrong(EvidenceKey(target)) &&
+            (authorization == null || authorization.Transaction == null ||
+             authorization.Transaction.Evidence != DecisionEvidenceClass.HardFailure))
+        {
+            logger.Write("automatic switch rejected identity_strength=session-only");
+            return false;
+        }
         if (authorization == null || !authorization.Accepted ||
             (authorization.Directive != AutomaticDecisionDirective.Switch &&
              authorization.Directive != AutomaticDecisionDirective.Rollback))
@@ -1406,6 +1438,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             assurance.RecordAutomaticSwitch(expectedSource, target, reason, clock.UtcNow);
             assurance.Begin(expectedSource, target, baselineResponse, quality,
                 provisional, clock.UtcNow);
+            if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
             previousSelectedNode = expectedSource;
             controller.RecordSwitch();
             return true;
@@ -1427,7 +1460,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         if (mihomo.GetSelected(config.SharedGroup) != to) throw new InvalidOperationException("节点切换未确认，未写入成功记录");
         RunStatistics.SelectionConfirmed();
         experience.RecordChange(from, to, reason, clock.UtcNow);
-        experienceStore.Save(experience, clock.UtcNow);
+        SaveExperience(clock.UtcNow);
         FollowGeneralNode();
     }
 
@@ -1450,7 +1483,38 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
     private NodeHealthRecord Record(CandidateScanResult result)
     {
-        return new NodeHealthRecord(result.Name, result.Health, clock.UtcNow, HealthPolicy.CooldownUntil(result.Health, clock.UtcNow), false);
+        return new NodeHealthRecord(result.Name, EvidenceKey(result.Name), result.Health, clock.UtcNow,
+            HealthPolicy.CooldownUntil(result.Health, clock.UtcNow), false);
+    }
+
+    private void ReconcileHealthState(HealthState state)
+    {
+        if (state == null) return;
+        var records = new Dictionary<string, NodeHealthRecord>(StringComparer.Ordinal);
+        foreach (NodeHealthRecord record in state.Records.Values)
+        {
+            string name;
+            if (record != null && NodeIdentity.IsStrong(record.NodeId) &&
+                activeNamesByStrongId.TryGetValue(record.NodeId, out name))
+            {
+                CandidateNode candidate;
+                if (activeCandidatesByName.TryGetValue(name, out candidate))
+                    records[name] = new NodeHealthRecord(name, record.NodeId, record.Health,
+                        record.CheckedUtc, record.CooldownUntilUtc, record.ExplicitLocalExclusion);
+            }
+        }
+        state.Records.Clear();
+        foreach (KeyValuePair<string, NodeHealthRecord> item in records) state.Records[item.Key] = item.Value;
+        string preferredName;
+        if (NodeIdentity.IsStrong(state.PreferredNodeId) &&
+            activeNamesByStrongId.TryGetValue(state.PreferredNodeId, out preferredName))
+            state.PreferredNode = preferredName;
+        else
+        {
+            state.PreferredNode = "";
+            state.PreferredNodeId = "";
+            state.PreferredNodeVerifiedUtc = DateTime.MinValue;
+        }
     }
 
     private static string Fingerprint(IEnumerable<string> nodeKeys)
@@ -1481,6 +1545,40 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             candidate.IdentityStrength == NodeIdentityStrength.Strong && NodeIdentity.IsStrong(candidate.NodeId))
             return candidate.NodeId;
         return nodeIdentitySource == null ? name ?? "" : "";
+    }
+
+    private void SaveExperience(DateTime now)
+    {
+        if (nodeIdentitySource != null && activeStrongIdsByName.Count > 0)
+        {
+            experience.Assurance.CaptureIdentities(activeStrongIdsByName);
+            ReconcileAccountVerificationsForSave();
+        }
+        experienceStore.Save(experience, now);
+    }
+
+    private void ReconcileAccountVerifications()
+    {
+        if (experience.AccountVerifications == null)
+            experience.AccountVerifications = new List<AccountVerificationRecord>();
+        experience.AccountVerifications = experience.AccountVerifications.Where(x => x != null &&
+            NodeIdentity.IsStrong(x.NodeId) && activeNamesByStrongId.ContainsKey(x.NodeId)).ToList();
+        foreach (AccountVerificationRecord item in experience.AccountVerifications)
+            item.Node = activeNamesByStrongId[item.NodeId];
+    }
+
+    private void ReconcileAccountVerificationsForSave()
+    {
+        if (experience.AccountVerifications == null)
+            experience.AccountVerifications = new List<AccountVerificationRecord>();
+        foreach (AccountVerificationRecord item in experience.AccountVerifications)
+        {
+            string nodeId;
+            item.NodeId = item != null && !String.IsNullOrEmpty(item.Node) &&
+                activeStrongIdsByName.TryGetValue(item.Node, out nodeId) ? nodeId : "";
+        }
+        experience.AccountVerifications = experience.AccountVerifications.Where(x => x != null &&
+            NodeIdentity.IsStrong(x.NodeId)).ToList();
     }
 
     private static bool QualityMatches(QualitySample sample, string nodeKey)

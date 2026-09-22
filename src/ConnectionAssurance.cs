@@ -5,6 +5,7 @@ using System.Linq;
 public sealed class StandbyNode
 {
     public string Name { get; set; }
+    public string NodeId { get; set; }
     public DateTime VerifiedUtc { get; set; }
 }
 
@@ -13,7 +14,10 @@ public sealed class ConnectionAssurance
     public string Scope { get; set; }
     public List<StandbyNode> Standbys { get; set; }
     public string Previous { get; set; }
+    public string PreviousNodeId { get; set; }
     public string Target { get; set; }
+    public string TargetNodeId { get; set; }
+    public string CurrentNodeId { get; set; }
     public double PreviousResponse { get; set; }
     public bool QualitySwitch { get; set; }
     public bool ProvisionalSwitch { get; set; }
@@ -39,11 +43,88 @@ public sealed class ConnectionAssurance
     public void SetScope(string scope)
     {
         if (Scope == scope) return;
-        Scope = scope; Standbys.Clear(); Target = null; Previous = null; StartedUtc = DateTime.MinValue; StableCycles = 0;
+        Scope = scope; Standbys.Clear(); Target = null; TargetNodeId = null; Previous = null;
+        PreviousNodeId = null; CurrentNodeId = null; StartedUtc = DateTime.MinValue; StableCycles = 0;
         RefreshUtc = DateTime.MinValue; PendingOptimization = null; LastOpportunityScanUtc = DateTime.MinValue;
         Decision = new AutomaticDecisionTransaction {
             State = AutomaticDecisionState.Healthy, Scope = scope, Revision = 1
         };
+    }
+    public void ReconcileIdentities(IDictionary<string, string> liveNamesById, DateTime now)
+    {
+        liveNamesById = liveNamesById ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        if (Standbys == null) Standbys = new List<StandbyNode>();
+        Standbys = Standbys.Where(x => x != null && NodeIdentity.IsStrong(x.NodeId) &&
+            liveNamesById.ContainsKey(x.NodeId) && x.VerifiedUtc <= now).ToList();
+        foreach (StandbyNode standby in Standbys) standby.Name = liveNamesById[standby.NodeId];
+
+        Previous = ResolveLiveName(PreviousNodeId, liveNamesById);
+        if (Previous == null) PreviousNodeId = null;
+        string targetName = ResolveLiveName(TargetNodeId, liveNamesById);
+        if (!String.IsNullOrEmpty(Target) && targetName == null)
+        {
+            Target = null; TargetNodeId = null; StartedUtc = DateTime.MinValue;
+        }
+        else if (targetName != null) Target = targetName;
+
+        if (PendingOptimization != null)
+        {
+            string pendingTarget = ResolveLiveName(PendingOptimization.TargetNodeId, liveNamesById);
+            string pendingCurrent = ResolveLiveName(PendingOptimization.CurrentNodeId, liveNamesById);
+            if (pendingTarget == null || pendingCurrent == null) PendingOptimization = null;
+            else { PendingOptimization.Target = pendingTarget; PendingOptimization.Current = pendingCurrent; }
+        }
+        if (Decision != null)
+        {
+            string decisionTarget = ResolveLiveName(Decision.TargetNodeId, liveNamesById);
+            if (!String.IsNullOrEmpty(Decision.Target) && decisionTarget == null)
+            {
+                Decision.Target = null; Decision.TargetNodeId = null;
+                Decision.State = AutomaticDecisionState.Degraded;
+                Decision.Reason = "stale identity transaction cancelled";
+                Decision.Revision++;
+            }
+            else if (decisionTarget != null) Decision.Target = decisionTarget;
+            string decisionPrevious = ResolveLiveName(Decision.PreviousNodeId, liveNamesById);
+            Decision.Previous = decisionPrevious;
+            if (decisionPrevious == null) Decision.PreviousNodeId = null;
+            string decisionCurrent = ResolveLiveName(Decision.CurrentNodeId, liveNamesById);
+            if (decisionCurrent != null) Decision.Current = decisionCurrent;
+        }
+    }
+
+    public void CaptureIdentities(IDictionary<string, string> nodeIdsByName)
+    {
+        nodeIdsByName = nodeIdsByName ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        PreviousNodeId = ResolveNodeId(Previous, nodeIdsByName);
+        TargetNodeId = ResolveNodeId(Target, nodeIdsByName);
+        CurrentNodeId = ResolveNodeId(Decision == null ? null : Decision.Current, nodeIdsByName);
+        foreach (StandbyNode standby in Standbys ?? new List<StandbyNode>())
+            standby.NodeId = ResolveNodeId(standby.Name, nodeIdsByName);
+        if (PendingOptimization != null)
+        {
+            PendingOptimization.CurrentNodeId = ResolveNodeId(PendingOptimization.Current, nodeIdsByName);
+            PendingOptimization.TargetNodeId = ResolveNodeId(PendingOptimization.Target, nodeIdsByName);
+        }
+        if (Decision != null)
+        {
+            Decision.CurrentNodeId = ResolveNodeId(Decision.Current, nodeIdsByName);
+            Decision.TargetNodeId = ResolveNodeId(Decision.Target, nodeIdsByName);
+            Decision.PreviousNodeId = ResolveNodeId(Decision.Previous, nodeIdsByName);
+        }
+    }
+
+    private static string ResolveLiveName(string nodeId, IDictionary<string, string> liveNamesById)
+    {
+        string name;
+        return NodeIdentity.IsStrong(nodeId) && liveNamesById.TryGetValue(nodeId, out name) ? name : null;
+    }
+
+    private static string ResolveNodeId(string name, IDictionary<string, string> nodeIdsByName)
+    {
+        string nodeId;
+        return !String.IsNullOrEmpty(name) && nodeIdsByName.TryGetValue(name, out nodeId) &&
+            NodeIdentity.IsStrong(nodeId) ? nodeId : null;
     }
     public void Remember(CandidateScanResult scan, string current, DateTime now)
     {
@@ -92,6 +173,7 @@ public sealed class ConnectionAssurance
         {
             Decision.State = AutomaticDecisionState.Degraded;
             Decision.Target = null;
+            Decision.TargetNodeId = null;
             Decision.Reason = "pending optimization cleared";
             Decision.Revision++;
         }

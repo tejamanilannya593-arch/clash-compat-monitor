@@ -138,8 +138,11 @@ public sealed class AutomaticDecisionTransaction
     public AutomaticDecisionState State { get; set; }
     public string Scope { get; set; }
     public string Current { get; set; }
+    public string CurrentNodeId { get; set; }
     public string Target { get; set; }
+    public string TargetNodeId { get; set; }
     public string Previous { get; set; }
+    public string PreviousNodeId { get; set; }
     public ServiceKind? Service { get; set; }
     public DecisionEvidenceClass Evidence { get; set; }
     public double BaselineResponse { get; set; }
@@ -152,8 +155,9 @@ public sealed class AutomaticDecisionTransaction
     public AutomaticDecisionTransaction Copy()
     {
         return new AutomaticDecisionTransaction {
-            State = State, Scope = Scope, Current = Current, Target = Target,
-            Previous = Previous, Service = Service, Evidence = Evidence,
+            State = State, Scope = Scope, Current = Current, CurrentNodeId = CurrentNodeId,
+            Target = Target, TargetNodeId = TargetNodeId,
+            Previous = Previous, PreviousNodeId = PreviousNodeId, Service = Service, Evidence = Evidence,
             BaselineResponse = BaselineResponse, TargetResponse = TargetResponse,
             StartedUtc = StartedUtc, ExpiresUtc = ExpiresUtc, Reason = Reason,
             Revision = Revision

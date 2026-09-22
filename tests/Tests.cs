@@ -1315,6 +1315,27 @@ internal static class Tests
         restored.Begin("b", "c", 1000, true, false, now);
         Equal(null, restored.PendingOptimization, "starting a real switch clears pending optimization");
 
+        string liveId = "node-v1-" + new string('G', 43);
+        string staleId = "node-v1-" + new string('H', 43);
+        var identityAssurance = new ConnectionAssurance {
+            Scope = "identity-scope", Target = "same display", TargetNodeId = staleId,
+            Previous = "old display", PreviousNodeId = liveId,
+            PendingOptimization = new PendingOptimization {
+                Scope = "identity-scope", Current = "old display", CurrentNodeId = liveId,
+                Target = "same display", TargetNodeId = staleId, CreatedUtc = now
+            },
+            Standbys = new List<StandbyNode> {
+                new StandbyNode { Name = "old display", NodeId = liveId, VerifiedUtc = now },
+                new StandbyNode { Name = "same display", NodeId = staleId, VerifiedUtc = now }
+            }
+        };
+        identityAssurance.ReconcileIdentities(new Dictionary<string, string> { { liveId, "renamed live" } }, now);
+        Equal(null, identityAssurance.Target, "same name changed identity cancels switch target");
+        Equal(null, identityAssurance.PendingOptimization, "missing identity cancels pending optimization");
+        Equal("renamed live", identityAssurance.Previous, "renamed rollback origin follows stable identity");
+        Equal(1, identityAssurance.Standbys.Count, "stale identity is removed from standby pool");
+        Equal("renamed live", identityAssurance.Standbys[0].Name, "standby display name follows stable identity");
+
         policy.Decision = new AutomaticDecisionTransaction {
             State = AutomaticDecisionState.ConfirmingOptimization,
             Scope = "scope", Current = "b", Target = "c",
@@ -3552,13 +3573,17 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         string statePath = Path.Combine(Path.GetTempPath(), "clash-monitor-state-" + Guid.NewGuid().ToString("N"), "health.state");
         var state = new HealthState("old");
         state.Records["节点\t一"] = new NodeHealthRecord("节点\t一", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false);
-        state.Records["香港"] = new NodeHealthRecord("香港", CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
-        state.RememberPreferred("节点\t一", CandidateHealth.Compatible, clock.UtcNow);
+        string healthNodeId = "node-v1-" + new string('I', 43);
+        state.Records["香港"] = new NodeHealthRecord("香港", healthNodeId,
+            CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
+        state.RememberPreferred("节点\t一", healthNodeId, CandidateHealth.Compatible, clock.UtcNow);
         var store = new StateStore(statePath);
         store.Save(state, state.Records.Keys);
         var loaded = store.Load();
         Equal(2, loaded.Records.Count, "state roundtrip count");
         Equal("节点\t一", loaded.PreferredNode, "preferred node roundtrip");
+        Equal(healthNodeId, loaded.PreferredNodeId, "preferred stable identity roundtrip");
+        Equal(healthNodeId, loaded.Records["香港"].NodeId, "health record stable identity roundtrip");
         Equal(clock.UtcNow, loaded.PreferredNodeVerifiedUtc, "preferred time roundtrip");
         loaded.RememberPreferred("失败节点", CandidateHealth.Transient, clock.UtcNow.AddMinutes(1));
         Equal("节点\t一", loaded.PreferredNode, "failure does not replace preferred node");

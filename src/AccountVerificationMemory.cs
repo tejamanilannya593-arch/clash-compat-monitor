@@ -6,6 +6,7 @@ public sealed class AccountVerificationRecord
 {
     public string Scope { get; set; }
     public string Node { get; set; }
+    public string NodeId { get; set; }
     public string ExitFingerprint { get; set; }
     public ServiceKind Service { get; set; }
     public bool Passed { get; set; }
