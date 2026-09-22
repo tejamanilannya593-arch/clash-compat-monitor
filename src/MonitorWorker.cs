@@ -51,6 +51,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly TrafficGuard trafficGuard;
     private readonly IProxyPathHealthChecker pathHealthChecker;
     private readonly Func<RuntimeSnapshot> runtimeSnapshotProvider;
+    private readonly INodeIdentitySource nodeIdentitySource;
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
     private int accountCommandRunning;
@@ -78,14 +79,16 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     }
 
     public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock,
-        IExitIdentityProbe exitIdentityProbe = null, IProxyPathHealthChecker pathHealthChecker = null)
-        : this(config, mihomo, probe, logger, clock, exitIdentityProbe, pathHealthChecker, null)
+        IExitIdentityProbe exitIdentityProbe = null, IProxyPathHealthChecker pathHealthChecker = null,
+        INodeIdentitySource nodeIdentitySource = null)
+        : this(config, mihomo, probe, logger, clock, exitIdentityProbe, pathHealthChecker, null, nodeIdentitySource)
     {
     }
 
     internal MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe,
         BoundedLogger logger, IClock clock, IExitIdentityProbe exitIdentityProbe,
-        IProxyPathHealthChecker pathHealthChecker, Func<RuntimeSnapshot> runtimeSnapshotProvider)
+        IProxyPathHealthChecker pathHealthChecker, Func<RuntimeSnapshot> runtimeSnapshotProvider,
+        INodeIdentitySource nodeIdentitySource = null)
     {
         this.config = config;
         this.mihomo = mihomo;
@@ -95,6 +98,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         this.clock = clock;
         this.pathHealthChecker = pathHealthChecker;
         this.runtimeSnapshotProvider = runtimeSnapshotProvider ?? delegate { return RuntimeInspector.Capture(mihomo); };
+        this.nodeIdentitySource = nodeIdentitySource;
         experienceStore = new ExperienceStore(Path.Combine(config.RootPath, "state", "experience.json"));
         experience = experienceStore.Load();
         regionEligibilityStore = new RegionEligibilityStore(

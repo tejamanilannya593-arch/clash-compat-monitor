@@ -147,6 +147,56 @@ internal static class Tests
             new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 443, changedParameters), key),
             "material connection parameter creates a new identity");
         Equal("", NodeIdentity.Create(material, new byte[0]), "missing identity key fails closed");
+
+        string directory = Path.Combine(Path.GetTempPath(), "node-identity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string profilesPath = Path.Combine(directory, "profiles.yaml");
+            string configPath = Path.Combine(directory, "clash-verge.yaml");
+            File.WriteAllText(profilesPath, "current: provider-a\nitems:\n- uid: provider-a\n  type: remote\n", Encoding.UTF8);
+            File.WriteAllText(configPath,
+                "proxies:\n" +
+                "- name: renamed\n  server: edge.example\n  port: 443\n  type: vmess\n  uuid: secret-uuid\n  network: ws\n  tls: true\n" +
+                "- { name: inline, type: trojan, server: inline.example, port: 443, password: inline-secret, sni: login.example }\n" +
+                "- name: duplicate\n  server: one.example\n  port: 443\n  type: trojan\n  password: first\n" +
+                "- name: duplicate\n  server: two.example\n  port: 443\n  type: trojan\n  password: second\n" +
+                "- name: broken\n  server: broken.example\n  type: vmess\n",
+                Encoding.UTF8);
+            string profilesHash = TestFileSha256(profilesPath);
+            string configHash = TestFileSha256(configPath);
+            var source = new ClashNodeIdentitySource(configPath, profilesPath, key);
+            IDictionary<string, ResolvedNodeIdentity> resolved = source.Resolve(
+                new[] { "renamed", "inline", "duplicate", "broken", "missing" });
+
+            Equal(NodeIdentityStrength.Strong, resolved["renamed"].Strength,
+                "valid block proxy metadata resolves strongly");
+            Equal(NodeIdentityStrength.Strong, resolved["inline"].Strength,
+                "valid inline proxy metadata resolves strongly");
+            Equal(NodeIdentityStrength.SessionOnly, resolved["duplicate"].Strength,
+                "conflicting duplicate name fails closed");
+            Equal("duplicate-conflict", resolved["duplicate"].Reason,
+                "duplicate conflict uses a bounded reason");
+            Equal(NodeIdentityStrength.SessionOnly, resolved["broken"].Strength,
+                "incomplete proxy metadata fails closed");
+            Equal(NodeIdentityStrength.SessionOnly, resolved["missing"].Strength,
+                "missing proxy metadata fails closed");
+            Equal(false, resolved.Values.Any(x => x.NodeId.Contains("example") || x.NodeId.Contains("secret")),
+                "resolved identities reveal no raw metadata");
+            Equal(profilesHash, TestFileSha256(profilesPath), "identity resolver does not write profile metadata");
+            Equal(configHash, TestFileSha256(configPath), "identity resolver does not write generated config");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(directory);
+        }
+    }
+
+    private static string TestFileSha256(string path)
+    {
+        using (var stream = File.OpenRead(path))
+        using (var hash = System.Security.Cryptography.SHA256.Create())
+            return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "");
     }
 
     private static void ServiceObservationBehavior()

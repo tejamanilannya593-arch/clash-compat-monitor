@@ -77,9 +77,16 @@ public sealed class CloudflareExitIdentityProbe : IExitIdentityProbe
     }
 
     public CloudflareExitIdentityProbe(string proxyUrl, string keyPath, string evidencePath)
+        : this(proxyUrl, ExitIdentityKey.LoadOrCreate(keyPath), evidencePath)
+    {
+    }
+
+    public CloudflareExitIdentityProbe(string proxyUrl, byte[] identityKey, string evidencePath)
     {
         this.proxyUrl = proxyUrl;
-        key = ExitIdentityKey.LoadOrCreate(keyPath);
+        if (identityKey == null || identityKey.Length < 16)
+            throw new ArgumentException("Identity key is unavailable.", "identityKey");
+        key = (byte[])identityKey.Clone();
         clock = new SystemClock();
         enricher = new ExitNetworkEvidenceEnricher(new IpWhoExitAsnResolver(proxyUrl, key),
             new ExitNetworkEvidenceStore(evidencePath));
