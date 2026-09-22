@@ -183,6 +183,24 @@ internal static class Tests
                 "missing proxy metadata fails closed");
             Equal(false, resolved.Values.Any(x => x.NodeId.Contains("example") || x.NodeId.Contains("secret")),
                 "resolved identities reveal no raw metadata");
+            string stateDirectory = Path.Combine(directory, "state");
+            Directory.CreateDirectory(stateDirectory);
+            string strongId = resolved["renamed"].NodeId;
+            var experienceData = new ExperienceData();
+            experienceData.Nodes.Add(new NodeExperience { Scope = "scope", Node = "renamed", NodeId = strongId,
+                FirstUtc = DateTime.UtcNow, LastUtc = DateTime.UtcNow,
+                RecentResponseMilliseconds = new List<double> { 100 } });
+            new ExperienceStore(Path.Combine(stateDirectory, "experience.json")).Save(experienceData, DateTime.UtcNow);
+            new QualityStateStore(Path.Combine(stateDirectory, "quality.state")).Save(new[] {
+                new QualitySample("renamed", strongId, DateTime.UtcNow, true, 100, 0, 0, null) });
+            var regionCache = new RegionEligibilityCache();
+            regionCache.Remember("scope", "renamed", strongId, 1L.ToString("X64"), "JP", DateTime.UtcNow);
+            new RegionEligibilityStore(Path.Combine(stateDirectory, "region.json")).Save(regionCache);
+            string persisted = String.Join("\n", Directory.GetFiles(stateDirectory)
+                .Select(File.ReadAllText));
+            Equal(false, new[] { "edge.example", "secret-uuid", "inline-secret", "login.example" }
+                .Any(x => persisted.IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0),
+                "persistent state contains no raw connection material");
             Equal(profilesHash, TestFileSha256(profilesPath), "identity resolver does not write profile metadata");
             Equal(configHash, TestFileSha256(configPath), "identity resolver does not write generated config");
         }

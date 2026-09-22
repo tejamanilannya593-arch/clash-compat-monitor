@@ -45,6 +45,10 @@ if (!$currentDocs.Contains('three distinct real exits') -or !$currentDocs.Contai
 if (!$currentDocs.Contains('raw probe evidence') -or !$currentDocs.Contains('raw exit IP')) {
     throw 'Raw evidence separation or exit-IP privacy is undocumented.'
 }
+if (!$currentDocs.Contains('stable node identity') -or !$currentDocs.Contains('same-name connection replacement') -or
+    !$currentDocs.Contains('Raw servers, ports, UUIDs, passwords, and SNI')) {
+    throw 'Stable node identity and migration privacy are undocumented.'
+}
 
 $exe = Join-Path $root 'bin\ClashCompatibilityMonitor.exe'
 if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Main executable was not built.' }
