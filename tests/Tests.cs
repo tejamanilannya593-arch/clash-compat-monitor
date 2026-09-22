@@ -312,6 +312,12 @@ internal static class Tests
         Equal(true, supported, "fresh Japan exit remains eligible");
         Equal(false, cache.TryGet("scope-a", "node-a", exitB, now, out countryCode, out supported),
             "different actual exit fingerprint invalidates region cache");
+        string regionNodeId = "node-v1-" + new string('E', 43);
+        cache.Remember("scope-a", "renamed", regionNodeId, exitA, "JP", now);
+        Equal(true, cache.TryGet("scope-a", "other display", regionNodeId, exitA, now,
+            out countryCode, out supported), "region cache follows stable identity across rename");
+        Equal(false, cache.TryGet("scope-a", "renamed", "node-v1-" + new string('F', 43), exitA,
+            now, out countryCode, out supported), "region cache rejects same-name replacement identity");
         Equal(false, cache.TryGet("scope-a", "node-a", "", now, out countryCode, out supported),
             "unknown actual exit cannot use a cached eligibility decision");
         Equal(false, cache.TryGet("scope-b", "node-a", exitA, now, out countryCode, out supported),
@@ -1590,6 +1596,18 @@ internal static class Tests
         Equal(migratedScope, jmMigration.Nodes[0].Scope, "JMComic migration keeps node history reachable");
         Equal(migratedScope, jmMigration.Assurance.Scope, "JMComic migration keeps assurance scope aligned");
         var memory = new ExperienceData();
+        string firstNodeId = "node-v1-" + new string('B', 43);
+        string secondNodeId = "node-v1-" + new string('C', 43);
+        var replacedNameMemory = new ExperienceData();
+        replacedNameMemory.Observe("identity-scope", firstNodeId,
+            new CandidateScanResult("same display", CandidateHealth.Compatible, null, "ok", 100, 1), null, now);
+        replacedNameMemory.Observe("identity-scope", secondNodeId,
+            new CandidateScanResult("same display", CandidateHealth.Compatible, null, "ok", 200, 1), null,
+            now.AddMinutes(1));
+        Equal(1, replacedNameMemory.RecentResponses("identity-scope", firstNodeId, 10).Count,
+            "old physical node history is isolated by identity");
+        Equal(1, replacedNameMemory.RecentResponses("identity-scope", secondNodeId, 10).Count,
+            "same-name replacement starts separate identity history");
         var scan = new CandidateScanResult("stable", CandidateHealth.Compatible, null, "ok", 100, 1);
         var partialMemory = new ExperienceData();
         partialMemory.Observe("scope", new CandidateScanResult("partial", CandidateHealth.BasicCompatible, null, "challenge", 100, 1), null, now);
@@ -3425,6 +3443,10 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         var qualityStore = new QualityStateStore(qualityPath);
         qualityStore.Save(stableHistory.Concat(new[] { stable, jittery }));
         Equal(5, qualityStore.Load().Count, "quality state roundtrip");
+        string qualityNodeId = "node-v1-" + new string('D', 43);
+        qualityStore.Save(new[] { new QualitySample("renamed display", qualityNodeId, now, true, 123, 4, 0, null) });
+        QualitySample identityQuality = qualityStore.Load().Single();
+        Equal(qualityNodeId, identityQuality.NodeId, "quality state preserves stable node identity");
         File.WriteAllText(qualityPath, "broken", Encoding.UTF8);
         Equal(0, qualityStore.Load().Count, "quality corrupt recovery");
         Equal(true, Directory.GetFiles(directory, "quality.state.corrupt-*").Length == 1, "quality corrupt archived");

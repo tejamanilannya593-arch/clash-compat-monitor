@@ -11,6 +11,7 @@ public sealed class RegionEligibilityRecord
 {
     public string Scope { get; set; }
     public string Node { get; set; }
+    public string NodeId { get; set; }
     public string ExitFingerprint { get; set; }
     public string CountryCode { get; set; }
     public string PolicyVersion { get; set; }
@@ -44,6 +45,23 @@ public sealed class RegionEligibilityCache
         return item != null;
     }
 
+    public bool TryGet(string scope, string node, string nodeId, string expectedExitFingerprint, DateTime now,
+        out string countryCode, out bool supported)
+    {
+        if (!NodeIdentity.IsStrong(nodeId))
+        {
+            countryCode = ""; supported = false; return false;
+        }
+        RegionEligibilityRecord item = (Records ?? new List<RegionEligibilityRecord>())
+            .Where(x => IsValidRecord(x, now.AddMinutes(5)) && x.Scope == scope && x.NodeId == nodeId &&
+                String.Equals(x.ExitFingerprint, expectedExitFingerprint, StringComparison.Ordinal) &&
+                x.PolicyVersion == AiRegionPolicy.SnapshotDate && x.CheckedUtc > now.AddHours(-24))
+            .OrderByDescending(x => x.CheckedUtc).FirstOrDefault();
+        countryCode = item == null ? "" : item.CountryCode;
+        supported = item != null && AiRegionPolicy.SupportsBoth(item.CountryCode);
+        return item != null;
+    }
+
     public void Remember(string scope, string node, string exitFingerprint, string countryCode, DateTime now)
     {
         if (!IsBoundedText(scope, MaxScopeLength))
@@ -67,6 +85,27 @@ public sealed class RegionEligibilityCache
         Records = Records.OrderByDescending(x => x.CheckedUtc).Take(256).ToList();
     }
 
+    public void Remember(string scope, string node, string nodeId, string exitFingerprint, string countryCode, DateTime now)
+    {
+        if (!NodeIdentity.IsStrong(nodeId)) throw new ArgumentException("A strong node identity is required.", "nodeId");
+        if (!CanRemember(scope, node, exitFingerprint, countryCode))
+            throw new ArgumentException("Bounded region evidence is required.");
+        if (Records == null) Records = new List<RegionEligibilityRecord>();
+        Records.RemoveAll(x => x.Scope == scope && x.NodeId == nodeId);
+        Records.Add(new RegionEligibilityRecord { Scope = scope, Node = node, NodeId = nodeId,
+            ExitFingerprint = exitFingerprint, CountryCode = countryCode,
+            PolicyVersion = AiRegionPolicy.SnapshotDate, CheckedUtc = now });
+        Records = Records.OrderByDescending(x => x.CheckedUtc).Take(256).ToList();
+    }
+
+    public bool TryRemember(string scope, string node, string nodeId, string exitFingerprint,
+        string countryCode, DateTime now)
+    {
+        if (!NodeIdentity.IsStrong(nodeId) || !CanRemember(scope, node, exitFingerprint, countryCode)) return false;
+        Remember(scope, node, nodeId, exitFingerprint, countryCode, now);
+        return true;
+    }
+
     public bool TryRemember(string scope, string node, string exitFingerprint, string countryCode, DateTime now)
     {
         if (!CanRemember(scope, node, exitFingerprint, countryCode)) return false;
@@ -84,6 +123,7 @@ public sealed class RegionEligibilityCache
     {
         return item != null && IsBoundedText(item.Scope, MaxScopeLength) &&
             IsBoundedText(item.Node, MaxNodeLength) && IsCanonicalFingerprint(item.ExitFingerprint) &&
+            (String.IsNullOrEmpty(item.NodeId) || NodeIdentity.IsStrong(item.NodeId)) &&
             IsCountryCode(item.CountryCode) && IsBoundedText(item.PolicyVersion, MaxPolicyVersionLength) &&
             item.CheckedUtc != DateTime.MinValue && item.CheckedUtc <= latestAllowedUtc;
     }

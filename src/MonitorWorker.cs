@@ -52,6 +52,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly IProxyPathHealthChecker pathHealthChecker;
     private readonly Func<RuntimeSnapshot> runtimeSnapshotProvider;
     private readonly INodeIdentitySource nodeIdentitySource;
+    private IDictionary<string, CandidateNode> activeCandidatesByName =
+        new Dictionary<string, CandidateNode>(StringComparer.Ordinal);
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
     private int accountCommandRunning;
@@ -346,6 +348,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             }
             IList<CandidateNode> candidates = CandidateCatalog.Filter(
                 discovered.Select(x => x.Name), runtimeTypes, resolvedIdentities);
+            activeCandidatesByName = candidates.ToDictionary(x => x.Name, x => x, StringComparer.Ordinal);
             if (candidates.Count == 0)
             {
                 logger.Write("no eligible candidates");
@@ -726,20 +729,24 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             Report("当前节点检测完成，正在评估稳定性", currentEvidence);
             bool trafficIdle = trafficGuard.SampleAndMayProbe(new SystemTrafficMeter());
 
-            QualitySample priorCurrent = Latest(qualityHistory, current);
+            string currentEvidenceKey = EvidenceKey(current);
+            QualitySample priorCurrent = Latest(qualityHistory, currentEvidenceKey);
             double currentResponse = QualityMeasurement.ResponseMilliseconds(currentScan, priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
             double currentHistoryResponse = QualityMeasurement.ResponseMilliseconds(currentHistoryScan,
                 priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
-            if (currentHistoryScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(
-                currentHistoryScan.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(currentHistoryScan),
-                currentHistoryResponse, Jitter(qualityHistory, currentHistoryScan.Name, currentHistoryResponse),
+            if (currentHistoryScan.Health != CandidateHealth.Unknown && currentEvidenceKey.Length > 0)
+                qualityHistory.Add(new QualitySample(
+                currentHistoryScan.Name, currentEvidenceKey, clock.UtcNow,
+                ServiceEvidencePolicy.CanEmergencySwitch(currentHistoryScan),
+                currentHistoryResponse, Jitter(qualityHistory, currentEvidenceKey, currentHistoryResponse),
                 priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
                 currentCandidate == null ? (double?)null : currentCandidate.Multiplier));
-            experience.Observe(memoryScope, currentHistoryScan, null, clock.UtcNow);
+            if (currentEvidenceKey.Length > 0)
+                experience.Observe(memoryScope, currentEvidenceKey, currentHistoryScan, null, clock.UtcNow);
 
             bool opportunityActivity = false;
             bool opportunitySwitched = false;
-            IList<double> recentCurrentResponses = experience.RecentResponses(memoryScope, current,
+            IList<double> recentCurrentResponses = experience.RecentResponses(memoryScope, currentEvidenceKey,
                 LatencyWindowStatistics.MaximumSamples);
             PendingOptimization pendingOptimization = assurance.PendingOptimization;
             if (pendingOptimization != null)
@@ -996,7 +1003,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         assurance.Remember(standbyHistory, current, clock.UtcNow);
                     if (ServiceEvidencePolicy.CanEmergencySwitch(standbyScan)) delays[standby] = (int)Math.Min(Int32.MaxValue, QualityMeasurement.ResponseMilliseconds(standbyScan, 5000));
                 }
-                foreach (var remembered in experience.Recommend(memoryScope, candidates.Select(x => x.Name), clock.UtcNow).Take(3))
+                foreach (var remembered in experience.Recommend(memoryScope,
+                    candidates.Select(x => EvidenceKey(x.Name)).Where(x => x.Length > 0), clock.UtcNow).Take(3))
                 {
                     Report("正在复检历史优选节点：" + remembered.Node, currentEvidence);
                     delays[remembered.Node] = mihomo.GetDelay(remembered.Node, config.DelayProbeUrl, 3000);
@@ -1033,13 +1041,17 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         assurance.Remember(historicalScan, current, clock.UtcNow);
                     if (historicalScan.Health != CandidateHealth.Unknown) state.Records[candidate.Name] = Record(historicalScan);
                     if (ServiceEvidencePolicy.CanEmergencySwitch(scan)) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
-                    QualitySample previous = Latest(qualityHistory, candidate.Name);
+                    string candidateEvidenceKey = EvidenceKey(candidate.Name);
+                    QualitySample previous = Latest(qualityHistory, candidateEvidenceKey);
                     double response = QualityMeasurement.ResponseMilliseconds(historicalScan, 5000);
-                    if (historicalScan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(
-                        candidate.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(historicalScan),
-                        MedianResponse(qualityHistory, candidate.Name, response), Jitter(qualityHistory, candidate.Name, response),
+                    if (historicalScan.Health != CandidateHealth.Unknown && candidateEvidenceKey.Length > 0)
+                        qualityHistory.Add(new QualitySample(candidate.Name, candidateEvidenceKey, clock.UtcNow,
+                        ServiceEvidencePolicy.CanEmergencySwitch(historicalScan),
+                        MedianResponse(qualityHistory, candidateEvidenceKey, response),
+                        Jitter(qualityHistory, candidateEvidenceKey, response),
                         previous == null ? 0 : previous.ThroughputBytesPerSecond, candidate.Multiplier));
-                    experience.Observe(memoryScope, historicalScan, null, clock.UtcNow);
+                    if (candidateEvidenceKey.Length > 0)
+                        experience.Observe(memoryScope, candidateEvidenceKey, historicalScan, null, clock.UtcNow);
                     if (!ServiceEvidencePolicy.CanHold(scan))
                     {
                         string failureKey = scan.FailedService.HasValue ? scan.FailedService.Value.ToString() : scan.Health.ToString();
@@ -1065,8 +1077,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             if (!budget.TryReserve(ThroughputProbe.SampleBytes)) break;
                             mihomo.Select(config.ProbeGroup, candidate.Name);
                             ThroughputResult measured = throughputProbe.Probe();
-                            QualitySample previous = Latest(qualityHistory, candidate.Name);
-                            qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, true,
+                            string candidateEvidenceKey = EvidenceKey(candidate.Name);
+                            QualitySample previous = Latest(qualityHistory, candidateEvidenceKey);
+                            if (candidateEvidenceKey.Length == 0) continue;
+                            qualityHistory.Add(new QualitySample(candidate.Name, candidateEvidenceKey, clock.UtcNow, true,
                                 previous == null ? 5000 : previous.ResponseMedianMs,
                                 previous == null ? 0 : previous.JitterMs, measured.BytesPerSecond, candidate.Multiplier));
                             speedSamples[candidate.Name] = qualityHistory[qualityHistory.Count - 1];
@@ -1087,21 +1101,25 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             }
 
             qualityHistory = QualityStateStore.Bound(qualityHistory);
-            var latestCohort = candidates.Select(x => Latest(qualityHistory, x.Name)).Where(x => x != null && x.Compatible && freshlyVerified.Contains(x.Name)).ToList();
+            var latestCohort = candidates.Select(x => Latest(qualityHistory, EvidenceKey(x.Name)))
+                .Where(x => x != null && x.Compatible && freshlyVerified.Contains(x.Name)).ToList();
             var scores = new Dictionary<string, QualityBreakdown>(StringComparer.Ordinal);
             foreach (QualitySample sample in latestCohort)
-                scores[sample.Name] = QualityScorer.Score(sample, qualityHistory.Where(x => x.Name == sample.Name), latestCohort, clock.UtcNow);
+                scores[sample.Name] = QualityScorer.Score(sample,
+                    qualityHistory.Where(x => QualityMatches(x, EvidenceKey(sample.Name))), latestCohort, clock.UtcNow);
             if (suppressedServices.Count > 0)
             {
                 var incidentCohort = scans.Values.Where(x => freshlyVerified.Contains(x.Name) && ServiceEvidencePolicy.CanEmergencySwitch(x))
-                    .Select(x => new QualitySample(x.Name, clock.UtcNow, true,
+                    .Select(x => new QualitySample(x.Name, EvidenceKey(x.Name), clock.UtcNow, true,
                         QualityMeasurement.ResponseMilliseconds(x, 5000), 0, 0,
                         candidates.First(y => y.Name == x.Name).Multiplier)).ToList();
                 foreach (QualitySample sample in incidentCohort)
                     scores[sample.Name] = QualityScorer.Score(sample, new[] { sample }, incidentCohort, clock.UtcNow);
             }
-            foreach (var remembered in experience.Recommend(memoryScope, scores.Keys, clock.UtcNow))
-                scores[remembered.Node].Score = 0.8 * scores[remembered.Node].Score + 0.2 * remembered.Rank(clock.UtcNow);
+            foreach (var remembered in experience.Recommend(memoryScope,
+                scores.Keys.Select(EvidenceKey).Where(x => x.Length > 0), clock.UtcNow))
+                if (scores.ContainsKey(remembered.Node))
+                    scores[remembered.Node].Score = 0.8 * scores[remembered.Node].Score + 0.2 * remembered.Rank(clock.UtcNow);
             QualityBreakdown currentScore = null;
             var best = scores.OrderByDescending(x => {
                 CandidateScanResult candidateScan;
@@ -1148,9 +1166,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     else
                     {
                         FailoverDecision qualityDecision = controller.DecideQuality(currentScore.Score, best.Value.Score, false,
-                            freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, best.Key, clock.UtcNow),
-                            experience.RecentResponses(memoryScope, current, LatencyWindowStatistics.MaximumSamples),
-                            experience.RecentResponses(memoryScope, best.Key, LatencyWindowStatistics.MaximumSamples), selectedTargetScan);
+                            freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, EvidenceKey(best.Key), clock.UtcNow),
+                            experience.RecentResponses(memoryScope, currentEvidenceKey, LatencyWindowStatistics.MaximumSamples),
+                            experience.RecentResponses(memoryScope, EvidenceKey(best.Key),
+                                LatencyWindowStatistics.MaximumSamples), selectedTargetScan);
                         shouldSwitch = qualityDecision.ShouldSwitch;
                         reason = qualityDecision.Reason;
                     }
@@ -1258,7 +1277,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 speedSamples.TryGetValue(scan.Name, out speed);
                 CandidateScanResult historicalScan = ServiceIncidentPolicy.ForNodeHealth(
                     ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices));
-                experience.Observe(memoryScope, historicalScan, speed, clock.UtcNow);
+                string scanEvidenceKey = EvidenceKey(scan.Name);
+                if (scanEvidenceKey.Length > 0)
+                    experience.Observe(memoryScope, scanEvidenceKey, historicalScan, speed, clock.UtcNow);
             }
             TimeSpan nextInterval = assurance.Interval(actualScan);
             if (assurance.PendingOptimization != null) nextInterval = OpportunityOptimizationPolicy.ConfirmationInterval;
@@ -1315,8 +1336,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private void RememberRegionEligibility(string scope, CandidateScanResult scan)
     {
         if (scan == null) return;
-        regionEligibility.TryRemember(scope, scan.Name, scan.ExitFingerprint,
-            scan.ExitCountryCode, clock.UtcNow);
+        string nodeId = EvidenceKey(scan.Name);
+        if (NodeIdentity.IsStrong(nodeId))
+            regionEligibility.TryRemember(scope, scan.Name, nodeId, scan.ExitFingerprint,
+                scan.ExitCountryCode, clock.UtcNow);
+        else if (nodeIdentitySource == null)
+            regionEligibility.TryRemember(scope, scan.Name, scan.ExitFingerprint,
+                scan.ExitCountryCode, clock.UtcNow);
     }
 
     private void SaveRegionEligibility()
@@ -1448,23 +1474,41 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             .Select(MonitorPresentation.ServiceLabel));
     }
 
-    private static QualitySample Latest(IEnumerable<QualitySample> samples, string name)
+    private string EvidenceKey(string name)
     {
-        return (samples ?? Enumerable.Empty<QualitySample>()).Where(x => String.Equals(x.Name, name, StringComparison.Ordinal))
+        CandidateNode candidate;
+        if (activeCandidatesByName != null && activeCandidatesByName.TryGetValue(name ?? "", out candidate) &&
+            candidate.IdentityStrength == NodeIdentityStrength.Strong && NodeIdentity.IsStrong(candidate.NodeId))
+            return candidate.NodeId;
+        return nodeIdentitySource == null ? name ?? "" : "";
+    }
+
+    private static bool QualityMatches(QualitySample sample, string nodeKey)
+    {
+        if (sample == null || String.IsNullOrEmpty(nodeKey)) return false;
+        if (NodeIdentity.IsStrong(nodeKey)) return String.Equals(sample.NodeId, nodeKey, StringComparison.Ordinal);
+        return !NodeIdentity.IsStrong(sample.NodeId) && String.Equals(sample.Name, nodeKey, StringComparison.Ordinal);
+    }
+
+    private static QualitySample Latest(IEnumerable<QualitySample> samples, string nodeKey)
+    {
+        return (samples ?? Enumerable.Empty<QualitySample>()).Where(x => QualityMatches(x, nodeKey))
             .OrderByDescending(x => x.CheckedUtc).FirstOrDefault();
     }
 
-    private static double MedianResponse(IEnumerable<QualitySample> samples, string name, double current)
+    private static double MedianResponse(IEnumerable<QualitySample> samples, string nodeKey, double current)
     {
-        var values = samples.Where(x => x.Name == name && x.ResponseMedianMs > 0).OrderByDescending(x => x.CheckedUtc)
+        var values = samples.Where(x => QualityMatches(x, nodeKey) && x.ResponseMedianMs > 0)
+            .OrderByDescending(x => x.CheckedUtc)
             .Take(LatencyWindowStatistics.MaximumSamples - 1).Select(x => x.ResponseMedianMs).Reverse()
             .Concat(new[] { current });
         return LatencyWindowStatistics.Summarize(values).MedianMilliseconds;
     }
 
-    private static double Jitter(IEnumerable<QualitySample> samples, string name, double current)
+    private static double Jitter(IEnumerable<QualitySample> samples, string nodeKey, double current)
     {
-        var values = samples.Where(x => x.Name == name && x.ResponseMedianMs > 0).OrderByDescending(x => x.CheckedUtc)
+        var values = samples.Where(x => QualityMatches(x, nodeKey) && x.ResponseMedianMs > 0)
+            .OrderByDescending(x => x.CheckedUtc)
             .Take(LatencyWindowStatistics.MaximumSamples - 1).Select(x => x.ResponseMedianMs).Reverse()
             .Concat(new[] { current });
         return LatencyWindowStatistics.Summarize(values).JitterMilliseconds;
