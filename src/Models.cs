@@ -4,13 +4,22 @@ using System.Collections.ObjectModel;
 public sealed class CandidateNode
 {
     public CandidateNode(string name, double? multiplier)
+        : this(name, multiplier, "", NodeIdentityStrength.SessionOnly)
+    {
+    }
+
+    public CandidateNode(string name, double? multiplier, string nodeId, NodeIdentityStrength identityStrength)
     {
         Name = name;
         Multiplier = multiplier;
+        NodeId = nodeId ?? "";
+        IdentityStrength = identityStrength;
     }
 
     public string Name { get; private set; }
     public double? Multiplier { get; private set; }
+    public string NodeId { get; private set; }
+    public NodeIdentityStrength IdentityStrength { get; private set; }
 }
 
 public enum ServiceKind

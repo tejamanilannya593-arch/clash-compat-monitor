@@ -1555,6 +1555,12 @@ internal static class Tests
         Equal("first|chatgpt,gemini", originalScope, "initial subscription creates scope");
         Equal(originalScope, continuity.ResolveScope("reordered", new[] { "d", "c", "b", "a" }, "chatgpt,gemini"),
             "candidate reorder preserves experience scope");
+        var renamedIdentityContinuity = new ExperienceData();
+        string identityScope = renamedIdentityContinuity.ResolveScope("identity-first",
+            new[] { "node-v1-a", "node-v1-b" }, "chatgpt,gemini");
+        Equal(identityScope, renamedIdentityContinuity.ResolveScope("identity-renamed",
+            new[] { "node-v1-b", "node-v1-a" }, "chatgpt,gemini"),
+            "display rename preserves identity-based scope");
         Equal(originalScope, continuity.ResolveScope("minor", new[] { "a", "b", "c", "e", "f" }, "chatgpt,gemini"),
             "minor subscription update preserves experience scope");
         Equal("different|chatgpt,gemini", continuity.ResolveScope("different", new[] { "w", "x", "y", "z" }, "chatgpt,gemini"),
@@ -1687,6 +1693,22 @@ internal static class Tests
             "provider contact and account metadata never enter node measurements");
         Equal(2, CandidateCatalog.Filter(new[] { "香港 I1 | 通知优化", "Tokyo-A" }, runtimeTypes).Count,
             "notice filtering does not reject node regions or ordinary words inside node names");
+
+        string stableId = "node-v1-" + new string('A', 43);
+        var identified = new CandidateNode("display", 1.0, stableId, NodeIdentityStrength.Strong);
+        Equal("display", identified.Name, "candidate retains selector name");
+        Equal(stableId, identified.NodeId, "candidate carries stable identity");
+        Equal(NodeIdentityStrength.Strong, identified.IdentityStrength, "candidate carries identity strength");
+        var resolved = new Dictionary<string, ResolvedNodeIdentity>(StringComparer.Ordinal) {
+            { "Tokyo-A", new ResolvedNodeIdentity(stableId, NodeIdentityStrength.Strong, "") },
+            { "Tokyo alias", new ResolvedNodeIdentity(stableId, NodeIdentityStrength.Strong, "") }
+        };
+        IList<CandidateNode> identityCandidates = CandidateCatalog.Filter(
+            new[] { "Tokyo alias", "Tokyo-A", "unresolved" }, null, resolved);
+        Equal(2, identityCandidates.Count, "equivalent strong aliases collapse to one live candidate");
+        Equal("Tokyo-A", identityCandidates[0].Name, "equivalent aliases use deterministic live name");
+        Equal(NodeIdentityStrength.SessionOnly, identityCandidates[1].IdentityStrength,
+            "unresolved candidate remains available for the live session");
     }
 
     private static void PipeHttpDecoding()

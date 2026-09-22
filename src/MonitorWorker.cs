@@ -334,7 +334,18 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 catch (TimeoutException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
                 catch (ArgumentException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
             }
-            IList<CandidateNode> candidates = CandidateCatalog.Filter(mihomo.GetChoices(config.SharedGroup), runtimeTypes);
+            IList<CandidateNode> discovered = CandidateCatalog.Filter(
+                mihomo.GetChoices(config.SharedGroup), runtimeTypes);
+            IDictionary<string, ResolvedNodeIdentity> resolvedIdentities = null;
+            if (nodeIdentitySource != null)
+            {
+                try { resolvedIdentities = nodeIdentitySource.Resolve(discovered.Select(x => x.Name)); }
+                catch (IOException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+                catch (UnauthorizedAccessException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+                catch (ArgumentException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+            }
+            IList<CandidateNode> candidates = CandidateCatalog.Filter(
+                discovered.Select(x => x.Name), runtimeTypes, resolvedIdentities);
             if (candidates.Count == 0)
             {
                 logger.Write("no eligible candidates");
@@ -343,10 +354,15 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             }
             var store = new StateStore(config.StatePath);
             HealthState state = store.Load();
-            string fingerprint = Fingerprint(candidates);
             string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
-            string memoryScope = experience.ResolveScope(fingerprint, candidates.Select(x => x.Name), servicesKey);
-            logger.Write("subscription candidates=" + candidates.Count + " continuity=" + experience.ScopeContinuityReason);
+            IList<string> strongNodeIds = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+                NodeIdentity.IsStrong(x.NodeId)).Select(x => x.NodeId).Distinct(StringComparer.Ordinal).ToList();
+            IList<string> scopeNodeKeys = nodeIdentitySource == null
+                ? candidates.Select(x => x.Name).ToList() : strongNodeIds;
+            string fingerprint = Fingerprint(scopeNodeKeys);
+            string memoryScope = experience.ResolveScope(fingerprint, scopeNodeKeys, servicesKey);
+            logger.Write("subscription candidates=" + candidates.Count + " strong_identities=" + strongNodeIds.Count +
+                " continuity=" + experience.ScopeContinuityReason);
             ConnectionAssurance assurance = experience.Assurance;
             assurance.SetScope(memoryScope);
             var requiredServices = preferences.RequiredServices.Distinct().ToList();
@@ -1411,9 +1427,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         return new NodeHealthRecord(result.Name, result.Health, clock.UtcNow, HealthPolicy.CooldownUntil(result.Health, clock.UtcNow), false);
     }
 
-    private static string Fingerprint(IEnumerable<CandidateNode> candidates)
+    private static string Fingerprint(IEnumerable<string> nodeKeys)
     {
-        byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", candidates.Select(x => x.Name).Distinct(StringComparer.Ordinal)
+        byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", (nodeKeys ?? Enumerable.Empty<string>())
+            .Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal)
             .OrderBy(x => x, StringComparer.Ordinal)));
         using (SHA256 hash = SHA256.Create()) return Convert.ToBase64String(hash.ComputeHash(bytes));
     }
