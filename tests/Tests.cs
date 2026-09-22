@@ -69,6 +69,7 @@ internal static class Tests
             "IPv6 flag alone cannot disable monitoring or trigger configuration rewrites");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
+        NodeIdentityBehavior();
         ServiceObservationBehavior();
         ExitNetworkEvidenceBehavior();
         RegionEligibilityCaching();
@@ -108,6 +109,44 @@ internal static class Tests
         BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void NodeIdentityBehavior()
+    {
+        byte[] key = Enumerable.Range(1, 32).Select(x => (byte)x).ToArray();
+        var parameters = new Dictionary<string, string> {
+            { "uuid", "secret-uuid" }, { "network", "ws" }, { "tls", "true" }
+        };
+        var reordered = new Dictionary<string, string> {
+            { "tls", "true" }, { "network", "ws" }, { "uuid", "secret-uuid" }
+        };
+        var material = new NodeIdentityMaterial("provider-a", "VMess", "EDGE.EXAMPLE", 443, parameters);
+        string identity = NodeIdentity.Create(material, key);
+
+        Equal(true, identity.StartsWith("node-v1-", StringComparison.Ordinal), "node identity is versioned");
+        Equal(identity, NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 443, reordered), key),
+            "node identity normalizes host protocol and parameter order");
+        Equal(false, identity.Contains("edge.example") || identity.Contains("secret-uuid"),
+            "node identity reveals no source material");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "other.example", 443, parameters), key),
+            "server change creates a new identity");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 8443, parameters), key),
+            "port change creates a new identity");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "trojan", "edge.example", 443, parameters), key),
+            "protocol change creates a new identity");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-b", "vmess", "edge.example", 443, parameters), key),
+            "subscription source change creates a new identity");
+        var changedParameters = new Dictionary<string, string>(parameters);
+        changedParameters["network"] = "grpc";
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 443, changedParameters), key),
+            "material connection parameter creates a new identity");
+        Equal("", NodeIdentity.Create(material, new byte[0]), "missing identity key fails closed");
     }
 
     private static void ServiceObservationBehavior()
