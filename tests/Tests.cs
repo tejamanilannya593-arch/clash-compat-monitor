@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.15", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.16", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -89,6 +89,7 @@ internal static class Tests
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
         RankedOpportunitySelectionBehavior();
+        WebsitePrioritySelectionBehavior();
         OpportunityCandidatePlanningBehavior();
         AutomaticDecisionPolicyBehavior();
         AutomaticDecisionStateMachineBehavior();
@@ -2129,15 +2130,15 @@ internal static class Tests
         ServiceKind[] criticalServices = StartupRecovery.FastProbeServices(
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google, ServiceKind.GitHub,
                 ServiceKind.SteamStore, ServiceKind.SteamCommunity, ServiceKind.SteamApi }, ServiceKind.SteamApi);
-        Equal("ChatGPT,Gemini,Google,GitHub,SteamApi", String.Join(",", criticalServices),
+        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", criticalServices),
             "fast comparison skips duplicate Steam endpoints but keeps the failed service");
         ServiceKind[] fixedCriticalServices = StartupRecovery.FastProbeServices(
             new[] { ServiceKind.Discord, ServiceKind.ZLibraryWeb }, ServiceKind.GitHub);
-        Equal("ChatGPT,Gemini,Google,GitHub", String.Join(",", fixedCriticalServices),
-            "fast comparison always checks the four region-safe critical services");
+        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", fixedCriticalServices),
+            "fast comparison always checks the AI, Steam, Google and GitHub services");
         ServiceKind[] fullFailoverServices = StartupRecovery.FullFailoverProbeServices(
             new[] { ServiceKind.Discord, ServiceKind.ZLibraryWeb }, ServiceKind.GitHub);
-        Equal("ChatGPT,Gemini,Google,GitHub,Discord,ZLibraryWeb", String.Join(",", fullFailoverServices),
+        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub,Discord,ZLibraryWeb", String.Join(",", fullFailoverServices),
             "full failover validation retains every selected service after the critical gate");
         var fasterTarget = new CandidateScanResult("fast", CandidateHealth.BasicCompatible, null, "ok", 800, 2,
             new Dictionary<ServiceKind, ProbeResult>
@@ -2261,7 +2262,9 @@ internal static class Tests
             .WithCandidateLatencies(new[] {
                 new CandidateLatencyMeasurement("node-a", "JP", 42, new[] {
                     new ServiceMeasurement(ServiceKind.ChatGPT, true, 120, "entry reachable", ProbeFailureKind.Partial),
-                    new ServiceMeasurement(ServiceKind.Gemini, false, 900, "blocked", ProbeFailureKind.Service)
+                    new ServiceMeasurement(ServiceKind.Gemini, false, 900, "blocked", ProbeFailureKind.Service),
+                    new ServiceMeasurement(ServiceKind.SteamApi, true, 150, "ok"),
+                    new ServiceMeasurement(ServiceKind.Google, true, 160, "ok")
                 }, now)
             });
         using (var form = new CandidateLatencyForm(snapshot, delegate { }))
@@ -2274,6 +2277,11 @@ internal static class Tests
                 "candidate latency table has a ChatGPT website column");
             Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
                 "candidate latency table has a Gemini website column");
+            Equal("service_ChatGPT,service_Gemini,service_SteamApi,service_Google",
+                String.Join(",", table.Columns.Cast<DataGridViewColumn>()
+                    .Where(x => x.Name.StartsWith("service_", StringComparison.Ordinal))
+                    .Select(x => x.Name).Take(4)),
+                "candidate latency table shows primary AI then secondary Steam and Google");
             Equal("入口可达 · 120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
                 "candidate latency table shows partial website latency without claiming full verification");
             Equal("不可用", table.Rows[0].Cells["service_Gemini"].Value,
@@ -2892,6 +2900,52 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal<string>(null, none.Node, "ranked selector retains a faster current node");
         Equal("first", String.Join(",", checkedNodes),
             "ranked selector stops before rows that cannot beat the current response");
+    }
+
+    private static void WebsitePrioritySelectionBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 24, 0, 0, 0, DateTimeKind.Utc);
+        var aiFast = new CandidateLatencyMeasurement("ai-fast", "JP", 900, new[] {
+            new ServiceMeasurement(ServiceKind.ChatGPT, true, 180, "ok"),
+            new ServiceMeasurement(ServiceKind.Gemini, true, 200, "ok"),
+            new ServiceMeasurement(ServiceKind.SteamApi, true, 1200, "ok"),
+            new ServiceMeasurement(ServiceKind.Google, true, 1100, "ok") }, now);
+        var aiSlow = new CandidateLatencyMeasurement("ai-slow", "JP", 20, new[] {
+            new ServiceMeasurement(ServiceKind.ChatGPT, true, 300, "ok"),
+            new ServiceMeasurement(ServiceKind.Gemini, true, 320, "ok"),
+            new ServiceMeasurement(ServiceKind.SteamApi, true, 40, "ok"),
+            new ServiceMeasurement(ServiceKind.Google, true, 50, "ok") }, now);
+        Equal(true, RankedOpportunitySelector.ResponseMilliseconds(aiFast) <
+            RankedOpportunitySelector.ResponseMilliseconds(aiSlow),
+            "ChatGPT and Gemini website latency outranks Steam, Google and Clash delay");
+        var secondaryFast = new CandidateLatencyMeasurement("secondary-fast", "JP", 900, new[] {
+            new ServiceMeasurement(ServiceKind.ChatGPT, true, 180, "ok"),
+            new ServiceMeasurement(ServiceKind.Gemini, true, 200, "ok"),
+            new ServiceMeasurement(ServiceKind.SteamApi, true, 100, "ok"),
+            new ServiceMeasurement(ServiceKind.Google, true, 110, "ok") }, now);
+        Equal(true, WebsitePriorityLatency.Secondary(secondaryFast) <
+            WebsitePriorityLatency.Secondary(aiFast),
+            "Steam and Google website latency breaks equal AI latency ties");
+
+        Func<string, long, long, long, long, CandidateScanResult> scan = (name, chat, gemini, steam, google) =>
+            new CandidateScanResult(name, CandidateHealth.BasicCompatible, null, "ok", 0, 4,
+                new Dictionary<ServiceKind, ProbeResult> {
+                    { ServiceKind.ChatGPT, ProbeResult.Partial("entry", chat) },
+                    { ServiceKind.Gemini, ProbeResult.Partial("entry", gemini) },
+                    { ServiceKind.SteamApi, ProbeResult.Success(steam) },
+                    { ServiceKind.Google, ProbeResult.Success(google) }
+                }, null, "JP");
+        CandidateScanResult first = scan("ai-fast", 180, 200, 1200, 1100);
+        CandidateScanResult second = scan("ai-slow", 300, 320, 40, 50);
+        CandidateScanResult third = scan("secondary-fast", 180, 200, 100, 110);
+        string[] ranked = StartupRecovery.RankVerifiedFastTargets(new[] { first, second, third },
+            new Dictionary<string, int> { { "ai-fast", 900 }, { "ai-slow", 20 }, { "secondary-fast", 950 } },
+            ServiceKind.ChatGPT);
+        Equal("secondary-fast,ai-fast,ai-slow", String.Join(",", ranked),
+            "recovery ranks AI first and Steam/Google second without Clash delay ties");
+        Equal(true, StartupRecovery.FastProbeServices(new[] { ServiceKind.ChatGPT, ServiceKind.Gemini },
+            ServiceKind.ChatGPT).Contains(ServiceKind.SteamApi),
+            "quick recovery measures Steam even when it is not selected in preferences");
     }
 
     private static void RunUnhelpfulSevereLatencyOrchestration()
@@ -4890,7 +4944,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.15"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.16"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

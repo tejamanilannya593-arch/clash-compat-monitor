@@ -73,7 +73,9 @@ public sealed class CandidateLatencyForm : Form
         IList<CandidateLatencyMeasurement> rows = snapshot.CandidateLatencies ??
             new List<CandidateLatencyMeasurement>().AsReadOnly();
         ServiceKind[] services = rows.SelectMany(x => x.Services).Select(x => x.Service)
-            .Distinct().OrderBy(x => x).ToArray();
+            .Distinct().OrderBy(x => x == ServiceKind.ChatGPT ? 0 :
+                x == ServiceKind.Gemini ? 1 : x == ServiceKind.SteamApi ? 2 :
+                x == ServiceKind.Google ? 3 : 4).ThenBy(x => x).ToArray();
 
         latencyTable.SuspendLayout();
         latencyTable.Columns.Clear();
@@ -81,7 +83,7 @@ public sealed class CandidateLatencyForm : Form
         AddColumn("rank", "排名", 54, true);
         AddColumn("node", "候选节点", 230, true);
         AddColumn("country", "出口", 60, true);
-        AddColumn("mihomo", "Clash 延迟", 88, true);
+        AddColumn("mihomo", "Clash 延迟（初筛）", 120, true);
         foreach (ServiceKind service in services)
             AddColumn("service_" + service, MonitorPresentation.ServiceLabel(service), 90, false);
 
@@ -107,7 +109,8 @@ public sealed class CandidateLatencyForm : Form
         }
         DateTime checkedUtc = rows.Select(x => x.CheckedUtc).DefaultIfEmpty(DateTime.MinValue).Max();
         statusLabel.Text = rows.Count == 0 ? "尚未实测。点击下方按钮开始测量。" :
-            "按各网站响应 P75 排序 · 最近实测：" + checkedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss");
+            "先按 ChatGPT/Gemini，次按 Steam/Google 实测延迟排序 · Clash 延迟仅用于初筛 · 最近实测：" +
+            checkedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss");
         latencyTable.ResumeLayout();
     }
 

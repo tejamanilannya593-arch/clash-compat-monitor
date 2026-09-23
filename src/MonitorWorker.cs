@@ -864,10 +864,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         RememberRegionEligibility(memoryScope, targetScan);
                         scans[targetScan.Name] = targetScan;
                         scanTimes[targetScan.Name] = clock.UtcNow;
-                        double confirmedBaseline = QualityMeasurement.ResponseMilliseconds(currentScan,
-                            pendingOptimization.BaselineResponse);
-                        double confirmedTarget = QualityMeasurement.ResponseMilliseconds(targetScan,
-                            pendingOptimization.TargetResponse);
+                        double confirmedBaseline = WebsitePriorityLatency.Primary(currentScan);
+                        double confirmedTarget = WebsitePriorityLatency.Primary(targetScan);
                         bool comparable = OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices);
                         MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
                             confirmedBaseline, confirmedTarget,
@@ -961,7 +959,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 IList<CandidateLatencyMeasurement> publishedRanking;
                 if (!candidateLatencyStore.TryPublish(rankingGeneration, ranking, out publishedRanking))
                     ranking = publishedRanking;
-                double baseline = QualityMeasurement.ResponseMilliseconds(currentScan, 5000);
+                double baseline = WebsitePriorityLatency.Primary(currentScan);
                 RankedOpportunitySelection selected = RankedOpportunitySelector.Select(ranking,
                     baseline, requiredServices, name =>
                 {
@@ -1571,7 +1569,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         {
             CheckStop();
             CandidateNode candidate = alternatives.First(x => x.Name == name);
-            CandidateScanResult scan = scanner.ScanSelected(candidate, requiredServices,
+            CandidateScanResult scan = scanner.ScanSelected(candidate, requiredServices
+                .Concat(new[] { ServiceKind.ChatGPT, ServiceKind.Gemini,
+                    ServiceKind.SteamApi, ServiceKind.Google }).Distinct().ToArray(),
                 TimeSpan.FromSeconds(2));
             int mihomoDelay;
             if (!delays.TryGetValue(name, out mihomoDelay)) mihomoDelay = Int32.MaxValue;
@@ -1583,7 +1583,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         }
         IList<CandidateLatencyMeasurement> result = measured
             .OrderBy(x => RankedOpportunitySelector.ResponseMilliseconds(x))
-            .ThenBy(x => x.MihomoMilliseconds)
+            .ThenBy(x => WebsitePriorityLatency.Secondary(x))
             .ThenBy(x => x.Node, StringComparer.Ordinal)
             .ToList().AsReadOnly();
         logger.Write("candidate latency ranking measured=" + result.Count +

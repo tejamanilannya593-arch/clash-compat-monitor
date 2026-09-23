@@ -83,7 +83,8 @@ public static class StartupRecovery
     public static ServiceKind[] FastProbeServices(System.Collections.Generic.IEnumerable<ServiceKind> required,
         ServiceKind failedService)
     {
-        return new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google, ServiceKind.GitHub }
+        return new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.SteamApi,
+                ServiceKind.Google, ServiceKind.GitHub }
             .Concat(new[] { failedService }).Distinct().ToArray();
     }
 
@@ -99,8 +100,9 @@ public static class StartupRecovery
     {
         return (scans ?? new CandidateScanResult[0])
             .Where(x => IsEligibleQuickScan(x, failedService))
-            .OrderBy(x => QualityMeasurement.ResponseMilliseconds(x, 5000))
-            .ThenBy(x => delays != null && delays.ContainsKey(x.Name) ? delays[x.Name] : Int32.MaxValue)
+            .OrderBy(x => WebsitePriorityLatency.Primary(x))
+            .ThenBy(x => WebsitePriorityLatency.Secondary(x))
+            .ThenBy(x => x.Name, StringComparer.Ordinal)
             .Select(x => x.Name).ToArray();
     }
 
@@ -109,8 +111,8 @@ public static class StartupRecovery
         System.Collections.Generic.IDictionary<string, int> delays)
     {
         return (scans ?? new CandidateScanResult[0])
-            .OrderBy(x => QualityMeasurement.ResponseMilliseconds(x, 5000))
-            .ThenBy(x => delays != null && delays.ContainsKey(x.Name) ? delays[x.Name] : Int32.MaxValue)
+            .OrderBy(x => WebsitePriorityLatency.Primary(x))
+            .ThenBy(x => WebsitePriorityLatency.Secondary(x))
             .ThenBy(x => x.Name, StringComparer.Ordinal)
             .Select(x => x.Name).ToArray();
     }
