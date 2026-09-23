@@ -23,7 +23,7 @@ public static class OpportunityOptimizationPolicy
     public static bool ShouldScan(bool enabled, bool observing,
         IEnumerable<double> currentResponses, DateTime lastScanUtc, DateTime nowUtc)
     {
-        return enabled && !observing && QualityPolicy.CurrentNeedsOptimization(currentResponses) &&
+        return enabled && !observing &&
             (lastScanUtc == DateTime.MinValue || nowUtc - lastScanUtc >= ScanInterval);
     }
 

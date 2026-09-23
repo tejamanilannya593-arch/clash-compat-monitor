@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.12", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.13", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -80,6 +80,7 @@ internal static class Tests
         CompatibilityScanning();
         FastFailoverWorkerOrchestration();
         CandidateLatencyRankingBehavior();
+        AutomaticRankedSelectionBehavior();
         ZLibraryWebBehavior();
         ZLibraryChoiceBehavior();
         DetailsTypographyBehavior();
@@ -2258,7 +2259,7 @@ internal static class Tests
         MonitorSnapshot snapshot = MonitorSnapshot.CreateState(MonitorRunState.Running, "ok", now, now)
             .WithCandidateLatencies(new[] {
                 new CandidateLatencyMeasurement("node-a", "JP", 42, new[] {
-                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 120, "ok"),
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 120, "entry reachable", ProbeFailureKind.Partial),
                     new ServiceMeasurement(ServiceKind.Gemini, false, 900, "blocked", ProbeFailureKind.Service)
                 }, now)
             });
@@ -2272,8 +2273,8 @@ internal static class Tests
                 "candidate latency table has a ChatGPT website column");
             Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
                 "candidate latency table has a Gemini website column");
-            Equal("120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
-                "candidate latency table shows measured website latency");
+            Equal("入口可达 · 120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
+                "candidate latency table shows partial website latency without claiming full verification");
             Equal("不可用", table.Rows[0].Cells["service_Gemini"].Value,
                 "candidate latency table distinguishes failure from latency");
             Equal("待测", table.Rows[9].Cells["node"].Value,
@@ -2321,12 +2322,12 @@ internal static class Tests
                 "candidate website latency measurement never changes the shared selector");
             Equal(10, ranking.Count,
                 "candidate website latency ranking contains ten rows");
-            Equal("node-02,node-03,node-04,node-05,node-06,node-07,node-08,node-09,node-10,node-01",
+            Equal("node-10,node-09,node-08,node-07,node-06,node-05,node-04,node-03,node-02,node-01",
                 String.Join(",", ranking.Select(x => x.Node)),
-                "candidate website latency ranking puts incomplete website coverage after complete candidates");
-            Equal(20, ranking[0].MihomoMilliseconds,
+                "candidate website latency ranking uses website responses before Mihomo delay");
+            Equal(100, ranking[0].MihomoMilliseconds,
                 "candidate ranking exposes the live Mihomo delay");
-            Equal(102L, ranking[0].Services
+            Equal(100L, ranking[0].Services
                 .First(x => x.Service == ServiceKind.ChatGPT).Milliseconds,
                 "candidate ranking exposes per-website measured latency");
             Equal(true, ranking.All(x =>
@@ -2341,6 +2342,133 @@ internal static class Tests
         {
             DeleteDirectoryEventually(root);
         }
+    }
+
+    private static void AutomaticRankedSelectionBehavior()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-ranked-selection-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 10)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new RankedSelectionProbe(mihomo, 900),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot result = worker.Run(preferences);
+
+            Equal("node-02", mihomo.GetSelected("shared"),
+                "automatic ranking skips a failed first full recheck and selects the second website-ranked node");
+            Equal(10, result.CandidateLatencies.Count,
+                "automatic selection publishes the same ten website latency rows");
+            Equal("node-01,node-02", String.Join(",", result.CandidateLatencies.Take(2).Select(x => x.Node)),
+                "automatic selection follows displayed website latency order");
+            Equal("node-01,node-02", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(5))
+                .Where(x => x != "current")),
+                "automatic selection fully rechecks ranked candidates in order and stops after success");
+            ExperienceData afterSwitch = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal(true, afterSwitch.Assurance.ProvisionalSwitch,
+                "ranked selection marks a reachable-only AI target as provisional during observation");
+        }
+        finally { DeleteDirectoryEventually(root); }
+
+        string fastRoot = Path.Combine(Path.GetTempPath(), "monitor-ranked-current-fast-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fastRoot);
+        try
+        {
+            string[] alternatives = { "node-01", "node-02", "node-03" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var worker = new MonitorWorker(FastWorkerConfiguration(fastRoot), mihomo,
+                new RankedSelectionProbe(mihomo, 80),
+                new BoundedLogger(Path.Combine(fastRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 10, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot result = worker.Run(preferences);
+            Equal("current", mihomo.GetSelected("shared"),
+                "website ranking retains a current node that is faster than every candidate");
+            Equal(3, result.CandidateLatencies.Count,
+                "healthy current still receives the scheduled website ranking");
+            Equal(0, mihomo.ScanNodes(TimeSpan.FromSeconds(5)).Count(x => x != "current"),
+                "slower ranked candidates do not cause unnecessary full rechecks");
+        }
+        finally { DeleteDirectoryEventually(fastRoot); }
+
+        string dryRoot = Path.Combine(Path.GetTempPath(), "monitor-ranked-dry-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dryRoot);
+        try
+        {
+            string[] alternatives = { "node-01", "node-02", "node-03" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var worker = new MonitorWorker(FastWorkerConfiguration(dryRoot), mihomo,
+                new RankedSelectionProbe(mihomo, 900),
+                new BoundedLogger(Path.Combine(dryRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 20, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(true, preferences);
+            Equal("current", mihomo.GetSelected("shared"),
+                "dry-run website ranking never changes the shared selector");
+        }
+        finally { DeleteDirectoryEventually(dryRoot); }
+
+        string invalidatedRoot = Path.Combine(Path.GetTempPath(),
+            "monitor-ranked-invalidated-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(invalidatedRoot);
+        try
+        {
+            string[] alternatives = { "node-01", "node-02", "node-03" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var blockingProbe = new BlockingRankedSelectionProbe(mihomo);
+            var worker = new MonitorWorker(FastWorkerConfiguration(invalidatedRoot), mihomo,
+                blockingProbe,
+                new BoundedLogger(Path.Combine(invalidatedRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 30, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+            Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => worker.Run(preferences),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            try
+            {
+                Equal(true, blockingProbe.WaitUntilRankingStarts(5000),
+                    "ranking invalidation fixture pauses during the website scan");
+                ((ICandidateLatencyRunner)worker).InvalidateCandidateLatencies();
+            }
+            finally { blockingProbe.Release(); }
+            Equal(true, cycle.Wait(5000), "invalidated ranking cycle completes");
+            Equal("current", mihomo.GetSelected("shared"),
+                "invalidated website ranking cannot switch the shared selector");
+            Equal(0, cycle.Result.CandidateLatencies.Count,
+                "invalidated website ranking is not published by the automatic cycle");
+        }
+        finally { DeleteDirectoryEventually(invalidatedRoot); }
     }
 
     private static void RunRecoveredSevereLatencyOrchestration()
@@ -2457,22 +2585,21 @@ internal static class Tests
 
             Equal(alternatives.Length, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
                 "scheduled opportunity scan measures every alternative once");
-            Equal("node-01,node-06,node-07", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
-                "scheduled opportunity scan includes live historical and exploration candidates before stopping");
-            Equal("current", mihomo.GetSelected("shared"),
-                "first opportunity scan prepares a target without switching");
+            Equal(String.Join(",", alternatives), String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "scheduled ranking measures the candidate websites in live delay order");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "scheduled ranking directly selects the first fully rechecked faster node");
             ExperienceData afterDiscovery = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
-            Equal("node-01", afterDiscovery.Assurance.PendingOptimization.Target,
-                "fresh service response outranks historical candidate origin");
-            Equal(AutomaticDecisionState.ConfirmingOptimization, afterDiscovery.Assurance.Decision.State,
-                "opportunity discovery enters optimization confirmation state");
+            Equal<PendingOptimization>(null, afterDiscovery.Assurance.PendingOptimization,
+                "ranked selection does not leave a pending optimization");
+            Equal(AutomaticDecisionState.Observing, afterDiscovery.Assurance.Decision.State,
+                "ranked selection enters normal switch observation");
             Equal(TimeSpan.FromSeconds(30), discovery.NextCheckUtc - discovery.CheckedUtc,
-                "pending target schedules a thirty-second confirmation");
+                "ranked switch schedules a thirty-second observation");
             string trace = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
-            Equal(true, trace.Contains("opportunity candidate plan live=5 historical=1 exploration=1 fill=0"),
-                "opportunity trace records source counts");
-            Equal(true, trace.Contains("source=historical") && trace.Contains("source=exploration"),
-                "opportunity trace records scanned source categories");
+            Equal(true, trace.Contains("ranked selection elapsed_ms=") &&
+                trace.Contains("ranked=7 rechecked=1 switched=true"),
+                "ranked selection trace records the bounded scan and switch");
             Equal(false, trace.Contains("node-06") || trace.Contains("node-07"),
                 "opportunity trace never exposes raw node names");
 
@@ -2483,16 +2610,16 @@ internal static class Tests
             Equal(delayCount, mihomo.DelayNodes(2500).Count,
                 "confirmation performs no second all-node delay round");
             Equal("node-01", mihomo.GetSelected("shared"),
-                "automatic confirmation switches the materially faster target");
+                "observation retains the ranked selected target");
             ExperienceData afterConfirmation = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
             Equal("node-01", afterConfirmation.Assurance.Target,
-                "automatic optimization enters normal post-switch observation");
+                "ranked selection retains normal post-switch observation");
             Equal(AutomaticDecisionState.Observing, afterConfirmation.Assurance.Decision.State,
-                "confirmed optimization enters state-machine observation");
+                "ranked selection retains state-machine observation");
             Equal<PendingOptimization>(null, afterConfirmation.Assurance.PendingOptimization,
-                "successful confirmation clears pending optimization");
+                "ranked selection has no pending optimization");
             Equal(TimeSpan.FromSeconds(30), confirmation.NextCheckUtc - confirmation.CheckedUtc,
-                "automatic switch keeps the observation interval");
+                "ranked switch keeps the observation interval");
         }
         finally
         {
@@ -2546,8 +2673,8 @@ private static void RunRecentSwitchOpportunityHysteresisOrchestration()
             ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
             Equal<PendingOptimization>(null, after.Assurance.PendingOptimization,
                 "recent switch rejects an optimization below thirty percent improvement");
-            Equal("current", mihomo.GetSelected("shared"),
-                "recent switch hysteresis keeps the current node");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "a recent switch permits a faster ranked node while the switch budget allows it");
         }
         finally
         {
@@ -2627,9 +2754,9 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal(true, OpportunityOptimizationPolicy.ShouldScan(true, false,
             new[] { 900d, 850d, 801d, 900d, 900d }, DateTime.MinValue, now),
             "slow current schedules automatic opportunity discovery");
-        Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
+        Equal(true, OpportunityOptimizationPolicy.ShouldScan(true, false,
             new[] { 900d, 900d, 800d, 700d, 700d }, DateTime.MinValue, now),
-            "good current does not schedule opportunity discovery");
+            "a working current still schedules a ranked comparison when due");
         Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
             new[] { 900d, 850d, 801d, 900d, 900d }, now.AddMinutes(-2), now),
             "opportunity discovery is limited to one round per three minutes");
@@ -3421,11 +3548,59 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             if (scan.Node == "current") return ProbeResult.Success(250);
             int number;
             if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 99;
+            long elapsed = 200 - number * 10;
             if (scan.Node == "node-01" && service == ServiceKind.Gemini)
-                return ProbeResult.ServiceFailure("blocked", 101);
+                return ProbeResult.ServiceFailure("blocked", elapsed);
             return service == ServiceKind.ChatGPT || service == ServiceKind.Gemini
-                ? ProbeResult.Partial("entry reachable", 100 + number)
-                : ProbeResult.Success(100 + number);
+                ? ProbeResult.Partial("entry reachable", elapsed)
+                : ProbeResult.Success(elapsed);
+        }
+    }
+
+    private sealed class RankedSelectionProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly long currentMilliseconds;
+        public RankedSelectionProbe(OrchestratedMihomo mihomo, long currentMilliseconds)
+        {
+            this.mihomo = mihomo;
+            this.currentMilliseconds = currentMilliseconds;
+        }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current") return ProbeResult.Success(currentMilliseconds);
+            int number = Int32.Parse(scan.Node.Substring("node-".Length));
+            if (number == 1 && timeout > TimeSpan.FromSeconds(2) && service == ServiceKind.ChatGPT)
+                return ProbeResult.ServiceFailure("full recheck failed", 100);
+            return number == 2 && service == ServiceKind.ChatGPT
+                ? ProbeResult.Partial("entry reachable", 100 + number * 50)
+                : ProbeResult.Success(100 + number * 50);
+        }
+    }
+
+    private sealed class BlockingRankedSelectionProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        public BlockingRankedSelectionProbe(OrchestratedMihomo mihomo) { this.mihomo = mihomo; }
+        public bool WaitUntilRankingStarts(int milliseconds) { return entered.Wait(milliseconds); }
+        public void Release() { released.Set(); }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "node-01" && timeout == TimeSpan.FromSeconds(2) &&
+                service == ServiceKind.ChatGPT)
+            {
+                entered.Set();
+                released.Wait(TimeSpan.FromSeconds(15));
+            }
+            return ProbeResult.Success(scan.Node == "current" ? 900 : 150);
         }
     }
 
@@ -4524,7 +4699,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.12"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.13"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

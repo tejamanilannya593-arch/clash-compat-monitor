@@ -121,6 +121,8 @@ public sealed class CandidateLatencyForm : Form
     private static string WebsiteLatencyText(ServiceMeasurement service)
     {
         if (service == null || service.Evidence == ProbeFailureKind.Unverified) return "待验证";
+        if (service.Evidence == ProbeFailureKind.Partial)
+            return service.Milliseconds > 0 ? "入口可达 · " + service.Milliseconds + " ms" : "入口可达";
         if (!service.Available) return "不可用";
         return service.Milliseconds > 0 ? service.Milliseconds + " ms" : "可用";
     }

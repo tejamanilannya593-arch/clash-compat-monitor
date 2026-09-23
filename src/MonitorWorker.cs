@@ -952,94 +952,82 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                         Reason = "scheduled opportunity scan" });
                 assurance.LastOpportunityScanUtc = clock.UtcNow;
-                List<CandidateNode> opportunityPool = candidates.Where(x => x.Name != current).ToList();
                 Stopwatch opportunityTimer = Stopwatch.StartNew();
-                Dictionary<string, int> opportunityDelays = MeasureLiveDelays(opportunityPool);
-                OpportunityCandidatePlan candidatePlan = OpportunityCandidatePlanner.Create(
-                    opportunityPool, opportunityDelays, current, experience, memoryScope, clock.UtcNow);
-                logger.Write("opportunity candidate plan live=" + candidatePlan.LiveDelayCount +
-                    " historical=" + candidatePlan.HistoricalCount +
-                    " exploration=" + candidatePlan.ExplorationCount +
-                    " fill=" + candidatePlan.FillCount +
-                    " duplicate_removal=" + candidatePlan.DuplicateRemovalCount);
-                ServiceKind[] quickServices = StartupRecovery.FastProbeServices(requiredServices, ServiceKind.ChatGPT);
-                var comparableScans = new List<CandidateScanResult>();
+                int rankingGeneration = candidateLatencyStore.BeginMeasurement();
+                IList<CandidateLatencyMeasurement> ranking = MeasureCandidateLatencies(candidates,
+                    current, requiredServices);
+                IList<CandidateLatencyMeasurement> publishedRanking;
+                if (!candidateLatencyStore.TryPublish(rankingGeneration, ranking, out publishedRanking))
+                    ranking = publishedRanking;
+                double baseline = QualityMeasurement.ResponseMilliseconds(currentScan, 5000);
                 int checkedCandidates = 0;
-                foreach (OpportunityCandidateChoice planned in candidatePlan.Candidates)
+                foreach (CandidateLatencyMeasurement ranked in ranking)
                 {
-                    if (StartupRecovery.ShouldStopAfterCheckedCandidates(checkedCandidates) ||
-                        StartupRecovery.ShouldStopAfterEligibleCandidates(comparableScans.Count)) break;
-                    string candidateName = planned.Name;
-                    CandidateNode candidate = candidates.First(x => x.Name == candidateName);
-                    Report("正在自动比较候选：" + candidateName, currentEvidence);
-                    logger.Write("opportunity candidate scan node=" + SafeName(candidateName) +
-                        " source=" + planned.Source.ToString().ToLowerInvariant());
-                    CandidateScanResult quickScan = scanner.ScanSelected(candidate, quickServices,
-                        TimeSpan.FromSeconds(2));
-                    RememberRegionEligibility(memoryScope, quickScan);
-                    scans[candidateName] = quickScan;
-                    scanTimes[candidateName] = clock.UtcNow;
-                    checkedCandidates++;
-                    if (OpportunityOptimizationPolicy.IsPerformanceComparable(quickScan, quickServices))
-                        comparableScans.Add(quickScan);
-                }
-                string[] opportunityTargets = StartupRecovery.RankPerformanceComparableTargets(
-                    comparableScans, opportunityDelays);
-                if (opportunityTargets.Length > 0)
-                {
-                    string target = opportunityTargets[0];
-                    CandidateNode targetCandidate = candidates.First(x => x.Name == target);
-                    Report("正在完整验证自动寻优目标：" + target, currentEvidence);
+                    double rankedResponse = CandidateLatencyResponse(ranked);
+                    if (rankedResponse >= baseline) break;
+                    CandidateNode targetCandidate = candidates.First(x => x.Name == ranked.Node);
+                    Report("正在按网站延迟排行复检候选：" + ranked.Node, currentEvidence);
                     CandidateScanResult fullTargetScan = scanner.ScanSelected(targetCandidate, requiredServices);
                     RememberRegionEligibility(memoryScope, fullTargetScan);
-                    scans[target] = fullTargetScan;
-                    scanTimes[target] = clock.UtcNow;
-                    List<double> orderedResponses = recentCurrentResponses.OrderBy(x => x).ToList();
-                    double baseline = orderedResponses.Count == 0 ? currentResponse :
-                        orderedResponses[orderedResponses.Count / 2];
+                    scans[ranked.Node] = fullTargetScan;
+                    scanTimes[ranked.Node] = clock.UtcNow;
+                    checkedCandidates++;
                     double targetResponse = QualityMeasurement.ResponseMilliseconds(fullTargetScan, 5000);
-                    MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
-                        baseline, targetResponse, assurance.HasRecentAutomaticSwitch(clock.UtcNow));
-                    if (OpportunityOptimizationPolicy.IsPerformanceComparable(fullTargetScan, requiredServices) &&
-                        improvement.Accepted)
+                    if (!OpportunityOptimizationPolicy.IsPerformanceComparable(fullTargetScan, requiredServices) ||
+                        targetResponse >= baseline) continue;
+                    if (dryRun) break;
+                    SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
+                    if (!budget.Allowed)
                     {
-                        assurance.PendingOptimization = new PendingOptimization { Scope = memoryScope,
-                            Current = current, CurrentNodeId = EvidenceKey(current),
-                            Target = target, TargetNodeId = EvidenceKey(target), BaselineResponse = baseline,
-                            TargetResponse = targetResponse, CreatedUtc = clock.UtcNow };
-                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
-                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
-                                Current = current, Target = target, BaselineResponse = baseline,
-                                TargetResponse = targetResponse,
-                                ExpiresUtc = clock.UtcNow.Add(OpportunityOptimizationPolicy.PendingLifetime),
-                                Reason = "material optimization target prepared" });
-                        assuranceDecision = "已找到更快候选，30 秒后自动确认";
-                        logger.Write("opportunity pending target=" + SafeName(target) + " baseline_ms=" +
-                            baseline.ToString("F0") + " target_ms=" + targetResponse.ToString("F0") +
-                            " relative=" + improvement.RelativeImprovement.ToString("P1") +
-                            " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
-                            " required_relative=" + improvement.RequiredRelativeImprovement.ToString("P0") +
-                            " required_absolute_ms=" + improvement.RequiredAbsoluteImprovementMilliseconds.ToString("F0"));
-                    }
-                    else
-                    {
-                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
+                        ApplyDecision(assurance, AutomaticDecisionEvent.BudgetExhausted,
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
-                                Target = target, BaselineResponse = baseline,
-                                TargetResponse = targetResponse, Reason = improvement.Reason });
-                        assurance.ClearPendingOptimization();
+                                ExpiresUtc = budget.AllowedAtUtc, Reason = budget.Reason });
+                        assuranceDecision = "自动切换达到预算，保持当前节点";
+                        break;
                     }
+                    ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
+                            Current = current, Target = ranked.Node, BaselineResponse = baseline,
+                            TargetResponse = targetResponse, Reason = "ranked candidate fully rechecked" });
+                    DecisionTransition authorization = ApplyDecision(assurance,
+                        AutomaticDecisionEvent.SwitchAuthorized,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                            Current = current, Previous = current, Target = ranked.Node,
+                            BaselineResponse = baseline, TargetResponse = targetResponse,
+                            Reason = "website latency ranked selection" });
+                    if (ApplyAutomaticSwitch(assurance, authorization, current, ranked.Node,
+                        "自动按网站延迟排行切换", baseline, true,
+                        !ServiceEvidencePolicy.CanEmergencySwitch(fullTargetScan)))
+                    {
+                        string oldCurrent = current;
+                        current = ranked.Node;
+                        currentCandidate = targetCandidate;
+                        currentScan = fullTargetScan;
+                        currentResponse = targetResponse;
+                        observing = true;
+                        opportunitySwitched = true;
+                        assuranceDecision = "已按网站延迟排行切换到更快节点";
+                        logger.Write("ranked selection from=" + SafeName(oldCurrent) +
+                            " to=" + SafeName(current) + " rank=" + (ranking.IndexOf(ranked) + 1) +
+                            " baseline_ms=" + baseline.ToString("F0") +
+                            " target_ms=" + targetResponse.ToString("F0"));
+                    }
+                    break;
                 }
-                else
+                if (!opportunitySwitched && assurance.Decision.State == AutomaticDecisionState.SearchingOptimization)
                 {
-                    ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
+                    bool currentUsable = ServiceEvidencePolicy.CanHold(currentScan);
+                    ApplyDecision(assurance, currentUsable ? AutomaticDecisionEvent.HealthyEvidence :
+                        AutomaticDecisionEvent.OptimizationRejected,
                         new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
-                            Reason = "no comparable optimization target" });
-                    assurance.ClearPendingOptimization();
+                            Reason = "no better fully verified ranked candidate" });
+                    assuranceDecision = dryRun ? "演练完成，未切换节点" :
+                        "前十名中没有通过完整复检且更快的节点";
                 }
                 opportunityTimer.Stop();
-                logger.Write("opportunity scan elapsed_ms=" + opportunityTimer.ElapsedMilliseconds +
-                    " checked=" + checkedCandidates + " eligible=" + comparableScans.Count);
+                logger.Write("ranked selection elapsed_ms=" + opportunityTimer.ElapsedMilliseconds +
+                    " ranked=" + ranking.Count + " rechecked=" + checkedCandidates +
+                    " switched=" + opportunitySwitched.ToString().ToLowerInvariant());
             }
 
             if (lastQualityRefreshUtc == DateTime.MinValue)
