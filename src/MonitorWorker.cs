@@ -39,8 +39,55 @@ public sealed class BoundedLogger
     }
 }
 
+internal sealed class CandidateLatencyStore
+{
+    private readonly object gate = new object();
+    private int generation;
+    private IList<CandidateLatencyMeasurement> current = Empty();
+
+    public IList<CandidateLatencyMeasurement> Current
+    {
+        get { lock (gate) return current; }
+    }
+
+    public int BeginMeasurement()
+    {
+        lock (gate) return generation;
+    }
+
+    public bool TryPublish(int measuredGeneration, IList<CandidateLatencyMeasurement> value,
+        out IList<CandidateLatencyMeasurement> published)
+    {
+        lock (gate)
+        {
+            if (measuredGeneration != generation)
+            {
+                published = Empty();
+                return false;
+            }
+            current = value ?? Empty();
+            published = current;
+            return true;
+        }
+    }
+
+    public void Invalidate()
+    {
+        lock (gate)
+        {
+            generation++;
+            current = Empty();
+        }
+    }
+
+    private static IList<CandidateLatencyMeasurement> Empty()
+    {
+        return new List<CandidateLatencyMeasurement>().AsReadOnly();
+    }
+}
+
 public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner, IAccountVerificationRunner,
-    ITriggeredCycleRunner
+    ITriggeredCycleRunner, ICandidateLatencyRunner
 {
     private readonly MonitorConfiguration config;
     private readonly IMihomoClient mihomo;
@@ -69,6 +116,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private ExperienceData experience;
     private readonly RegionEligibilityStore regionEligibilityStore;
     private readonly RegionEligibilityCache regionEligibility;
+    private readonly CandidateLatencyStore candidateLatencyStore = new CandidateLatencyStore();
     private bool firstCompletedCycle = true;
     public event Action<MonitorSnapshot> Progress;
     public Func<bool> ShouldStop { get; set; }
@@ -79,9 +127,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     {
         CheckStop();
         var handler = Progress;
-        if (handler != null) handler(evidence == null
+        if (handler != null) handler((evidence == null
             ? MonitorSnapshot.CreateState(MonitorRunState.Checking, stage, DateTime.MinValue, DateTime.MaxValue)
-            : evidence.WithProgress(stage));
+            : evidence.WithProgress(stage)).WithCandidateLatencies(candidateLatencyStore.Current));
     }
 
     public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock,
@@ -129,6 +177,37 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     {
         logger.Write("cycle trigger=" + trigger.ToString().ToLowerInvariant());
         return RunOnce(false, preferences);
+    }
+
+    public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+    {
+        if (preferences == null) throw new ArgumentNullException("preferences");
+        if (preferences.RequiredServices == null || preferences.RequiredServices.Count == 0)
+            throw new ArgumentException("At least one required service is needed.", "preferences");
+        if (System.Threading.Interlocked.Exchange(ref running, 1) != 0) return candidateLatencyStore.Current;
+        try
+        {
+            int generation = candidateLatencyStore.BeginMeasurement();
+            cycleTimer = Stopwatch.StartNew();
+            IList<CandidateNode> candidates = DiscoverCandidates();
+            string current = mihomo.GetSelected(config.SharedGroup);
+            IList<CandidateLatencyMeasurement> measured = MeasureCandidateLatencies(candidates, current,
+                UserPreferencePolicy.NormalizeServices(preferences.RequiredServices));
+            IList<CandidateLatencyMeasurement> published;
+            candidateLatencyStore.TryPublish(generation, measured, out published);
+            return published;
+        }
+        finally
+        {
+            cycleTimer = null;
+            System.Threading.Volatile.Write(ref running, 0);
+            MemoryTrimmer.TrimIdleWorkingSet();
+        }
+    }
+
+    public void InvalidateCandidateLatencies()
+    {
+        candidateLatencyStore.Invalidate();
     }
 
     public bool RestorePrevious()
@@ -331,34 +410,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 return MonitorSnapshot.CreateState(MonitorRunState.Degraded, ipv6Action, clock.UtcNow,
                     clock.UtcNow.Add(config.CycleInterval));
             }
-            IDictionary<string, string> runtimeTypes = null;
-            var catalogClient = mihomo as MihomoPipeClient;
-            if (catalogClient != null)
-            {
-                try { runtimeTypes = catalogClient.GetProxyTypes(); }
-                catch (IOException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
-                catch (TimeoutException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
-                catch (ArgumentException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
-            }
-            IList<CandidateNode> discovered = CandidateCatalog.Filter(
-                mihomo.GetChoices(config.SharedGroup), runtimeTypes);
-            IDictionary<string, ResolvedNodeIdentity> resolvedIdentities = null;
-            if (nodeIdentitySource != null)
-            {
-                try { resolvedIdentities = nodeIdentitySource.Resolve(discovered.Select(x => x.Name)); }
-                catch (IOException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
-                catch (UnauthorizedAccessException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
-                catch (ArgumentException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
-            }
-            IList<CandidateNode> candidates = CandidateCatalog.Filter(
-                discovered.Select(x => x.Name), runtimeTypes, resolvedIdentities);
-            activeCandidatesByName = candidates.ToDictionary(x => x.Name, x => x, StringComparer.Ordinal);
-            activeStrongIdsByName = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
-                NodeIdentity.IsStrong(x.NodeId)).ToDictionary(x => x.Name, x => x.NodeId, StringComparer.Ordinal);
-            activeNamesByStrongId = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
-                NodeIdentity.IsStrong(x.NodeId)).GroupBy(x => x.NodeId, StringComparer.Ordinal)
-                .ToDictionary(x => x.Key, x => x.OrderBy(y => y.Name.Length)
-                    .ThenBy(y => y.Name, StringComparer.Ordinal).First().Name, StringComparer.Ordinal);
+            IList<CandidateNode> candidates = DiscoverCandidates();
             if (candidates.Count == 0)
             {
                 logger.Write("no eligible candidates");
@@ -392,6 +444,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             if (suppressedServices.Count > 0)
                 logger.Write("service circuit active services=" + String.Join(",", suppressedServices));
             bool subscriptionChanged = !String.Equals(state.SubscriptionFingerprint, fingerprint, StringComparison.Ordinal);
+            if (subscriptionChanged) InvalidateCandidateLatencies();
             state.ApplySubscriptionFingerprint(fingerprint);
             var qualityStore = new QualityStateStore(config.QualityStatePath);
             List<QualitySample> qualityHistory = qualityStore.Load();
@@ -1327,7 +1380,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             firstCompletedCycle = false;
             MonitorSnapshot completed = MonitorSnapshot.CreateRunning(actual, actualScan, reportedScore, decision, clock.UtcNow,
                 clock.UtcNow.Add(nextInterval))
-                .WithSelectionReason(selectionSummary);
+                .WithSelectionReason(selectionSummary)
+                .WithCandidateLatencies(candidateLatencyStore.Current);
             return pathHealth != null && pathHealth.Mismatch
                 ? completed.WithState(MonitorRunState.Degraded, decision, clock.UtcNow.Add(nextInterval)) : completed;
         }
@@ -1479,6 +1533,83 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         catch (TimeoutException ex) { logger.Write("general selector sync skipped " + ex.GetType().Name); }
         catch (InvalidOperationException ex) { logger.Write("general selector sync skipped " + ex.GetType().Name); }
         return false;
+    }
+
+    private IList<CandidateNode> DiscoverCandidates()
+    {
+        IDictionary<string, string> runtimeTypes = null;
+        var catalogClient = mihomo as MihomoPipeClient;
+        if (catalogClient != null)
+        {
+            try { runtimeTypes = catalogClient.GetProxyTypes(); }
+            catch (IOException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+            catch (TimeoutException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+            catch (ArgumentException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+        }
+        IList<CandidateNode> discovered = CandidateCatalog.Filter(
+            mihomo.GetChoices(config.SharedGroup), runtimeTypes);
+        IDictionary<string, ResolvedNodeIdentity> resolvedIdentities = null;
+        if (nodeIdentitySource != null)
+        {
+            try { resolvedIdentities = nodeIdentitySource.Resolve(discovered.Select(x => x.Name)); }
+            catch (IOException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+            catch (UnauthorizedAccessException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+            catch (ArgumentException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+        }
+        IList<CandidateNode> candidates = CandidateCatalog.Filter(
+            discovered.Select(x => x.Name), runtimeTypes, resolvedIdentities);
+        activeCandidatesByName = candidates.ToDictionary(x => x.Name, x => x, StringComparer.Ordinal);
+        activeStrongIdsByName = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+            NodeIdentity.IsStrong(x.NodeId)).ToDictionary(x => x.Name, x => x.NodeId, StringComparer.Ordinal);
+        activeNamesByStrongId = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+            NodeIdentity.IsStrong(x.NodeId)).GroupBy(x => x.NodeId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.OrderBy(y => y.Name.Length)
+                .ThenBy(y => y.Name, StringComparer.Ordinal).First().Name, StringComparer.Ordinal);
+        return candidates;
+    }
+
+    private IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(
+        IList<CandidateNode> candidates, string current, IList<ServiceKind> requiredServices)
+    {
+        List<CandidateNode> alternatives = (candidates ?? new List<CandidateNode>())
+            .Where(x => !String.Equals(x.Name, current, StringComparison.Ordinal)).ToList();
+        Dictionary<string, int> delays = MeasureLiveDelays(alternatives);
+        string[] ranked = StartupRecovery.RankFastCandidates(
+            alternatives, delays, current, 10);
+        var measured = new List<CandidateLatencyMeasurement>();
+        foreach (string name in ranked)
+        {
+            CheckStop();
+            CandidateNode candidate = alternatives.First(x => x.Name == name);
+            CandidateScanResult scan = scanner.ScanSelected(candidate, requiredServices,
+                TimeSpan.FromSeconds(2));
+            int mihomoDelay;
+            if (!delays.TryGetValue(name, out mihomoDelay)) mihomoDelay = Int32.MaxValue;
+            measured.Add(new CandidateLatencyMeasurement(name, scan.ExitCountryCode,
+                mihomoDelay, scan.ServiceResults.OrderBy(x => x.Key)
+                    .Select(x => new ServiceMeasurement(x.Key, x.Value.Passed,
+                        x.Value.ElapsedMilliseconds, x.Value.Detail, x.Value.FailureKind)),
+                clock.UtcNow));
+        }
+        IList<CandidateLatencyMeasurement> result = measured
+            .OrderBy(x => CandidateLatencyResponse(x))
+            .ThenBy(x => x.MihomoMilliseconds)
+            .ThenBy(x => x.Node, StringComparer.Ordinal)
+            .ToList().AsReadOnly();
+        logger.Write("candidate latency ranking measured=" + result.Count +
+            " services=" + requiredServices.Distinct().Count());
+        return result;
+    }
+
+    private static double CandidateLatencyResponse(CandidateLatencyMeasurement candidate)
+    {
+        if (candidate == null || candidate.Services.Count == 0 ||
+            candidate.Services.Any(x => !x.Available)) return Double.MaxValue;
+        List<long> values = candidate.Services.Where(x => x.Available && x.Milliseconds > 0)
+            .Select(x => x.Milliseconds).OrderBy(x => x).ToList();
+        if (values.Count == 0) return Double.MaxValue;
+        int rank = (int)Math.Ceiling(values.Count * 0.75);
+        return values[Math.Max(0, rank - 1)];
     }
 
     private NodeHealthRecord Record(CandidateScanResult result)

@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.11", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.12", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -79,9 +79,11 @@ internal static class Tests
         MihomoPipeIntegration();
         CompatibilityScanning();
         FastFailoverWorkerOrchestration();
+        CandidateLatencyRankingBehavior();
         ZLibraryWebBehavior();
         ZLibraryChoiceBehavior();
         DetailsTypographyBehavior();
+        CandidateLatencyTableBehavior();
         QualityScoringAndState();
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
@@ -634,6 +636,18 @@ internal static class Tests
         return null;
     }
 
+    private static Button FindButton(Control parent, string title)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            var button = child as Button;
+            if (button != null && button.Text == title) return button;
+            var nested = FindButton(child, title);
+            if (nested != null) return nested;
+        }
+        return null;
+    }
+
     private static void DetailsTypographyBehavior()
     {
         int[] narrow = ServiceTableLayout.ColumnWidths(280, 1F);
@@ -655,6 +669,8 @@ internal static class Tests
             var fields = BindingFlags.Instance | BindingFlags.NonPublic;
             var times = (Label)typeof(DetailsForm).GetField("nextCheckLabel", fields).GetValue(form);
             var services = (ListView)typeof(DetailsForm).GetField("serviceList", fields).GetValue(form);
+            Equal(true, FindButton(form, "候选网站延迟排行") != null,
+                "details window exposes the candidate website latency table");
             Equal("Segoe UI", times.Font.Name, "timestamps use compact Latin digits");
             Equal("Segoe UI", services.Font.Name, "service latency uses compact Latin digits");
             form.Show();
@@ -2236,6 +2252,97 @@ internal static class Tests
         }
     }
 
+    private static void CandidateLatencyTableBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 23, 6, 0, 0, DateTimeKind.Utc);
+        MonitorSnapshot snapshot = MonitorSnapshot.CreateState(MonitorRunState.Running, "ok", now, now)
+            .WithCandidateLatencies(new[] {
+                new CandidateLatencyMeasurement("node-a", "JP", 42, new[] {
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 120, "ok"),
+                    new ServiceMeasurement(ServiceKind.Gemini, false, 900, "blocked", ProbeFailureKind.Service)
+                }, now)
+            });
+        using (var form = new CandidateLatencyForm(snapshot, delegate { }))
+        {
+            var fields = BindingFlags.Instance | BindingFlags.NonPublic;
+            var table = (DataGridView)typeof(CandidateLatencyForm)
+                .GetField("latencyTable", fields).GetValue(form);
+            Equal(10, table.Rows.Count, "candidate latency table always presents at least ten rows");
+            Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "ChatGPT"),
+                "candidate latency table has a ChatGPT website column");
+            Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
+                "candidate latency table has a Gemini website column");
+            Equal("120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
+                "candidate latency table shows measured website latency");
+            Equal("不可用", table.Rows[0].Cells["service_Gemini"].Value,
+                "candidate latency table distinguishes failure from latency");
+            Equal("待测", table.Rows[9].Cells["node"].Value,
+                "unmeasured ranking slots remain explicit");
+        }
+    }
+
+    private static void CandidateLatencyRankingBehavior()
+    {
+        var cache = new CandidateLatencyStore();
+        int staleGeneration = cache.BeginMeasurement();
+        cache.Invalidate();
+        IList<CandidateLatencyMeasurement> rejected;
+        Equal(false, cache.TryPublish(staleGeneration,
+            new List<CandidateLatencyMeasurement> {
+                new CandidateLatencyMeasurement("stale", "JP", 40,
+                    new[] { new ServiceMeasurement(ServiceKind.ChatGPT, true, 80, "ok") },
+                    DateTime.UtcNow)
+            }.AsReadOnly(), out rejected),
+            "candidate latency cache atomically rejects a result invalidated before commit");
+        Equal(0, cache.Current.Count,
+            "invalidated candidate latency cache cannot be repopulated by a stale commit");
+
+        string root = Path.Combine(Path.GetTempPath(), "monitor-candidate-ranking-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 12)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new RankingServiceProbe(mihomo),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 5, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            IList<CandidateLatencyMeasurement> ranking =
+                ((ICandidateLatencyRunner)worker).MeasureCandidateLatencies(UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "candidate website latency measurement never changes the shared selector");
+            Equal(10, ranking.Count,
+                "candidate website latency ranking contains ten rows");
+            Equal("node-02,node-03,node-04,node-05,node-06,node-07,node-08,node-09,node-10,node-01",
+                String.Join(",", ranking.Select(x => x.Node)),
+                "candidate website latency ranking puts incomplete website coverage after complete candidates");
+            Equal(20, ranking[0].MihomoMilliseconds,
+                "candidate ranking exposes the live Mihomo delay");
+            Equal(102L, ranking[0].Services
+                .First(x => x.Service == ServiceKind.ChatGPT).Milliseconds,
+                "candidate ranking exposes per-website measured latency");
+            Equal(true, ranking.All(x =>
+                x.Services.Any(service => service.Service == ServiceKind.ChatGPT) &&
+                x.Services.Any(service => service.Service == ServiceKind.Gemini)),
+                "every candidate row includes the mandatory AI websites");
+            ((ICandidateLatencyRunner)worker).InvalidateCandidateLatencies();
+            Equal(0, worker.RunOnce(false, UserPreferences.Defaults()).CandidateLatencies.Count,
+                "invalidated candidate ranking cannot reappear after a normal monitor cycle");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
     private static void RunRecoveredSevereLatencyOrchestration()
     {
         string root = Path.Combine(Path.GetTempPath(), "monitor-latency-recovery-" + Guid.NewGuid().ToString("N"));
@@ -3297,6 +3404,31 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         }
     }
 
+    private sealed class RankingServiceProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+
+        public RankingServiceProbe(OrchestratedMihomo mihomo)
+        {
+            this.mihomo = mihomo;
+        }
+
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current") return ProbeResult.Success(250);
+            int number;
+            if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 99;
+            if (scan.Node == "node-01" && service == ServiceKind.Gemini)
+                return ProbeResult.ServiceFailure("blocked", 101);
+            return service == ServiceKind.ChatGPT || service == ServiceKind.Gemini
+                ? ProbeResult.Partial("entry reachable", 100 + number)
+                : ProbeResult.Success(100 + number);
+        }
+    }
+
     private sealed class OpportunityServiceProbe : IServiceProbe
     {
         private readonly OrchestratedMihomo mihomo;
@@ -4015,6 +4147,55 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "coordinator distinguishes startup, requested, and scheduled diagnostics");
         }
 
+        var rankingRunner = new TriggeredCycleRunner();
+        using (var coordinator = new MonitorCoordinator(rankingRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, rankingRunner.WaitForRunCount(1, 1000), "candidate ranking waits for initial cycle");
+            coordinator.RequestCandidateRanking();
+            Equal(true, SpinWait.SpinUntil(() => rankingRunner.RankingCount == 1, 1000),
+                "candidate ranking request starts a dedicated measurement");
+            Equal("Startup", String.Join(",", rankingRunner.Triggers()),
+                "candidate ranking request does not execute a monitor decision cycle");
+            Equal(1, coordinator.Latest.CandidateLatencies.Count,
+                "dedicated candidate ranking is published without replacing current status");
+            Equal(MonitorRunState.Running, coordinator.Latest.State,
+                "candidate ranking progress does not replace the main monitor state");
+            Equal("ok", coordinator.Latest.Decision,
+                "candidate ranking progress does not replace the main monitor decision");
+            Equal(true, coordinator.Latest.NextCheckUtc < DateTime.MaxValue,
+                "candidate ranking progress does not suspend the next main check");
+            coordinator.UpdatePreferences(new UserPreferences {
+                FirstRunComplete = true,
+                RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Discord }
+            });
+            Equal(0, coordinator.Latest.CandidateLatencies.Count,
+                "service selection changes clear stale candidate website columns");
+            Equal(1, rankingRunner.InvalidationCount,
+                "service selection changes invalidate the runner-side ranking cache");
+        }
+
+
+        var throwingRankingRunner = new ThrowingCandidateLatencyRunner();
+        using (var coordinator = new MonitorCoordinator(throwingRankingRunner,
+            TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, throwingRankingRunner.WaitForRunCount(1, 1000),
+                "ranking failure fixture completes initial monitor cycle");
+            MonitorSnapshot before = coordinator.Latest;
+            coordinator.RequestCandidateRanking();
+            Equal(true, SpinWait.SpinUntil(() => throwingRankingRunner.RankingCount == 1, 1000),
+                "ranking failure fixture executes the dedicated request");
+            Thread.Sleep(80);
+            Equal(before.State, coordinator.Latest.State,
+                "candidate ranking failure does not degrade the main monitor state");
+            Equal(before.Decision, coordinator.Latest.Decision,
+                "candidate ranking failure does not replace the main monitor decision");
+            Equal(before.NextCheckUtc, coordinator.Latest.NextCheckUtc,
+                "candidate ranking failure does not replace the next main check");
+        }
+
     }
 
     private static void BrowserVerificationUiBehavior()
@@ -4178,10 +4359,12 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         public void Release() { released.Set(); }
     }
 
-    private sealed class TriggeredCycleRunner : ITriggeredCycleRunner
+    private sealed class TriggeredCycleRunner : ITriggeredCycleRunner, ICandidateLatencyRunner, IProgressCycleRunner
     {
         private readonly object gate = new object();
         private readonly List<MonitorCycleTrigger> triggers = new List<MonitorCycleTrigger>();
+        private int rankingCount;
+        private int invalidationCount;
         public MonitorSnapshot Run(UserPreferences preferences)
         { return Run(preferences, MonitorCycleTrigger.Scheduled); }
         public MonitorSnapshot Run(UserPreferences preferences, MonitorCycleTrigger trigger)
@@ -4194,6 +4377,54 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         public bool WaitForRunCount(int count, int milliseconds)
         { return SpinWait.SpinUntil(() => { lock (gate) return triggers.Count >= count; }, milliseconds); }
         public MonitorCycleTrigger[] Triggers() { lock (gate) return triggers.ToArray(); }
+        public int RankingCount { get { return Volatile.Read(ref rankingCount); } }
+        public int InvalidationCount { get { return Volatile.Read(ref invalidationCount); } }
+        public event Action<MonitorSnapshot> Progress;
+        public Func<bool> ShouldStop { get; set; }
+        public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref rankingCount);
+            var progress = Progress;
+            if (progress != null)
+                progress(MonitorSnapshot.CreateState(MonitorRunState.Checking,
+                    "正在实测候选", DateTime.UtcNow, DateTime.MaxValue));
+            return new List<CandidateLatencyMeasurement> {
+                new CandidateLatencyMeasurement("candidate", "JP", 50,
+                    new[] { new ServiceMeasurement(ServiceKind.ChatGPT, true, 100, "ok") },
+                    DateTime.UtcNow)
+            }.AsReadOnly();
+        }
+        public void InvalidateCandidateLatencies()
+        {
+            Interlocked.Increment(ref invalidationCount);
+        }
+    }
+
+    private sealed class ThrowingCandidateLatencyRunner : IMonitorCycleRunner, ICandidateLatencyRunner, IProgressCycleRunner
+    {
+        private int runCount;
+        private int rankingCount;
+        public int RankingCount { get { return Volatile.Read(ref rankingCount); } }
+        public event Action<MonitorSnapshot> Progress;
+        public Func<bool> ShouldStop { get; set; }
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "main healthy",
+                DateTime.UtcNow, DateTime.UtcNow.AddHours(1));
+        }
+        public bool WaitForRunCount(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= count, milliseconds); }
+        public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref rankingCount);
+            var progress = Progress;
+            if (progress != null)
+                progress(MonitorSnapshot.CreateState(MonitorRunState.Checking,
+                    "正在实测候选后失败", DateTime.UtcNow, DateTime.MaxValue));
+            throw new InvalidOperationException("ranking failed");
+        }
+        public void InvalidateCandidateLatencies() { }
     }
 
     private sealed class DegradedCycleRunner : IMonitorCycleRunner
@@ -4293,7 +4524,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.11"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.12"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

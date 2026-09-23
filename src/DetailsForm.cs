@@ -44,6 +44,7 @@ public sealed class DetailsForm : Form
     private readonly Action restorePrevious;
     private readonly Action<string, ServiceKind, DateTime> reportServiceFailure;
     private readonly Action exitApplication;
+    private readonly Action requestCandidateRanking;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
     private readonly List<ServiceChoice> choices = new List<ServiceChoice>();
@@ -58,11 +59,13 @@ public sealed class DetailsForm : Form
     private readonly Button pauseButton = new Button();
     private bool paused;
     private MonitorSnapshot latestSnapshot;
+    private CandidateLatencyForm candidateLatencyForm;
 
     public DetailsForm(UserPreferences preferences, Action<UserPreferences> savePreferences,
         Action requestCheck, Action<bool> setPaused, Action restorePrevious,
         Action startBrowserVerification,
-        Action<string, ServiceKind, DateTime> reportServiceFailure, Action exitApplication)
+        Action<string, ServiceKind, DateTime> reportServiceFailure, Action exitApplication,
+        Action requestCandidateRanking = null)
     {
         this.savePreferences = savePreferences;
         this.requestCheck = requestCheck;
@@ -70,6 +73,7 @@ public sealed class DetailsForm : Form
         this.restorePrevious = restorePrevious;
         this.reportServiceFailure = reportServiceFailure;
         this.exitApplication = exitApplication;
+        this.requestCandidateRanking = requestCandidateRanking ?? delegate { };
 
         Text = "节点守护";
         Icon = AppIcon.Current;
@@ -220,6 +224,7 @@ public sealed class DetailsForm : Form
         buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
         buttons.Controls.Add(ActionButton("切换记录与推荐", delegate { using (var window = new ExperienceForm()) window.ShowDialog(this); }));
         buttons.Controls.Add(ActionButton("运行统计", delegate { using (var window = new StatisticsForm()) window.ShowDialog(this); }));
+        buttons.Controls.Add(ActionButton("候选网站延迟排行", delegate { ShowCandidateLatencyRanking(); }));
         layout.Controls.Add(buttons);
         layout.Controls.Add(TextLabel("响应时间来自轻量 HTTP 探测，不代表网页渲染、AI 生成或游戏服务器延迟。"));
         layout.Controls.Add(ActionButton("退出节点守护", delegate { exitApplication(); }));
@@ -259,6 +264,25 @@ public sealed class DetailsForm : Form
             serviceList.Items.Add(item);
         }
         serviceList.EndUpdate();
+        if (candidateLatencyForm != null && !candidateLatencyForm.IsDisposed)
+            candidateLatencyForm.UpdateSnapshot(snapshot);
+    }
+
+    private void ShowCandidateLatencyRanking()
+    {
+        if (candidateLatencyForm == null || candidateLatencyForm.IsDisposed)
+        {
+            candidateLatencyForm = new CandidateLatencyForm(latestSnapshot, requestCandidateRanking);
+            candidateLatencyForm.FormClosed += delegate { candidateLatencyForm = null; };
+        }
+        candidateLatencyForm.UpdateSnapshot(latestSnapshot);
+        candidateLatencyForm.Show(this);
+        if (candidateLatencyForm.WindowState == FormWindowState.Minimized)
+            candidateLatencyForm.WindowState = FormWindowState.Normal;
+        candidateLatencyForm.Activate();
+        if (latestSnapshot == null || latestSnapshot.CandidateLatencies == null ||
+            latestSnapshot.CandidateLatencies.Count == 0)
+            requestCandidateRanking();
     }
 
     private void ReportCurrentFailure(ServiceKind service)

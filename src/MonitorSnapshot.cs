@@ -53,6 +53,25 @@ public sealed class ServiceMeasurement
     public DateTime AccountVerifiedUtc { get; private set; }
 }
 
+public sealed class CandidateLatencyMeasurement
+{
+    public CandidateLatencyMeasurement(string node, string exitCountryCode, int mihomoMilliseconds,
+        IEnumerable<ServiceMeasurement> services, DateTime checkedUtc)
+    {
+        Node = node ?? "";
+        ExitCountryCode = exitCountryCode ?? "";
+        MihomoMilliseconds = mihomoMilliseconds;
+        Services = (services ?? Enumerable.Empty<ServiceMeasurement>()).ToList().AsReadOnly();
+        CheckedUtc = checkedUtc;
+    }
+
+    public string Node { get; private set; }
+    public string ExitCountryCode { get; private set; }
+    public int MihomoMilliseconds { get; private set; }
+    public IList<ServiceMeasurement> Services { get; private set; }
+    public DateTime CheckedUtc { get; private set; }
+}
+
 public sealed class MonitorSnapshot
 {
     private MonitorSnapshot() { }
@@ -65,6 +84,7 @@ public sealed class MonitorSnapshot
     public DateTime CheckedUtc { get; private set; }
     public DateTime NextCheckUtc { get; private set; }
     public IList<ServiceMeasurement> Services { get; private set; }
+    public IList<CandidateLatencyMeasurement> CandidateLatencies { get; private set; }
     public CandidateHealth Health { get; private set; }
     public string ExitFingerprint { get; private set; }
     public string ExitCountryCode { get; private set; }
@@ -75,7 +95,8 @@ public sealed class MonitorSnapshot
     {
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = nextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = nextCheckUtc, Services = Services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
             BrowserStatusDetail = BrowserStatusDetail };
     }
@@ -84,7 +105,8 @@ public sealed class MonitorSnapshot
     {
         return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = reason ?? "", CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = NextCheckUtc, Services = Services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
             BrowserStatusDetail = BrowserStatusDetail };
     }
@@ -93,7 +115,8 @@ public sealed class MonitorSnapshot
     {
         return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = NextCheckUtc, Services = Services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = status,
             BrowserStatusDetail = detail ?? "" };
     }
@@ -102,6 +125,16 @@ public sealed class MonitorSnapshot
     {
         MonitorRunState progressState = State == MonitorRunState.Running ? MonitorRunState.Running : MonitorRunState.Checking;
         return WithState(progressState, decision, DateTime.MaxValue);
+    }
+
+    public MonitorSnapshot WithCandidateLatencies(IEnumerable<CandidateLatencyMeasurement> values)
+    {
+        return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
+            Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
+            NextCheckUtc = NextCheckUtc, Services = Services,
+            CandidateLatencies = (values ?? Enumerable.Empty<CandidateLatencyMeasurement>()).ToList().AsReadOnly(),
+            ExitFingerprint = ExitFingerprint, ExitCountryCode = ExitCountryCode, Health = Health,
+            BrowserStatus = BrowserStatus, BrowserStatusDetail = BrowserStatusDetail };
     }
 
     public MonitorSnapshot WithAccountVerification(ExperienceData data, string scope, DateTime now)
@@ -120,7 +153,8 @@ public sealed class MonitorSnapshot
             ? (accountReady ? MonitorRunState.Running : MonitorRunState.Pending) : State;
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = NextCheckUtc, Services = services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
             BrowserStatusDetail = BrowserStatusDetail };
     }
@@ -138,7 +172,8 @@ public sealed class MonitorSnapshot
             Health = CandidateHealth.Unknown,
             BrowserStatus = BrowserVerificationStatus.None,
             BrowserStatusDetail = "",
-            Services = new List<ServiceMeasurement>().AsReadOnly()
+            Services = new List<ServiceMeasurement>().AsReadOnly(),
+            CandidateLatencies = new List<CandidateLatencyMeasurement>().AsReadOnly()
         };
     }
 
@@ -161,6 +196,7 @@ public sealed class MonitorSnapshot
             Services = scan.ServiceResults.OrderBy(pair => pair.Key)
                 .Select(pair => new ServiceMeasurement(pair.Key, pair.Value.Passed,
                     pair.Value.ElapsedMilliseconds, pair.Value.Detail, pair.Value.FailureKind)).ToList().AsReadOnly(),
+            CandidateLatencies = new List<CandidateLatencyMeasurement>().AsReadOnly(),
             ExitFingerprint = scan.ExitFingerprint ?? "",
             ExitCountryCode = scan.ExitCountryCode ?? ""
         };

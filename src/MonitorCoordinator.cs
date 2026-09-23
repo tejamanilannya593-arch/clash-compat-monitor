@@ -11,6 +11,12 @@ public interface IMonitorCycleRunner
 
 public enum MonitorCycleTrigger { Startup, Scheduled, Requested }
 
+public interface ICandidateLatencyRunner
+{
+    IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences);
+    void InvalidateCandidateLatencies();
+}
+
 public interface ITriggeredCycleRunner : IMonitorCycleRunner
 {
     MonitorSnapshot Run(UserPreferences preferences, MonitorCycleTrigger trigger);
@@ -56,6 +62,8 @@ public sealed class MonitorCoordinator : IDisposable
     private UserPreferences preferences = UserPreferences.Defaults();
     private string lastAttentionKey;
     private int checkRequested = 1;
+    private int candidateRankingRequested;
+    private int candidateRankingInProgress;
     private int paused;
     private int restoreRequested;
     private int stopping;
@@ -126,6 +134,12 @@ public sealed class MonitorCoordinator : IDisposable
     public void RequestCheck()
     {
         Interlocked.Exchange(ref checkRequested, 1);
+        wake.Set();
+    }
+
+    public void RequestCandidateRanking()
+    {
+        Interlocked.Exchange(ref candidateRankingRequested, 1);
         wake.Set();
     }
 
@@ -245,6 +259,9 @@ public sealed class MonitorCoordinator : IDisposable
             throw new ArgumentException("At least one required service is needed.", "value");
         lock (preferencesGate) preferences = Copy(value);
         browserCoordinator.SetConsent(value.BrowserConversationVerification);
+        var latencyRunner = runner as ICandidateLatencyRunner;
+        if (latencyRunner != null) latencyRunner.InvalidateCandidateLatencies();
+        Publish(Latest.WithCandidateLatencies(new CandidateLatencyMeasurement[0]), false);
         RequestCheck();
     }
 
@@ -275,20 +292,33 @@ public sealed class MonitorCoordinator : IDisposable
             }
 
             TimeSpan remaining = nextRunUtc - DateTime.UtcNow;
-            if (Volatile.Read(ref checkRequested) == 0 && remaining > TimeSpan.Zero)
+            if (Volatile.Read(ref checkRequested) == 0 &&
+                Volatile.Read(ref candidateRankingRequested) == 0 && remaining > TimeSpan.Zero)
             {
                 wake.WaitOne(remaining);
                 continue;
             }
 
-            bool explicitlyRequested = Interlocked.Exchange(ref checkRequested, 0) != 0;
+            bool rankingRequested = Interlocked.Exchange(ref candidateRankingRequested, 0) != 0;
+            if (firstCycle && rankingRequested)
+            {
+                Interlocked.Exchange(ref candidateRankingRequested, 1);
+                rankingRequested = false;
+            }
+            bool explicitlyRequested = !rankingRequested &&
+                Interlocked.Exchange(ref checkRequested, 0) != 0;
             MonitorCycleTrigger trigger = firstCycle ? MonitorCycleTrigger.Startup :
                 explicitlyRequested ? MonitorCycleTrigger.Requested : MonitorCycleTrigger.Scheduled;
             firstCycle = false;
-            bool restore = Interlocked.Exchange(ref restoreRequested, 0) != 0;
+            bool restore = !rankingRequested && Interlocked.Exchange(ref restoreRequested, 0) != 0;
             Interlocked.Exchange(ref cancelCycle, 0);
             UserPreferences current;
             lock (preferencesGate) current = Copy(preferences);
+            if (rankingRequested)
+            {
+                RunCandidateLatencyRanking(current);
+                continue;
+            }
             Publish(Latest.WithState(MonitorRunState.Checking, "正在检测当前节点及所选服务", DateTime.MaxValue), false);
             Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => {
                 RunAccountCommands();
@@ -337,6 +367,42 @@ public sealed class MonitorCoordinator : IDisposable
         Publish(MonitorSnapshot.CreateState(MonitorRunState.Stopped, "已退出", DateTime.UtcNow, DateTime.MaxValue), false);
     }
 
+    private void RunCandidateLatencyRanking(UserPreferences current)
+    {
+        var latencyRunner = runner as ICandidateLatencyRunner;
+        if (latencyRunner == null) return;
+        Interlocked.Exchange(ref candidateRankingInProgress, 1);
+        try
+        {
+            Task<IList<CandidateLatencyMeasurement>> task = Task.Factory.StartNew(
+                () => latencyRunner.MeasureCandidateLatencies(current), CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            bool completed = false;
+            while (Volatile.Read(ref stopping) == 0 && elapsed.Elapsed < watchdog)
+                if (WaitWithoutThrowing(task, TimeSpan.FromMilliseconds(50))) { completed = true; break; }
+            if (!completed)
+            {
+                Interlocked.Exchange(ref cancelCycle, 1);
+                while (Volatile.Read(ref stopping) == 0 &&
+                    !WaitWithoutThrowing(task, TimeSpan.FromMilliseconds(100))) { }
+            }
+            if (Volatile.Read(ref stopping) != 0) return;
+            if (task.IsFaulted)
+            {
+                var observed = task.Exception;
+                Publish(Latest.WithCandidateLatencies(new CandidateLatencyMeasurement[0]), false);
+                return;
+            }
+            if (completed && task.IsCompleted && task.Result != null)
+                Publish(Latest.WithCandidateLatencies(task.Result), false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref candidateRankingInProgress, 0);
+        }
+    }
+
     private void RunAccountCommands()
     {
         List<Action<IAccountVerificationRunner>> pending;
@@ -352,7 +418,8 @@ public sealed class MonitorCoordinator : IDisposable
 
     private void OnProgress(MonitorSnapshot value)
     {
-        if (Volatile.Read(ref stopping) == 0 && Volatile.Read(ref paused) == 0 && Volatile.Read(ref cancelCycle) == 0)
+        if (Volatile.Read(ref stopping) == 0 && Volatile.Read(ref paused) == 0 &&
+            Volatile.Read(ref cancelCycle) == 0 && Volatile.Read(ref candidateRankingInProgress) == 0)
         {
             if (String.IsNullOrEmpty(value.ActualNode)) value = Latest.WithState(value.State, value.Decision, value.NextCheckUtc);
             Publish(value, false);

@@ -58,7 +58,8 @@ public sealed class TrayHost : ApplicationContext
         {
             details = new DetailsForm(preferences, SavePreferences, coordinator.RequestCheck,
                 coordinator.SetPaused, coordinator.RequestRestorePrevious,
-                delegate { }, coordinator.ReportServiceFailure, ExitThread);
+                delegate { }, coordinator.ReportServiceFailure, ExitThread,
+                coordinator.RequestCandidateRanking);
             details.FormClosed += delegate { details = null; MemoryTrimmer.TrimIdleWorkingSet(); };
         }
         details.UpdateSnapshot(coordinator.Latest);
