@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.16", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.18", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -2144,12 +2144,18 @@ internal static class Tests
             new Dictionary<ServiceKind, ProbeResult>
             {
                 { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 400) },
+                { ServiceKind.Gemini, ProbeResult.Partial("entry", 400) },
+                { ServiceKind.SteamApi, ProbeResult.Success(400) },
+                { ServiceKind.Google, ProbeResult.Success(400) },
                 { ServiceKind.GitHub, ProbeResult.Success(400) }
             }, 101L.ToString("X64"), "JP");
         var slowerTarget = new CandidateScanResult("slow", CandidateHealth.BasicCompatible, null, "ok", 1400, 2,
             new Dictionary<ServiceKind, ProbeResult>
             {
                 { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 700) },
+                { ServiceKind.Gemini, ProbeResult.Partial("entry", 700) },
+                { ServiceKind.SteamApi, ProbeResult.Success(700) },
+                { ServiceKind.Google, ProbeResult.Success(700) },
                 { ServiceKind.GitHub, ProbeResult.Success(700) }
             }, 102L.ToString("X64"), "JP");
         string[] verifiedOrder = StartupRecovery.RankVerifiedFastTargets(
@@ -2163,6 +2169,14 @@ internal static class Tests
             103L.ToString("X64"), "HK");
         Equal(false, StartupRecovery.IsEligibleQuickScan(unsupportedFastTarget, ServiceKind.ChatGPT),
             "only actual shared-region candidates count as eligible");
+        var missingSteamTarget = new CandidateScanResult("missing-steam", CandidateHealth.BasicCompatible,
+            null, "reachable", 300, 3, new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 100) },
+                { ServiceKind.Gemini, ProbeResult.Partial("entry", 100) },
+                { ServiceKind.Google, ProbeResult.Success(100) }
+            }, null, "JP");
+        Equal(false, StartupRecovery.IsEligibleQuickScan(missingSteamTarget, ServiceKind.ChatGPT),
+            "recovery never accepts a node without all four core website results");
         Equal(true, StartupRecovery.ShouldStopAfterEligibleCandidates(3),
             "fast selection stops after three eligible candidates");
         Equal(false, StartupRecovery.ShouldStopAfterEligibleCandidates(2),
@@ -2180,6 +2194,9 @@ internal static class Tests
             new Dictionary<ServiceKind, ProbeResult>
             {
                 { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 500) },
+                { ServiceKind.Gemini, ProbeResult.Partial("entry", 500) },
+                { ServiceKind.SteamApi, ProbeResult.Success(500) },
+                { ServiceKind.Google, ProbeResult.Success(500) },
                 { ServiceKind.GitHub, ProbeResult.Success(500) }
             }, 104L.ToString("X64"), "JP");
         string[] fullValidationOrder = StartupRecovery.RankVerifiedFastTargets(
@@ -2242,6 +2259,8 @@ internal static class Tests
             RunBudgetedSevereLatencyOrchestration();
             RunEligibleFastFailoverOrchestration();
             RunEightCandidateFastFailoverBound();
+            RunCoreFourRecovery();
+            RunLocalLinkFailurePausesSearch();
             RunAutomaticOpportunityOrchestration();
             RunRecentSwitchOpportunityHysteresisOrchestration();
             RunBudgetedOpportunityConfirmationOrchestration();
@@ -3272,10 +3291,11 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
             var mihomo = new OrchestratedMihomo("current",
                 new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            var clock = new FakeClock { UtcNow = new DateTime(2026, 9, 19, 9, 0, 0, DateTimeKind.Utc) };
             var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
                 new OrchestratedServiceProbe(mihomo, false),
                 new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
-                new FakeClock { UtcNow = new DateTime(2026, 9, 19, 9, 0, 0, DateTimeKind.Utc) },
+                clock,
                 new OrchestratedExitIdentityProbe(mihomo, true), null,
                 () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
 
@@ -3288,11 +3308,84 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "fast failover checks at most eight low-delay candidates when none is region eligible");
             Equal("current", mihomo.GetSelected("shared"),
                 "zero eligible quick scans never switch the shared group");
+            clock.UtcNow = clock.UtcNow.AddSeconds(30);
+            mihomo.ResetDelayRound();
+            worker.RunOnce(false, UserPreferences.Defaults());
+            Equal("node-09,node-10", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))
+                .Skip(8).Take(2)),
+                "the next recovery cycle reaches candidates beyond the first eight");
         }
         finally
         {
             DeleteDirectoryEventually(root);
         }
+    }
+
+    private static void RunCoreFourRecovery()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-core-four-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var mihomo = new OrchestratedMihomo("current", new[] { "current", "node-01", "node-02" },
+                new Dictionary<string, int> { { "node-01", 10 }, { "node-02", 20 } });
+            var failures = new Dictionary<string, ServiceKind>(StringComparer.Ordinal) {
+                { "current", ServiceKind.SteamApi }, { "node-01", ServiceKind.SteamApi }
+            };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 19, 9, 5, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+            var preferences = new UserPreferences {
+                RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini }
+            };
+            MonitorSnapshot result = worker.RunOnce(false, preferences);
+            Equal(true, mihomo.ScanServices("current", 1).Contains(ServiceKind.SteamApi) &&
+                mihomo.ScanServices("current", 1).Contains(ServiceKind.Google),
+                "every automatic cycle probes Steam API and Google even with old AI-only preferences");
+            Equal("node-02", mihomo.GetSelected("shared"),
+                "automatic recovery skips a Steam failure and switches only after all four websites connect");
+            Equal(true, result.Services.Any(x => x.Service == ServiceKind.SteamApi && x.Available),
+                "selected-node snapshot includes the mandatory Steam result");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
+    private static void RunLocalLinkFailurePausesSearch()
+    {
+        var runtimeConstructor = typeof(RuntimeSnapshot).GetConstructor(new[] {
+            typeof(bool), typeof(string), typeof(string), typeof(bool), typeof(bool)
+        });
+        Equal(true, runtimeConstructor != null,
+            "runtime snapshot can report whether Ethernet or Wi-Fi is connected");
+        if (runtimeConstructor == null) return;
+        string root = Path.Combine(Path.GetTempPath(), "monitor-local-link-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var mihomo = new OrchestratedMihomo("current", new[] { "current", "node-01" },
+                new Dictionary<string, int> { { "node-01", 10 } });
+            var runtime = (RuntimeSnapshot)runtimeConstructor.Invoke(new object[] {
+                true, "", "verge-mihomo", false, false
+            });
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedServiceProbe(mihomo, false),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 19, 9, 10, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null, () => runtime);
+            MonitorSnapshot result = worker.RunOnce(false, UserPreferences.Defaults());
+            Equal(MonitorRunState.Degraded, result.State,
+                "disconnected Ethernet and Wi-Fi pause the automatic search");
+            Equal(0, mihomo.AllDelayNodes().Count,
+                "local link outage does not waste candidate probes");
+            Equal("current", mihomo.GetSelected("shared"),
+                "local link outage never switches the shared selector");
+            Equal(TimeSpan.FromSeconds(30), result.NextCheckUtc - result.CheckedUtc,
+                "local link outage is retried automatically after thirty seconds");
+        }
+        finally { DeleteDirectoryEventually(root); }
     }
 
     private static void RunActiveCircuitAutomaticFailover()
@@ -3373,6 +3466,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
             Equal("current", mihomo.GetSelected("shared"),
                 "three-node service consensus keeps the current node instead of switching");
+            Equal(true, snapshot.Decision.Contains("继续寻找四站可连接的节点"),
+                "shared core-service failure does not falsely claim that recovery search stopped");
             Equal(ProbeFailureKind.Service,
                 snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT).Evidence,
                 "service consensus snapshot retains the real current-cycle failure evidence");
@@ -3518,6 +3613,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         {
             get { lock (gate) return maximumConcurrentDelayCalls; }
         }
+
+        public void ResetDelayRound() { delayEntries.Reset(delays.Count); }
 
         public string[] GetChoices(string groupName) { return choices.ToArray(); }
 
@@ -3782,6 +3879,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             }
             return ProbeResult.Success(scan.Node == "current" ? 900 : 150);
         }
+
     }
 
     private sealed class OpportunityServiceProbe : IServiceProbe
@@ -4374,8 +4472,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
-        Equal("ChatGPT,Gemini,GitHub", String.Join(",", loaded.RequiredServices),
-            "saving one AI service keeps the fixed ChatGPT and Gemini core together");
+        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", loaded.RequiredServices),
+            "saving old preferences retains the fixed four-website core");
         Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
         Equal(false, loaded.BrowserConversationVerification, "removed browser consent is not persisted");
         Equal(true, File.ReadAllText(path).Contains("version=3"), "preference schema upgraded");
@@ -4392,8 +4490,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "version=1\r\nfirstRun=True\r\nautomatic=True\r\nservices=ChatGPT,JMComicWeb,GitHub\r\n", Encoding.UTF8);
         var migrationStore = new UserPreferenceStore(migrationPath);
         UserPreferences migrated = migrationStore.Load();
-        Equal("ChatGPT,Gemini,GitHub", String.Join(",", migrated.RequiredServices),
-            "legacy preferences migrate to the fixed ChatGPT and Gemini core");
+        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", migrated.RequiredServices),
+            "legacy preferences migrate to the fixed four-website core");
         Equal(false, migrated.AutomaticOptimization, "v1 optimization migrates to conservative mode");
         Equal(false, migrated.BrowserConversationVerification, "v1 browser proof requires consent");
         Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
@@ -4404,16 +4502,16 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "version=2\r\nfirstRun=True\r\nautomatic=True\r\nbrowserConversation=True\r\nservices=GitHub\r\n", Encoding.UTF8);
         UserPreferences browserLegacy = migrationStore.Load();
         Equal(true, browserLegacy.AutomaticOptimization, "version 2 browser consent is ignored without corrupting preferences");
-        Equal("ChatGPT,Gemini,GitHub", String.Join(",", browserLegacy.RequiredServices),
-            "version 2 services migrate to the fixed ChatGPT and Gemini core");
+        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", browserLegacy.RequiredServices),
+            "version 2 services migrate to the fixed four-website core");
 
         using (var form = new DetailsForm(new UserPreferences {
             RequiredServices = new List<ServiceKind> { ServiceKind.Gemini, ServiceKind.GitHub }
         }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }))
         {
-            CheckBox core = FindCheckBox(form, "ChatGPT 与 Gemini（固定核心）");
+            CheckBox core = FindCheckBox(form, "ChatGPT、Gemini、Steam API 与 Google（固定核心）");
             Equal(true, core != null && core.Checked && !core.Enabled,
-                "settings display the AI intersection as one always-enabled core");
+                "settings display all four websites as one always-enabled core");
             Equal(null, FindCheckBox(form, "ChatGPT"), "settings cannot disable ChatGPT independently");
             Equal(null, FindCheckBox(form, "Gemini"), "settings cannot disable Gemini independently");
         }
@@ -4944,7 +5042,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.16"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.18"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

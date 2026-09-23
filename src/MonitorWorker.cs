@@ -405,6 +405,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 return MonitorSnapshot.CreateState(MonitorRunState.Degraded, conflict.Reason, clock.UtcNow,
                     clock.UtcNow.Add(config.CycleInterval));
             }
+            if (!runtime.LocalLinkAvailable)
+            {
+                logger.Write("local Ethernet and Wi-Fi links unavailable; recovery search paused");
+                return MonitorSnapshot.CreateState(MonitorRunState.Degraded,
+                    "以太网与 Wi-Fi 均未连接，等待本机网络恢复后继续查找节点", clock.UtcNow,
+                    clock.UtcNow.AddSeconds(30));
+            }
             string ipv6Action = RuntimeConfigurationPolicy.Ipv6Action(mihomo.IsRuntimeIpv6Enabled());
             if (ipv6Action != null)
             {
@@ -422,7 +429,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             var store = new StateStore(config.StatePath);
             HealthState state = store.Load();
             if (nodeIdentitySource != null) ReconcileHealthState(state);
-            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            var requiredServices = UserPreferencePolicy.NormalizeServices(preferences.RequiredServices);
+            string servicesKey = String.Join(",", requiredServices.Distinct().OrderBy(x => x));
             IList<string> strongNodeIds = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
                 NodeIdentity.IsStrong(x.NodeId)).Select(x => x.NodeId).Distinct(StringComparer.Ordinal).ToList();
             IList<string> scopeNodeKeys = nodeIdentitySource == null
@@ -438,7 +446,6 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 assurance.ReconcileIdentities(activeNamesByStrongId, clock.UtcNow);
                 ReconcileAccountVerifications();
             }
-            var requiredServices = preferences.RequiredServices.Distinct().ToList();
             var suppressedServices = requiredServices.Where(x =>
                 ServiceIncidentPolicy.IsActive(experience.ServiceIncidents, x, clock.UtcNow)).ToList();
             IList<ServiceKind> servicesToProbe = ServiceIncidentPolicy.ServicesToProbe(requiredServices,
@@ -473,6 +480,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, requiredServices);
             RememberRegionEligibility(memoryScope, currentScan);
             currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
+            if (CoreWebsitePolicy.AllReachable(currentScan)) assurance.RecoveryCursor = 0;
             bool selectorAlignmentChanged = !dryRun && FollowGeneralNode(currentScan);
             if (ProxyPathHealthPolicy.ShouldCheck(selectorAlignmentChanged) && pathHealthChecker != null && runtime.SystemProxy.Length > 0)
             {
@@ -553,12 +561,16 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     delayTimer.Stop();
                     string[] liveRanked = StartupRecovery.RankFastCandidates(
                         delayPool, rescueDelays, current, Int32.MaxValue);
+                    int recoveryStart = liveRanked.Length == 0 ? 0 :
+                        Math.Max(0, assurance.RecoveryCursor) % liveRanked.Length;
+                    string[] searchOrder = liveRanked.Skip(recoveryStart)
+                        .Concat(liveRanked.Take(recoveryStart)).ToArray();
                     ServiceKind[] fastServices = StartupRecovery.FastProbeServices(requiredServices, failedService);
                     ServiceKind[] fullFailoverServices = StartupRecovery.FullFailoverProbeServices(
                         requiredServices, failedService);
                     var quickScans = new List<CandidateScanResult>();
                     int comparedCandidates = 0;
-                    foreach (string standby in liveRanked)
+                    foreach (string standby in searchOrder)
                     {
                         if (StartupRecovery.ShouldStopAfterCheckedCandidates(comparedCandidates)) break;
                         Report("正在比较低延迟候选：" + standby, currentEvidence);
@@ -576,6 +588,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             if (StartupRecovery.ShouldStopAfterEligibleCandidates(quickScans.Count)) break;
                         }
                     }
+                    if (liveRanked.Length > 0)
+                        assurance.RecoveryCursor = (recoveryStart + comparedCandidates) % liveRanked.Length;
                     string[] verifiedTargets = StartupRecovery.RankVerifiedFastTargets(quickScans, rescueDelays, failedService);
                     double selectedResponseForLog = -1;
                     var fullValidationAttempts = new HashSet<string>(StringComparer.Ordinal);
@@ -648,6 +662,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         pathHealth = null;
                         currentFailureConfirmed = false;
                         fastSwitched = true;
+                        assurance.RecoveryCursor = 0;
                         observing = true;
                         assuranceDecision = severeLatency ? "当前节点单项响应过慢，已切换到" + fastSelectionSummary :
                             "当前节点故障，已切换到" + fastSelectionSummary;
@@ -694,7 +709,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             currentFailureConfirmed = false;
                             if (!observing) controller.Decide(true, false, current, null);
                             serviceIncidentDecision = MonitorPresentation.ServiceLabel(failedService) +
-                                " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟";
+                                (CoreWebsitePolicy.Required.Contains(failedService)
+                                    ? " 已在当前节点和两个备用节点出现同类异常，暂停节点归因，继续寻找四站可连接的节点"
+                                    : " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟");
                             logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
                                 " confirmations=3 duration_minutes=10");
                             SaveExperience(clock.UtcNow);

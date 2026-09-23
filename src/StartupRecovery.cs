@@ -119,7 +119,8 @@ public static class StartupRecovery
 
     public static bool IsEligibleQuickScan(CandidateScanResult scan, ServiceKind failedService)
     {
-        return scan != null && AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) &&
+        return scan != null && CoreWebsitePolicy.AllReachable(scan) &&
+            AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) &&
             ServiceEvidencePolicy.CanFastFailoverTarget(scan, failedService);
     }
 

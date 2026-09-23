@@ -111,11 +111,10 @@ public sealed class DetailsForm : Form
         layout.Controls.Add(Heading("选择你长期需要使用的服务"));
         layout.Controls.Add(TextLabel("只需设置一次。程序会寻找同时兼容这些服务、长期稳定且综合体验更好的节点。"));
 
-        AddChoice(layout, "ChatGPT 与 Gemini（固定核心）",
-            new[] { ServiceKind.ChatGPT, ServiceKind.Gemini }, preferences, false);
-        AddChoice(layout, "Google", new[] { ServiceKind.Google }, preferences);
+        AddChoice(layout, "ChatGPT、Gemini、Steam API 与 Google（固定核心）",
+            CoreWebsitePolicy.Required, preferences, false);
         AddChoice(layout, "GitHub", new[] { ServiceKind.GitHub }, preferences);
-        AddChoice(layout, "Steam 商店、社区与 API", new[] { ServiceKind.SteamStore, ServiceKind.SteamCommunity, ServiceKind.SteamApi }, preferences);
+        AddChoice(layout, "Steam 商店与社区", new[] { ServiceKind.SteamStore, ServiceKind.SteamCommunity }, preferences);
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);

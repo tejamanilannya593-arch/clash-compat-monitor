@@ -2,21 +2,30 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Net.NetworkInformation;
 using Microsoft.Win32;
 
 public sealed class RuntimeSnapshot
 {
     public RuntimeSnapshot(bool pipeAvailable, string systemProxy, string portOwner, bool otherVpnRoute)
+        : this(pipeAvailable, systemProxy, portOwner, otherVpnRoute, true)
+    {
+    }
+
+    public RuntimeSnapshot(bool pipeAvailable, string systemProxy, string portOwner,
+        bool otherVpnRoute, bool localLinkAvailable)
     {
         PipeAvailable = pipeAvailable;
         SystemProxy = systemProxy ?? "";
         PortOwner = portOwner ?? "";
         OtherVpnRoute = otherVpnRoute;
+        LocalLinkAvailable = localLinkAvailable;
     }
     public bool PipeAvailable { get; private set; }
     public string SystemProxy { get; private set; }
     public string PortOwner { get; private set; }
     public bool OtherVpnRoute { get; private set; }
+    public bool LocalLinkAvailable { get; private set; }
 }
 
 public sealed class ConflictResult
@@ -48,7 +57,24 @@ public static class RuntimeInspector
         {
             if (key != null && Convert.ToInt32(key.GetValue("ProxyEnable", 0)) != 0) proxy = Convert.ToString(key.GetValue("ProxyServer", ""));
         }
-        return new RuntimeSnapshot(client.IsAvailable(), proxy, FindPortOwner(7897), false);
+        return new RuntimeSnapshot(client.IsAvailable(), proxy, FindPortOwner(7897), false,
+            LocalLinkAvailable());
+    }
+
+    private static bool LocalLinkAvailable()
+    {
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces().Any(nic =>
+                nic.OperationalStatus == OperationalStatus.Up &&
+                (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 ||
+                 nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+                 nic.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
+                 nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT ||
+                 nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetFx ||
+                 nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet3Megabit));
+        }
+        catch (NetworkInformationException) { return false; }
     }
 
     private static string FindPortOwner(int port)

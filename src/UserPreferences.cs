@@ -33,11 +33,7 @@ public static class UserPreferencePolicy
 {
     public static List<ServiceKind> NormalizeServices(IEnumerable<ServiceKind> services)
     {
-        var selected = (services ?? Enumerable.Empty<ServiceKind>()).Distinct().ToList();
-        var normalized = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini };
-        normalized.AddRange(selected.Where(service =>
-            service != ServiceKind.ChatGPT && service != ServiceKind.Gemini));
-        return normalized;
+        return CoreWebsitePolicy.Normalize(services);
     }
 }
 

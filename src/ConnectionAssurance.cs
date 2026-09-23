@@ -28,6 +28,7 @@ public sealed class ConnectionAssurance
     public DateTime HoldUntilUtc { get; set; }
     public DateTime RefreshUtc { get; set; }
     public int StableCycles { get; set; }
+    public int RecoveryCursor { get; set; }
     public PendingOptimization PendingOptimization { get; set; }
     public DateTime LastOpportunityScanUtc { get; set; }
     public AutomaticDecisionTransaction Decision { get; set; }
@@ -45,6 +46,7 @@ public sealed class ConnectionAssurance
         if (Scope == scope) return;
         Scope = scope; Standbys.Clear(); Target = null; TargetNodeId = null; Previous = null;
         PreviousNodeId = null; CurrentNodeId = null; StartedUtc = DateTime.MinValue; StableCycles = 0;
+        RecoveryCursor = 0;
         RefreshUtc = DateTime.MinValue; PendingOptimization = null; LastOpportunityScanUtc = DateTime.MinValue;
         Decision = new AutomaticDecisionTransaction {
             State = AutomaticDecisionState.Healthy, Scope = scope, Revision = 1
