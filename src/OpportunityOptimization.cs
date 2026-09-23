@@ -6,7 +6,9 @@ public sealed class PendingOptimization
 {
     public string Scope { get; set; }
     public string Current { get; set; }
+    public string CurrentNodeId { get; set; }
     public string Target { get; set; }
+    public string TargetNodeId { get; set; }
     public double BaselineResponse { get; set; }
     public double TargetResponse { get; set; }
     public DateTime CreatedUtc { get; set; }
@@ -21,7 +23,7 @@ public static class OpportunityOptimizationPolicy
     public static bool ShouldScan(bool enabled, bool observing,
         IEnumerable<double> currentResponses, DateTime lastScanUtc, DateTime nowUtc)
     {
-        return enabled && !observing && QualityPolicy.CurrentNeedsOptimization(currentResponses) &&
+        return enabled && !observing &&
             (lastScanUtc == DateTime.MinValue || nowUtc - lastScanUtc >= ScanInterval);
     }
 

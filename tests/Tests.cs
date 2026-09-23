@@ -62,13 +62,16 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.6", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.15", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
             "IPv6 flag alone cannot disable monitoring or trigger configuration rewrites");
         Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
             "ordinary proxy group follows the stable selector");
+        NodeIdentityBehavior();
+        ServiceObservationBehavior();
+        ExitNetworkEvidenceBehavior();
         RegionEligibilityCaching();
         CandidateFiltering();
         PipeHttpDecoding();
@@ -76,12 +79,19 @@ internal static class Tests
         MihomoPipeIntegration();
         CompatibilityScanning();
         FastFailoverWorkerOrchestration();
+        CandidateLatencyRankingBehavior();
+        AutomaticRankedSelectionBehavior();
         ZLibraryWebBehavior();
         ZLibraryChoiceBehavior();
         DetailsTypographyBehavior();
+        CandidateLatencyTableBehavior();
         QualityScoringAndState();
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
+        RankedOpportunitySelectionBehavior();
+        OpportunityCandidatePlanningBehavior();
+        AutomaticDecisionPolicyBehavior();
+        AutomaticDecisionStateMachineBehavior();
         StabilityAndState();
         RuntimeGuards();
         SelectorFollowerBehavior();
@@ -105,6 +115,210 @@ internal static class Tests
         return failures == 0 ? 0 : 1;
     }
 
+    private static void NodeIdentityBehavior()
+    {
+        byte[] key = Enumerable.Range(1, 32).Select(x => (byte)x).ToArray();
+        var parameters = new Dictionary<string, string> {
+            { "uuid", "secret-uuid" }, { "network", "ws" }, { "tls", "true" }
+        };
+        var reordered = new Dictionary<string, string> {
+            { "tls", "true" }, { "network", "ws" }, { "uuid", "secret-uuid" }
+        };
+        var material = new NodeIdentityMaterial("provider-a", "VMess", "EDGE.EXAMPLE", 443, parameters);
+        string identity = NodeIdentity.Create(material, key);
+
+        Equal(true, identity.StartsWith("node-v1-", StringComparison.Ordinal), "node identity is versioned");
+        Equal(identity, NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 443, reordered), key),
+            "node identity normalizes host protocol and parameter order");
+        Equal(false, identity.Contains("edge.example") || identity.Contains("secret-uuid"),
+            "node identity reveals no source material");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "other.example", 443, parameters), key),
+            "server change creates a new identity");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 8443, parameters), key),
+            "port change creates a new identity");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "trojan", "edge.example", 443, parameters), key),
+            "protocol change creates a new identity");
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-b", "vmess", "edge.example", 443, parameters), key),
+            "subscription source change creates a new identity");
+        var changedParameters = new Dictionary<string, string>(parameters);
+        changedParameters["network"] = "grpc";
+        Equal(false, identity == NodeIdentity.Create(
+            new NodeIdentityMaterial("provider-a", "vmess", "edge.example", 443, changedParameters), key),
+            "material connection parameter creates a new identity");
+        Equal("", NodeIdentity.Create(material, new byte[0]), "missing identity key fails closed");
+
+        string directory = Path.Combine(Path.GetTempPath(), "node-identity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string profilesPath = Path.Combine(directory, "profiles.yaml");
+            string configPath = Path.Combine(directory, "clash-verge.yaml");
+            File.WriteAllText(profilesPath, "current: provider-a\nitems:\n- uid: provider-a\n  type: remote\n", Encoding.UTF8);
+            File.WriteAllText(configPath,
+                "proxies:\n" +
+                "- name: renamed\n  server: edge.example\n  port: 443\n  type: vmess\n  uuid: secret-uuid\n  network: ws\n  tls: true\n" +
+                "- { name: inline, type: trojan, server: inline.example, port: 443, password: inline-secret, sni: login.example }\n" +
+                "- name: duplicate\n  server: one.example\n  port: 443\n  type: trojan\n  password: first\n" +
+                "- name: duplicate\n  server: two.example\n  port: 443\n  type: trojan\n  password: second\n" +
+                "- name: broken\n  server: broken.example\n  type: vmess\n",
+                Encoding.UTF8);
+            string profilesHash = TestFileSha256(profilesPath);
+            string configHash = TestFileSha256(configPath);
+            var source = new ClashNodeIdentitySource(configPath, profilesPath, key);
+            IDictionary<string, ResolvedNodeIdentity> resolved = source.Resolve(
+                new[] { "renamed", "inline", "duplicate", "broken", "missing" });
+
+            Equal(NodeIdentityStrength.Strong, resolved["renamed"].Strength,
+                "valid block proxy metadata resolves strongly");
+            Equal(NodeIdentityStrength.Strong, resolved["inline"].Strength,
+                "valid inline proxy metadata resolves strongly");
+            Equal(NodeIdentityStrength.SessionOnly, resolved["duplicate"].Strength,
+                "conflicting duplicate name fails closed");
+            Equal("duplicate-conflict", resolved["duplicate"].Reason,
+                "duplicate conflict uses a bounded reason");
+            Equal(NodeIdentityStrength.SessionOnly, resolved["broken"].Strength,
+                "incomplete proxy metadata fails closed");
+            Equal(NodeIdentityStrength.SessionOnly, resolved["missing"].Strength,
+                "missing proxy metadata fails closed");
+            Equal(false, resolved.Values.Any(x => x.NodeId.Contains("example") || x.NodeId.Contains("secret")),
+                "resolved identities reveal no raw metadata");
+            string stateDirectory = Path.Combine(directory, "state");
+            Directory.CreateDirectory(stateDirectory);
+            string strongId = resolved["renamed"].NodeId;
+            var experienceData = new ExperienceData();
+            experienceData.Nodes.Add(new NodeExperience { Scope = "scope", Node = "renamed", NodeId = strongId,
+                FirstUtc = DateTime.UtcNow, LastUtc = DateTime.UtcNow,
+                RecentResponseMilliseconds = new List<double> { 100 } });
+            new ExperienceStore(Path.Combine(stateDirectory, "experience.json")).Save(experienceData, DateTime.UtcNow);
+            new QualityStateStore(Path.Combine(stateDirectory, "quality.state")).Save(new[] {
+                new QualitySample("renamed", strongId, DateTime.UtcNow, true, 100, 0, 0, null) });
+            var regionCache = new RegionEligibilityCache();
+            regionCache.Remember("scope", "renamed", strongId, 1L.ToString("X64"), "JP", DateTime.UtcNow);
+            new RegionEligibilityStore(Path.Combine(stateDirectory, "region.json")).Save(regionCache);
+            string persisted = String.Join("\n", Directory.GetFiles(stateDirectory)
+                .Select(File.ReadAllText));
+            Equal(false, new[] { "edge.example", "secret-uuid", "inline-secret", "login.example" }
+                .Any(x => persisted.IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0),
+                "persistent state contains no raw connection material");
+            Equal(profilesHash, TestFileSha256(profilesPath), "identity resolver does not write profile metadata");
+            Equal(configHash, TestFileSha256(configPath), "identity resolver does not write generated config");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(directory);
+        }
+    }
+
+    private static string TestFileSha256(string path)
+    {
+        using (var stream = File.OpenRead(path))
+        using (var hash = System.Security.Cryptography.SHA256.Create())
+            return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "");
+    }
+
+    private static void ServiceObservationBehavior()
+    {
+        DateTime observed = new DateTime(2026, 9, 21, 1, 2, 3, DateTimeKind.Utc);
+        ServiceObservation success = ServiceObservation.FromProbe(ServiceKind.Google,
+            ProbeResult.Success(123), observed, TestFingerprint('A'), "SG", 64500);
+        Equal(ServiceOutcome.Success, success.Outcome, "definite pass maps to success");
+        Equal(true, success.CountedForNodeHealth, "raw pass counts for node health");
+        Equal(64500L, success.ExitAsn, "observation carries ASN");
+
+        ServiceObservation failure = ServiceObservation.FromProbe(ServiceKind.ChatGPT,
+            ProbeResult.RegionFailure("blocked", 456), observed, TestFingerprint('B'), "US", 64501);
+        Equal(ServiceOutcome.Failure, failure.Outcome, "definite failure maps to failure");
+        Equal(ProbeFailureKind.Region, failure.FailureKind, "failure kind is preserved");
+
+        ServiceObservation partial = ServiceObservation.FromProbe(ServiceKind.Gemini,
+            ProbeResult.Partial("reachable only", 78), observed, TestFingerprint('C'), "JP", null);
+        Equal(ServiceOutcome.Unknown, partial.Outcome, "partial reachability maps to unknown");
+        Equal(ProbeFailureKind.Partial, partial.FailureKind, "partial kind is preserved");
+
+        ServiceObservation unverified = ServiceObservation.FromProbe(ServiceKind.Discord,
+            ProbeResult.Unverified("not probed"), observed, "", "", null);
+        Equal(ServiceOutcome.Unknown, unverified.Outcome, "unverified maps to unknown");
+        Equal(false, unverified.WithNodeHealthCounting(false).CountedForNodeHealth,
+            "history attribution can be disabled without changing outcome");
+        Equal(ServiceOutcome.Unknown, unverified.WithNodeHealthCounting(false).Outcome,
+            "history attribution leaves raw outcome unchanged");
+
+        var legacy = new CandidateScanResult("legacy", CandidateHealth.Compatible, null, "ok");
+        Equal(0, legacy.ServiceObservations.Count, "legacy scan defaults to no observations");
+        Equal<long?>(null, legacy.ExitAsn, "legacy scan defaults to unknown ASN");
+    }
+
+    private static string TestFingerprint(char value)
+    {
+        return new string(value, 64);
+    }
+
+    private static void ExitNetworkEvidenceBehavior()
+    {
+        byte[] key = Enumerable.Range(1, 32).Select(x => (byte)x).ToArray();
+        string rawIp = "203.0.113.9";
+        string expected = ExitIdentityKey.Fingerprint(rawIp, key);
+        ExitAsnResolution matched = IpWhoExitAsnParser.Parse(
+            "{\"success\":true,\"ip\":\"203.0.113.9\",\"country_code\":\"SG\",\"connection\":{\"asn\":64520}}",
+            key, expected, "SG");
+        Equal(true, matched.Matched, "IPWho identity matches Cloudflare evidence");
+        Equal(64520L, matched.Asn, "IPWho ASN is parsed");
+        Equal(false, matched.Detail.Contains(rawIp), "ASN diagnostics omit raw IP");
+
+        Equal(false, IpWhoExitAsnParser.Parse(
+            "{\"success\":true,\"ip\":\"203.0.113.10\",\"country_code\":\"SG\",\"connection\":{\"asn\":64520}}",
+            key, expected, "SG").Matched, "fingerprint mismatch is rejected");
+        Equal(false, IpWhoExitAsnParser.Parse(
+            "{\"success\":true,\"ip\":\"203.0.113.9\",\"country_code\":\"US\",\"connection\":{\"asn\":64520}}",
+            key, expected, "SG").Matched, "country mismatch is rejected");
+        Equal(false, IpWhoExitAsnParser.Parse("not-json", key, expected, "SG").Matched,
+            "malformed ASN response is unavailable evidence");
+
+        DateTime now = new DateTime(2026, 9, 21, 3, 0, 0, DateTimeKind.Utc);
+        var cache = new ExitNetworkEvidenceCache();
+        cache.Remember(expected, "SG", 64520, now, TimeSpan.FromMinutes(60));
+        long asn;
+        Equal(true, cache.TryGet(expected, "SG", now.AddMinutes(59), out asn),
+            "ASN cache is valid before sixty minutes");
+        Equal(64520L, asn, "ASN cache returns the verified network");
+        Equal(false, cache.TryGet(expected, "SG", now.AddMinutes(60), out asn),
+            "ASN cache expires at sixty minutes");
+        Equal(false, cache.TryGet(TestFingerprint('E'), "SG", now.AddMinutes(1), out asn),
+            "different fingerprint misses cache");
+
+        string root = Path.Combine(Path.GetTempPath(), "ccm-asn-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(root, "exit-network.state");
+        try
+        {
+            var store = new ExitNetworkEvidenceStore(path);
+            store.Save(cache, now.AddMinutes(1));
+            string json = File.ReadAllText(path);
+            Equal(false, json.Contains(rawIp), "ASN cache never persists raw IP");
+            ExitNetworkEvidenceCache loaded = store.Load(now.AddMinutes(1));
+            Equal(1, loaded.Records.Count, "valid ASN cache survives restart");
+            File.WriteAllText(path,
+                "{\"Records\":[{\"ExitFingerprint\":\"bad\",\"CountryCode\":\"S\",\"Asn\":0}]}");
+            Equal(0, store.Load(now).Records.Count, "malformed ASN records are rejected");
+
+            var failedResolver = new FakeExitAsnResolver(new ExitAsnResolution {
+                Matched = false, Asn = 0, Detail = "provider unavailable"
+            });
+            var enricher = new ExitNetworkEvidenceEnricher(failedResolver,
+                new ExitNetworkEvidenceStore(Path.Combine(root, "provider-failure.state")));
+            ExitIdentity original = new ExitIdentity(expected, "SG", "ok", null, now);
+            ExitIdentity unchanged = enricher.Enrich(original, now, TimeSpan.FromSeconds(1));
+            Equal(expected, unchanged.Fingerprint, "ASN provider failure preserves exit fingerprint");
+            Equal("SG", unchanged.CountryCode, "ASN provider failure preserves exit country");
+            Equal<long?>(null, unchanged.Asn, "ASN provider failure remains unknown evidence");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
     private static void RegionEligibilityCaching()
     {
         DateTime now = new DateTime(2026, 9, 17, 10, 0, 0, DateTimeKind.Utc);
@@ -120,6 +334,12 @@ internal static class Tests
         Equal(true, supported, "fresh Japan exit remains eligible");
         Equal(false, cache.TryGet("scope-a", "node-a", exitB, now, out countryCode, out supported),
             "different actual exit fingerprint invalidates region cache");
+        string regionNodeId = "node-v1-" + new string('E', 43);
+        cache.Remember("scope-a", "renamed", regionNodeId, exitA, "JP", now);
+        Equal(true, cache.TryGet("scope-a", "other display", regionNodeId, exitA, now,
+            out countryCode, out supported), "region cache follows stable identity across rename");
+        Equal(false, cache.TryGet("scope-a", "renamed", "node-v1-" + new string('F', 43), exitA,
+            now, out countryCode, out supported), "region cache rejects same-name replacement identity");
         Equal(false, cache.TryGet("scope-a", "node-a", "", now, out countryCode, out supported),
             "unknown actual exit cannot use a cached eligibility decision");
         Equal(false, cache.TryGet("scope-b", "node-a", exitA, now, out countryCode, out supported),
@@ -418,6 +638,18 @@ internal static class Tests
         return null;
     }
 
+    private static Button FindButton(Control parent, string title)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            var button = child as Button;
+            if (button != null && button.Text == title) return button;
+            var nested = FindButton(child, title);
+            if (nested != null) return nested;
+        }
+        return null;
+    }
+
     private static void DetailsTypographyBehavior()
     {
         int[] narrow = ServiceTableLayout.ColumnWidths(280, 1F);
@@ -439,6 +671,8 @@ internal static class Tests
             var fields = BindingFlags.Instance | BindingFlags.NonPublic;
             var times = (Label)typeof(DetailsForm).GetField("nextCheckLabel", fields).GetValue(form);
             var services = (ListView)typeof(DetailsForm).GetField("serviceList", fields).GetValue(form);
+            Equal(true, FindButton(form, "候选网站延迟排行") != null,
+                "details window exposes the candidate website latency table");
             Equal("Segoe UI", times.Font.Name, "timestamps use compact Latin digits");
             Equal("Segoe UI", services.Font.Name, "service latency uses compact Latin digits");
             form.Show();
@@ -1116,6 +1350,103 @@ internal static class Tests
         Equal(null, restored.Target, "pending optimization is separate from switch observation");
         restored.Begin("b", "c", 1000, true, false, now);
         Equal(null, restored.PendingOptimization, "starting a real switch clears pending optimization");
+
+        string liveId = "node-v1-" + new string('G', 43);
+        string staleId = "node-v1-" + new string('H', 43);
+        var identityAssurance = new ConnectionAssurance {
+            Scope = "identity-scope", Target = "same display", TargetNodeId = staleId,
+            Previous = "old display", PreviousNodeId = liveId,
+            PendingOptimization = new PendingOptimization {
+                Scope = "identity-scope", Current = "old display", CurrentNodeId = liveId,
+                Target = "same display", TargetNodeId = staleId, CreatedUtc = now
+            },
+            Standbys = new List<StandbyNode> {
+                new StandbyNode { Name = "old display", NodeId = liveId, VerifiedUtc = now },
+                new StandbyNode { Name = "same display", NodeId = staleId, VerifiedUtc = now }
+            }
+        };
+        identityAssurance.ReconcileIdentities(new Dictionary<string, string> { { liveId, "renamed live" } }, now);
+        Equal(null, identityAssurance.Target, "same name changed identity cancels switch target");
+        Equal(null, identityAssurance.PendingOptimization, "missing identity cancels pending optimization");
+        Equal("renamed live", identityAssurance.Previous, "renamed rollback origin follows stable identity");
+        Equal(1, identityAssurance.Standbys.Count, "stale identity is removed from standby pool");
+        Equal("renamed live", identityAssurance.Standbys[0].Name, "standby display name follows stable identity");
+
+        policy.Decision = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.ConfirmingOptimization,
+            Scope = "scope", Current = "b", Target = "c",
+            BaselineResponse = 1000, TargetResponse = 500,
+            StartedUtc = now, ExpiresUtc = now.AddMinutes(2), Revision = 7
+        };
+        policy.AutomaticSwitches = new List<AutomaticSwitchRecord> {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b", Reason = "recovery" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "c", Reason = "optimization" }
+        };
+        restored = serializer.Deserialize<ConnectionAssurance>(serializer.Serialize(policy));
+        Equal(AutomaticDecisionState.ConfirmingOptimization, restored.Decision.State,
+            "automatic decision state survives restart");
+        Equal("c", restored.Decision.Target,
+            "automatic decision target survives restart");
+        Equal(7L, restored.Decision.Revision,
+            "automatic decision revision survives restart");
+        Equal(2, restored.AutomaticSwitches.Count,
+            "automatic switch budget history survives restart");
+
+        var legacyPending = new ConnectionAssurance {
+            PendingOptimization = new PendingOptimization { Scope = "scope", Current = "b", Target = "c",
+                BaselineResponse = 1000, TargetResponse = 500, CreatedUtc = now }
+        };
+        Equal(AutomaticDecisionState.ConfirmingOptimization,
+            legacyPending.EnsureDecisionState("b", now.AddSeconds(30)).State,
+            "legacy pending optimization migrates to confirmation state");
+        var legacyObservation = new ConnectionAssurance { Target = "b", Previous = "a", StartedUtc = now };
+        Equal(AutomaticDecisionState.Observing,
+            legacyObservation.EnsureDecisionState("b", now.AddSeconds(30)).State,
+            "legacy switch target migrates to observation state");
+        var legacyHold = new ConnectionAssurance { HoldUntilUtc = now.AddMinutes(5) };
+        Equal(AutomaticDecisionState.Cooldown,
+            legacyHold.EnsureDecisionState("b", now).State,
+            "legacy future hold migrates to cooldown state");
+        Equal(AutomaticDecisionState.Healthy,
+            new ConnectionAssurance().EnsureDecisionState("b", now).State,
+            "empty legacy assurance starts healthy");
+
+        var activeRecovery = new ConnectionAssurance();
+        activeRecovery.EnsureDecisionState("a", now);
+        activeRecovery.Apply(AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now, Current = "a" });
+        activeRecovery.Apply(AutomaticDecisionEvent.FailureConfirmed,
+            new AutomaticDecisionContext { NowUtc = now, Current = "a" });
+        DecisionTransition recoveryReady = activeRecovery.Apply(AutomaticDecisionEvent.RecoveryTargetReady,
+            new AutomaticDecisionContext { NowUtc = now, Current = "a", Previous = "a", Target = "b" });
+        Equal(true, recoveryReady.Accepted,
+            "active recovery events are not normalized as interrupted persistence");
+        Equal(AutomaticDecisionState.Switching, activeRecovery.Decision.State,
+            "active recovery reaches switching through assurance events");
+
+        var interrupted = new ConnectionAssurance {
+            Decision = new AutomaticDecisionTransaction {
+                State = AutomaticDecisionState.SearchingOptimization,
+                Current = "b", StartedUtc = now.AddSeconds(-10)
+            }
+        };
+        Equal(AutomaticDecisionState.Degraded,
+            interrupted.EnsureDecisionState("b", now).State,
+            "interrupted search normalizes to degraded after restart");
+        var expiredCooldown = new ConnectionAssurance {
+            Decision = new AutomaticDecisionTransaction {
+                State = AutomaticDecisionState.Cooldown,
+                Current = "b", ExpiresUtc = now.AddSeconds(-1)
+            }
+        };
+        Equal(AutomaticDecisionState.Healthy,
+            expiredCooldown.EnsureDecisionState("b", now).State,
+            "expired cooldown normalizes to healthy after restart");
+        policy.SetScope("another scope");
+        Equal(AutomaticDecisionState.Healthy, policy.Decision.State,
+            "scope change resets automatic decision state");
+        Equal<string>(null, policy.Decision.Target,
+            "scope change clears automatic decision target");
     }
 
     private static void ServiceIncidentBehavior()
@@ -1141,6 +1472,51 @@ internal static class Tests
         Equal(false, ServiceIncidentPolicy.HasConsensus(current, new[] { IncidentScan("current", service, ProbeFailureKind.Service), sameA }, service),
             "current node cannot be counted as a backup confirmation");
 
+        ServiceIncidentConsensus sameExit = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('A'), "SG", 64530, service),
+                IncidentObservationScan("node-3", TestFingerprint('A'), "SG", 64530, service)
+            }, service);
+        Equal(false, sameExit.Passed, "three names on one exit cannot open incident");
+        Equal(1, sameExit.DistinctFingerprintCount, "duplicate exits are counted once");
+
+        ServiceIncidentConsensus oneAsn = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "SG", 64530, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "JP", 64530, service)
+            }, service);
+        Equal(false, oneAsn.Passed, "one known ASN cannot establish diversity");
+
+        ServiceIncidentConsensus twoAsns = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "SG", 64531, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "JP", 64531, service)
+            }, service);
+        Equal(true, twoAsns.Passed, "two known ASNs establish independent consensus");
+        Equal(3, twoAsns.DistinctFingerprintCount, "consensus counts three independent exits");
+        Equal(2, twoAsns.DistinctAsnCount, "consensus counts distinct ASNs");
+
+        ServiceIncidentConsensus countryFallback = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "JP", null, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "SG", 64530, service)
+            }, service);
+        Equal(true, countryFallback.Passed, "country fallback applies when ASN is incomplete");
+
+        ServiceIncidentConsensus noDiversity = ServiceIncidentPolicy.EvaluateConsensus(
+            IncidentObservationScan("current", TestFingerprint('A'), "SG", 64530, service),
+            new[] {
+                IncidentObservationScan("node-2", TestFingerprint('B'), "SG", null, service),
+                IncidentObservationScan("node-3", TestFingerprint('C'), "SG", null, service)
+            }, service);
+        Equal(false, noDiversity.Passed, "incomplete ASN with one country is rejected");
+        Equal("insufficient-country-diversity", noDiversity.RejectionReason,
+            "consensus rejection is explainable without node names");
+
         var incidents = new List<ServiceIncidentRecord>();
         ServiceIncidentPolicy.Open(incidents, service, ProbeFailureKind.Service, now, TimeSpan.FromMinutes(10));
         Equal(true, ServiceIncidentPolicy.IsActive(incidents, service, now.AddMinutes(9)), "service circuit active before expiry");
@@ -1159,6 +1535,38 @@ internal static class Tests
             "an active circuit does not erase a real current-cycle failure");
         Equal(ProbeFailureKind.Service, suppressedOwnFailure.ServiceResults[service].FailureKind,
             "an active circuit preserves real service evidence already probed");
+        Equal(ServiceOutcome.Failure, suppressedOwnFailure.ServiceObservations[service].Outcome,
+            "suppression preserves raw failure outcome");
+        Equal(false, suppressedOwnFailure.ServiceObservations[service].CountedForNodeHealth,
+            "suppressed failure is excluded from node history");
+        CandidateScanResult suppressedHealth = ServiceIncidentPolicy.ForNodeHealth(suppressedOwnFailure);
+        Equal(CandidateHealth.Unknown, suppressedHealth.Health,
+            "only suppressed evidence produces unknown node-health view");
+        Equal(0, suppressedHealth.ServiceResults.Count,
+            "node-health view excludes suppressed service measurements");
+
+        ProbeResult chatFailure = ProbeResult.ServiceFailure("shared outage", 900);
+        ProbeResult githubSuccess = ProbeResult.Success(100);
+        var mixedResults = new Dictionary<ServiceKind, ProbeResult> {
+            { ServiceKind.ChatGPT, chatFailure }, { ServiceKind.GitHub, githubSuccess }
+        };
+        var mixedObservations = new Dictionary<ServiceKind, ServiceObservation> {
+            { ServiceKind.ChatGPT, ServiceObservation.FromProbe(ServiceKind.ChatGPT, chatFailure,
+                now, TestFingerprint('A'), "SG", 64530) },
+            { ServiceKind.GitHub, ServiceObservation.FromProbe(ServiceKind.GitHub, githubSuccess,
+                now, TestFingerprint('A'), "SG", 64530) }
+        };
+        var mixed = new CandidateScanResult("mixed", CandidateHealth.ServiceFailed, ServiceKind.ChatGPT,
+            "shared outage", 1000, 2, mixedResults, TestFingerprint('A'), "SG", mixedObservations, 64530);
+        CandidateScanResult mixedSuppressed = ServiceIncidentPolicy.AttachSuppressed(mixed,
+            new[] { ServiceKind.ChatGPT });
+        CandidateScanResult mixedHealth = ServiceIncidentPolicy.ForNodeHealth(mixedSuppressed);
+        Equal(CandidateHealth.Compatible, mixedHealth.Health,
+            "unsuppressed success remains usable for node history");
+        Equal(1, mixedHealth.ServiceResults.Count,
+            "history measurements contain only attributable services");
+        Equal(true, mixedHealth.ServiceResults.ContainsKey(ServiceKind.GitHub),
+            "history retains the attributable service measurement");
         var unrelatedFailure = IncidentScan("current", ServiceKind.ChatGPT, ProbeFailureKind.Transient);
         CandidateScanResult preservedFailure = ServiceIncidentPolicy.AttachSuppressed(unrelatedFailure, new[] { service });
         Equal(CandidateHealth.Transient, preservedFailure.Health, "suppression preserves failures from other services");
@@ -1175,12 +1583,31 @@ internal static class Tests
 
     private static CandidateScanResult IncidentScan(string node, ServiceKind service, ProbeFailureKind kind)
     {
+        long asn = node == "current" ? 64530 : 64531;
+        string country = node == "current" ? "SG" : "JP";
+        return IncidentObservationScan(node, TestNodeFingerprint(node), country, asn, service, kind);
+    }
+
+    private static CandidateScanResult IncidentObservationScan(string node, string fingerprint,
+        string country, long? asn, ServiceKind service, ProbeFailureKind kind = ProbeFailureKind.Service)
+    {
         ProbeResult result = kind == ProbeFailureKind.Region ? ProbeResult.RegionFailure("same", 20) :
             kind == ProbeFailureKind.Transient ? ProbeResult.TransientFailure("same", 20) : ProbeResult.ServiceFailure("same", 20);
         CandidateHealth health = kind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             kind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
+        DateTime observed = new DateTime(2026, 9, 21, 4, 0, 0, DateTimeKind.Utc);
+        var observations = new Dictionary<ServiceKind, ServiceObservation> {
+            { service, ServiceObservation.FromProbe(service, result, observed, fingerprint, country, asn) }
+        };
         return new CandidateScanResult(node, health, service, "same", 20, 1,
-            new Dictionary<ServiceKind, ProbeResult> { { service, result } });
+            new Dictionary<ServiceKind, ProbeResult> { { service, result } }, fingerprint, country,
+            observations, asn);
+    }
+
+    private static string TestNodeFingerprint(string node)
+    {
+        using (var hash = System.Security.Cryptography.SHA256.Create())
+            return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(node ?? ""))).Replace("-", "");
     }
 
     private static void ExperienceBehavior()
@@ -1191,6 +1618,12 @@ internal static class Tests
         Equal("first|chatgpt,gemini", originalScope, "initial subscription creates scope");
         Equal(originalScope, continuity.ResolveScope("reordered", new[] { "d", "c", "b", "a" }, "chatgpt,gemini"),
             "candidate reorder preserves experience scope");
+        var renamedIdentityContinuity = new ExperienceData();
+        string identityScope = renamedIdentityContinuity.ResolveScope("identity-first",
+            new[] { "node-v1-a", "node-v1-b" }, "chatgpt,gemini");
+        Equal(identityScope, renamedIdentityContinuity.ResolveScope("identity-renamed",
+            new[] { "node-v1-b", "node-v1-a" }, "chatgpt,gemini"),
+            "display rename preserves identity-based scope");
         Equal(originalScope, continuity.ResolveScope("minor", new[] { "a", "b", "c", "e", "f" }, "chatgpt,gemini"),
             "minor subscription update preserves experience scope");
         Equal("different|chatgpt,gemini", continuity.ResolveScope("different", new[] { "w", "x", "y", "z" }, "chatgpt,gemini"),
@@ -1220,6 +1653,18 @@ internal static class Tests
         Equal(migratedScope, jmMigration.Nodes[0].Scope, "JMComic migration keeps node history reachable");
         Equal(migratedScope, jmMigration.Assurance.Scope, "JMComic migration keeps assurance scope aligned");
         var memory = new ExperienceData();
+        string firstNodeId = "node-v1-" + new string('B', 43);
+        string secondNodeId = "node-v1-" + new string('C', 43);
+        var replacedNameMemory = new ExperienceData();
+        replacedNameMemory.Observe("identity-scope", firstNodeId,
+            new CandidateScanResult("same display", CandidateHealth.Compatible, null, "ok", 100, 1), null, now);
+        replacedNameMemory.Observe("identity-scope", secondNodeId,
+            new CandidateScanResult("same display", CandidateHealth.Compatible, null, "ok", 200, 1), null,
+            now.AddMinutes(1));
+        Equal(1, replacedNameMemory.RecentResponses("identity-scope", firstNodeId, 10).Count,
+            "old physical node history is isolated by identity");
+        Equal(1, replacedNameMemory.RecentResponses("identity-scope", secondNodeId, 10).Count,
+            "same-name replacement starts separate identity history");
         var scan = new CandidateScanResult("stable", CandidateHealth.Compatible, null, "ok", 100, 1);
         var partialMemory = new ExperienceData();
         partialMemory.Observe("scope", new CandidateScanResult("partial", CandidateHealth.BasicCompatible, null, "challenge", 100, 1), null, now);
@@ -1234,10 +1679,11 @@ internal static class Tests
         memory.Observe("scope", scan, null, now.AddMinutes(5));
         memory.Observe("scope", scan, null, now.AddMinutes(10));
         Equal(false, memory.IsProvenStable("scope", "stable", now.AddMinutes(10)), "short history cannot authorize quality switch");
-        Equal(1, memory.Recommend("scope", new[] { "stable" }, now.AddMinutes(10)).Count(), "repeated stable history becomes recommendation");
+        Equal(0, memory.Recommend("scope", new[] { "stable" }, now.AddMinutes(10)).Count(), "three samples remain below recommendation minimum");
         memory.Observe("scope", scan, null, now.AddMinutes(20));
         memory.Observe("scope", scan, null, now.AddMinutes(30));
         Equal(true, memory.IsProvenStable("scope", "stable", now.AddMinutes(30)), "cross-time stable history authorizes quality switch");
+        Equal(1, memory.Recommend("scope", new[] { "stable" }, now.AddMinutes(30)).Count(), "five stable samples become recommendation");
         var ninetyPercent = new ExperienceData();
         var ninetyFivePercent = new ExperienceData();
         for (int i = 0; i < 20; i++)
@@ -1249,10 +1695,16 @@ internal static class Tests
         Equal(false, ninetyPercent.IsProvenStable("scope", "ninety", now.AddMinutes(38)), "ninety percent history cannot authorize quality switch");
         Equal(true, ninetyFivePercent.IsProvenStable("scope", "ninety-five", now.AddMinutes(38)), "ninety-five percent history authorizes quality switch");
         var latencyMemory = new ExperienceData();
-        for (int i = 1; i <= 6; i++)
+        for (int i = 1; i <= 12; i++)
             latencyMemory.Observe("scope", new CandidateScanResult("latency", CandidateHealth.Compatible, null, "ok", i * 100, 1), null, now.AddMinutes(i));
-        Equal("200,300,400,500,600", String.Join(",", latencyMemory.RecentResponses("scope", "latency", 5).Select(x => x.ToString("F0"))), "recent response history keeps newest samples");
-        Equal(true, latencyMemory.StabilitySummary("scope", "latency", now.AddMinutes(6)).Contains("6/5 次"), "stability summary exposes sample progress");
+        Equal("800,900,1000,1100,1200", String.Join(",", latencyMemory.RecentResponses("scope", "latency", 5).Select(x => x.ToString("F0"))), "recent response history keeps newest samples");
+        Equal(10, latencyMemory.Nodes[0].RecentResponseMilliseconds.Count, "recent response history is capped at ten samples");
+        Equal(750.0, latencyMemory.Nodes[0].ResponseMs, "experience response uses recent-window median");
+        Equal(350.0, latencyMemory.Nodes[0].JitterMs, "experience jitter uses P90 minus median");
+        Equal(true, latencyMemory.StabilitySummary("scope", "latency", now.AddMinutes(12)).Contains("12/5 次"), "stability summary exposes sample progress");
+        var reliableRank = new NodeExperience { Success = 1, ResponseMs = 300, JitterMs = 20, OutcomeSamples = 10, SuccessfulSamples = 10 };
+        var failureRank = new NodeExperience { Success = 1, ResponseMs = 300, JitterMs = 20, OutcomeSamples = 10, SuccessfulSamples = 8 };
+        Equal(true, reliableRank.Rank(now) > failureRank.Rank(now), "node rank uses observed failure rate");
         Equal(0, memory.Recommend("different services", new[] { "stable" }, now.AddMinutes(10)).Count(), "memory isolated by service and subscription scope");
         Equal(0, memory.Recommend("scope", new[] { "removed" }, now.AddMinutes(10)).Count(), "removed node not recommended");
         Equal(0, memory.Recommend("scope", new[] { "stable" }, now.AddDays(8)).Count(), "stale history not recommended");
@@ -1316,6 +1768,22 @@ internal static class Tests
             "provider contact and account metadata never enter node measurements");
         Equal(2, CandidateCatalog.Filter(new[] { "香港 I1 | 通知优化", "Tokyo-A" }, runtimeTypes).Count,
             "notice filtering does not reject node regions or ordinary words inside node names");
+
+        string stableId = "node-v1-" + new string('A', 43);
+        var identified = new CandidateNode("display", 1.0, stableId, NodeIdentityStrength.Strong);
+        Equal("display", identified.Name, "candidate retains selector name");
+        Equal(stableId, identified.NodeId, "candidate carries stable identity");
+        Equal(NodeIdentityStrength.Strong, identified.IdentityStrength, "candidate carries identity strength");
+        var resolved = new Dictionary<string, ResolvedNodeIdentity>(StringComparer.Ordinal) {
+            { "Tokyo-A", new ResolvedNodeIdentity(stableId, NodeIdentityStrength.Strong, "") },
+            { "Tokyo alias", new ResolvedNodeIdentity(stableId, NodeIdentityStrength.Strong, "") }
+        };
+        IList<CandidateNode> identityCandidates = CandidateCatalog.Filter(
+            new[] { "Tokyo alias", "Tokyo-A", "unresolved" }, null, resolved);
+        Equal(2, identityCandidates.Count, "equivalent strong aliases collapse to one live candidate");
+        Equal("Tokyo-A", identityCandidates[0].Name, "equivalent aliases use deterministic live name");
+        Equal(NodeIdentityStrength.SessionOnly, identityCandidates[1].IdentityStrength,
+            "unresolved candidate remains available for the live session");
     }
 
     private static void PipeHttpDecoding()
@@ -1555,12 +2023,21 @@ internal static class Tests
         Equal(TimeSpan.FromSeconds(2), probe.Timeouts.Single(), "fast candidate scan uses its shorter probe timeout");
 
         probe = new FakeProbe { DefaultResult = ProbeResult.Success(75) };
+        DateTime observed = new DateTime(2026, 9, 21, 2, 0, 0, DateTimeKind.Utc);
         scanner = new CompatibilityScanner(mihomo, probe, "probe",
-            new FakeExitIdentityProbe(new ExitIdentity("selected-fp", "JP", "ok")));
+            new FakeExitIdentityProbe(new ExitIdentity("selected-fp", "JP", "ok")),
+            new FakeClock { UtcNow = observed });
         CandidateScanResult selected = scanner.ScanSelected(new CandidateNode("selected", 1),
             new[] { ServiceKind.ChatGPT, ServiceKind.GitHub });
         Equal(2, probe.Calls.Count, "only selected services probed");
         Equal(75L, selected.ServiceResults[ServiceKind.ChatGPT].ElapsedMilliseconds, "service latency retained");
+        Equal(2, selected.ServiceObservations.Count, "one observation per selected service");
+        Equal(observed, selected.ServiceObservations[ServiceKind.GitHub].ObservedUtc,
+            "scanner uses injected clock for observation time");
+        Equal(ServiceOutcome.Success, selected.ServiceObservations[ServiceKind.ChatGPT].Outcome,
+            "scanner records final service outcome");
+        Equal("selected-fp", selected.ServiceObservations[ServiceKind.ChatGPT].ExitFingerprint,
+            "scanner attaches exit fingerprint to raw observation");
         DateTime snapshotTime = new DateTime(2026, 9, 8, 8, 0, 0, DateTimeKind.Utc);
         MonitorSnapshot snapshot = MonitorSnapshot.CreateRunning("selected", selected, 82.5,
             "保持当前节点", snapshotTime, snapshotTime.AddMinutes(1));
@@ -1760,9 +2237,13 @@ internal static class Tests
         {
             RunRecoveredSevereLatencyOrchestration();
             RunConfirmedSevereLatencyOrchestration();
+            RunUnhelpfulSevereLatencyOrchestration();
+            RunBudgetedSevereLatencyOrchestration();
             RunEligibleFastFailoverOrchestration();
             RunEightCandidateFastFailoverBound();
             RunAutomaticOpportunityOrchestration();
+            RunRecentSwitchOpportunityHysteresisOrchestration();
+            RunBudgetedOpportunityConfirmationOrchestration();
             RunActiveCircuitAutomaticFailover();
             RunConsensusCircuitDoesNotAttributeNodeFailure();
             RunCircuitRollbackRechecksAllRequiredServices();
@@ -1771,6 +2252,275 @@ internal static class Tests
         {
             ThreadPool.SetMinThreads(originalWorkerThreads, originalIoThreads);
         }
+    }
+
+    private static void CandidateLatencyTableBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 23, 6, 0, 0, DateTimeKind.Utc);
+        MonitorSnapshot snapshot = MonitorSnapshot.CreateState(MonitorRunState.Running, "ok", now, now)
+            .WithCandidateLatencies(new[] {
+                new CandidateLatencyMeasurement("node-a", "JP", 42, new[] {
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 120, "entry reachable", ProbeFailureKind.Partial),
+                    new ServiceMeasurement(ServiceKind.Gemini, false, 900, "blocked", ProbeFailureKind.Service)
+                }, now)
+            });
+        using (var form = new CandidateLatencyForm(snapshot, delegate { }))
+        {
+            var fields = BindingFlags.Instance | BindingFlags.NonPublic;
+            var table = (DataGridView)typeof(CandidateLatencyForm)
+                .GetField("latencyTable", fields).GetValue(form);
+            Equal(10, table.Rows.Count, "candidate latency table always presents at least ten rows");
+            Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "ChatGPT"),
+                "candidate latency table has a ChatGPT website column");
+            Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
+                "candidate latency table has a Gemini website column");
+            Equal("入口可达 · 120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
+                "candidate latency table shows partial website latency without claiming full verification");
+            Equal("不可用", table.Rows[0].Cells["service_Gemini"].Value,
+                "candidate latency table distinguishes failure from latency");
+            Equal("待测", table.Rows[9].Cells["node"].Value,
+                "unmeasured ranking slots remain explicit");
+        }
+    }
+
+    private static void CandidateLatencyRankingBehavior()
+    {
+        var cache = new CandidateLatencyStore();
+        int staleGeneration = cache.BeginMeasurement();
+        cache.Invalidate();
+        IList<CandidateLatencyMeasurement> rejected;
+        Equal(false, cache.TryPublish(staleGeneration,
+            new List<CandidateLatencyMeasurement> {
+                new CandidateLatencyMeasurement("stale", "JP", 40,
+                    new[] { new ServiceMeasurement(ServiceKind.ChatGPT, true, 80, "ok") },
+                    DateTime.UtcNow)
+            }.AsReadOnly(), out rejected),
+            "candidate latency cache atomically rejects a result invalidated before commit");
+        Equal(0, cache.Current.Count,
+            "invalidated candidate latency cache cannot be repopulated by a stale commit");
+
+        string root = Path.Combine(Path.GetTempPath(), "monitor-candidate-ranking-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 12)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new RankingServiceProbe(mihomo),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 5, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            IList<CandidateLatencyMeasurement> ranking =
+                ((ICandidateLatencyRunner)worker).MeasureCandidateLatencies(UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "candidate website latency measurement never changes the shared selector");
+            Equal(10, ranking.Count,
+                "candidate website latency ranking contains ten rows");
+            Equal("node-10,node-09,node-08,node-07,node-06,node-05,node-04,node-03,node-02,node-01",
+                String.Join(",", ranking.Select(x => x.Node)),
+                "candidate website latency ranking uses website responses before Mihomo delay");
+            Equal(100, ranking[0].MihomoMilliseconds,
+                "candidate ranking exposes the live Mihomo delay");
+            Equal(100L, ranking[0].Services
+                .First(x => x.Service == ServiceKind.ChatGPT).Milliseconds,
+                "candidate ranking exposes per-website measured latency");
+            Equal(true, ranking.All(x =>
+                x.Services.Any(service => service.Service == ServiceKind.ChatGPT) &&
+                x.Services.Any(service => service.Service == ServiceKind.Gemini)),
+                "every candidate row includes the mandatory AI websites");
+            ((ICandidateLatencyRunner)worker).InvalidateCandidateLatencies();
+            Equal(0, worker.RunOnce(false, UserPreferences.Defaults()).CandidateLatencies.Count,
+                "invalidated candidate ranking cannot reappear after a normal monitor cycle");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void AutomaticRankedSelectionBehavior()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-ranked-selection-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 10)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new RankedSelectionProbe(mihomo, 900),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot result = worker.Run(preferences);
+
+            Equal("node-02", mihomo.GetSelected("shared"),
+                "automatic ranking skips a failed first full recheck and selects the second website-ranked node");
+            Equal(10, result.CandidateLatencies.Count,
+                "automatic selection publishes the same ten website latency rows");
+            Equal("node-01,node-02", String.Join(",", result.CandidateLatencies.Take(2).Select(x => x.Node)),
+                "automatic selection follows displayed website latency order");
+            Equal("node-01,node-02", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(5))
+                .Where(x => x != "current")),
+                "automatic selection fully rechecks ranked candidates in order and stops after success");
+            ExperienceData afterSwitch = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal(true, afterSwitch.Assurance.ProvisionalSwitch,
+                "ranked selection marks a reachable-only AI target as provisional during observation");
+        }
+        finally { DeleteDirectoryEventually(root); }
+
+        string fastRoot = Path.Combine(Path.GetTempPath(), "monitor-ranked-current-fast-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fastRoot);
+        try
+        {
+            string[] alternatives = { "node-01", "node-02", "node-03" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var worker = new MonitorWorker(FastWorkerConfiguration(fastRoot), mihomo,
+                new RankedSelectionProbe(mihomo, 80),
+                new BoundedLogger(Path.Combine(fastRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 10, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot result = worker.Run(preferences);
+            Equal("current", mihomo.GetSelected("shared"),
+                "website ranking retains a current node that is faster than every candidate");
+            Equal(3, result.CandidateLatencies.Count,
+                "healthy current still receives the scheduled website ranking");
+            Equal(0, mihomo.ScanNodes(TimeSpan.FromSeconds(5)).Count(x => x != "current"),
+                "slower ranked candidates do not cause unnecessary full rechecks");
+        }
+        finally { DeleteDirectoryEventually(fastRoot); }
+
+        string dryRoot = Path.Combine(Path.GetTempPath(), "monitor-ranked-dry-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dryRoot);
+        try
+        {
+            string[] alternatives = { "node-01", "node-02", "node-03" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var worker = new MonitorWorker(FastWorkerConfiguration(dryRoot), mihomo,
+                new RankedSelectionProbe(mihomo, 900),
+                new BoundedLogger(Path.Combine(dryRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 20, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(true, preferences);
+            Equal("current", mihomo.GetSelected("shared"),
+                "dry-run website ranking never changes the shared selector");
+        }
+        finally { DeleteDirectoryEventually(dryRoot); }
+
+        string invalidatedRoot = Path.Combine(Path.GetTempPath(),
+            "monitor-ranked-invalidated-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(invalidatedRoot);
+        try
+        {
+            string[] alternatives = { "node-01", "node-02", "node-03" };
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            var blockingProbe = new BlockingRankedSelectionProbe(mihomo);
+            var worker = new MonitorWorker(FastWorkerConfiguration(invalidatedRoot), mihomo,
+                blockingProbe,
+                new BoundedLogger(Path.Combine(invalidatedRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 30, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+            Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => worker.Run(preferences),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            try
+            {
+                Equal(true, blockingProbe.WaitUntilRankingStarts(5000),
+                    "ranking invalidation fixture pauses during the website scan");
+                ((ICandidateLatencyRunner)worker).InvalidateCandidateLatencies();
+            }
+            finally { blockingProbe.Release(); }
+            Equal(true, cycle.Wait(5000), "invalidated ranking cycle completes");
+            Equal("current", mihomo.GetSelected("shared"),
+                "invalidated website ranking cannot switch the shared selector");
+            Equal(0, cycle.Result.CandidateLatencies.Count,
+                "invalidated website ranking is not published by the automatic cycle");
+        }
+        finally { DeleteDirectoryEventually(invalidatedRoot); }
+
+        string preferencesRoot = Path.Combine(Path.GetTempPath(),
+            "monitor-ranked-preferences-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(preferencesRoot);
+        try
+        {
+            var mihomo = new OrchestratedMihomo("current", new[] { "current", "node-01" },
+                new Dictionary<string, int> { { "node-01", 10 } });
+            var probe = new BlockingFullRecheckProbe(mihomo);
+            var worker = new MonitorWorker(FastWorkerConfiguration(preferencesRoot), mihomo,
+                probe, new BoundedLogger(Path.Combine(preferencesRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 40, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+            var oldPreferences = UserPreferences.Defaults();
+            oldPreferences.AutomaticOptimization = true;
+            using (var coordinator = new MonitorCoordinator(worker, TimeSpan.FromHours(1),
+                TimeSpan.FromSeconds(10)))
+            {
+                int changedPreferences = 0;
+                int staleSnapshots = 0;
+                int attentionCount = 0;
+                coordinator.SnapshotChanged += snapshot => {
+                    if (Volatile.Read(ref changedPreferences) != 0 && snapshot.ActualNode == "node-01")
+                        Interlocked.Increment(ref staleSnapshots);
+                };
+                coordinator.AttentionRequired += delegate { Interlocked.Increment(ref attentionCount); };
+                coordinator.UpdatePreferences(oldPreferences);
+                coordinator.Start();
+                try
+                {
+                    Equal(true, probe.WaitUntilFullRecheck(5000),
+                        "preference-change fixture pauses the old candidate full recheck");
+                    var changed = UserPreferences.Defaults();
+                    changed.AutomaticOptimization = false;
+                    changed.RequiredServices.Add(ServiceKind.Discord);
+                    Interlocked.Exchange(ref changedPreferences, 1);
+                    coordinator.UpdatePreferences(changed);
+                }
+                finally { probe.Release(); }
+                Equal(true, probe.WaitForCurrentChecks(2, 5000),
+                    "changed preferences start a new current-node cycle");
+                Equal("current", mihomo.GetSelected("shared"),
+                    "old selected-service results cannot switch after preferences change");
+                Equal(0, staleSnapshots,
+                    "cancelled old cycle cannot publish its old selected-service snapshot");
+                Equal(0, attentionCount,
+                    "preference cancellation does not raise a false monitor failure alert");
+            }
+        }
+        finally { DeleteDirectoryEventually(preferencesRoot); }
     }
 
     private static void RunRecoveredSevereLatencyOrchestration()
@@ -1851,7 +2601,7 @@ internal static class Tests
         try
         {
             DateTime now = new DateTime(2026, 9, 20, 12, 0, 0, DateTimeKind.Utc);
-            string[] alternatives = Enumerable.Range(1, 6).Select(x => "node-" + x.ToString("D2")).ToArray();
+            string[] alternatives = Enumerable.Range(1, 7).Select(x => "node-" + x.ToString("D2")).ToArray();
             string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
             var preferences = UserPreferences.Defaults();
             preferences.AutomaticOptimization = true;
@@ -1864,9 +2614,12 @@ internal static class Tests
                 LastNode = "current",
                 Assurance = new ConnectionAssurance { Scope = scope, Standbys = new List<StandbyNode>() },
                 Nodes = new List<NodeExperience> {
-                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-3),
-                        LastUtc = now.AddMinutes(-1), Samples = 3, Success = 1, LastPassed = true,
-                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000 } }
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } },
+                    new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddHours(-1),
+                        LastUtc = now.AddMinutes(-1), Samples = 6, Success = 1, LastPassed = true,
+                        ResponseMs = 400, RecentResponseMilliseconds = new List<double> { 400, 410, 390 } }
                 }
             };
             new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
@@ -1884,15 +2637,23 @@ internal static class Tests
 
             Equal(alternatives.Length, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
                 "scheduled opportunity scan measures every alternative once");
-            Equal("node-01,node-02,node-03", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
-                "scheduled opportunity scan stops after three comparable candidates");
-            Equal("current", mihomo.GetSelected("shared"),
-                "first opportunity scan prepares a target without switching");
+            Equal(String.Join(",", alternatives), String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "scheduled ranking measures the candidate websites in live delay order");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "scheduled ranking directly selects the first fully rechecked faster node");
             ExperienceData afterDiscovery = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
-            Equal("node-01", afterDiscovery.Assurance.PendingOptimization.Target,
-                "best real-service target is persisted for confirmation");
+            Equal<PendingOptimization>(null, afterDiscovery.Assurance.PendingOptimization,
+                "ranked selection does not leave a pending optimization");
+            Equal(AutomaticDecisionState.Observing, afterDiscovery.Assurance.Decision.State,
+                "ranked selection enters normal switch observation");
             Equal(TimeSpan.FromSeconds(30), discovery.NextCheckUtc - discovery.CheckedUtc,
-                "pending target schedules a thirty-second confirmation");
+                "ranked switch schedules a thirty-second observation");
+            string trace = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, trace.Contains("ranked selection elapsed_ms=") &&
+                trace.Contains("ranked=7 rechecked=1 switched=true"),
+                "ranked selection trace records the bounded scan and switch");
+            Equal(false, trace.Contains("node-06") || trace.Contains("node-07"),
+                "opportunity trace never exposes raw node names");
 
             int delayCount = mihomo.DelayNodes(2500).Count;
             clock.UtcNow = now.AddSeconds(30);
@@ -1901,14 +2662,138 @@ internal static class Tests
             Equal(delayCount, mihomo.DelayNodes(2500).Count,
                 "confirmation performs no second all-node delay round");
             Equal("node-01", mihomo.GetSelected("shared"),
-                "automatic confirmation switches the materially faster target");
+                "observation retains the ranked selected target");
             ExperienceData afterConfirmation = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
             Equal("node-01", afterConfirmation.Assurance.Target,
-                "automatic optimization enters normal post-switch observation");
+                "ranked selection retains normal post-switch observation");
+            Equal(AutomaticDecisionState.Observing, afterConfirmation.Assurance.Decision.State,
+                "ranked selection retains state-machine observation");
             Equal<PendingOptimization>(null, afterConfirmation.Assurance.PendingOptimization,
-                "successful confirmation clears pending optimization");
+                "ranked selection has no pending optimization");
             Equal(TimeSpan.FromSeconds(30), confirmation.NextCheckUtc - confirmation.CheckedUtc,
-                "automatic switch keeps the observation interval");
+                "ranked switch keeps the observation interval");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+private static void RunRecentSwitchOpportunityHysteresisOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-opportunity-hysteresis-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 20, 13, 0, 0, DateTimeKind.Utc);
+            string[] alternatives = Enumerable.Range(1, 3).Select(x => "node-" + x.ToString("D2")).ToArray();
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            var persisted = new ExperienceData {
+                ActiveScope = scope,
+                ActiveServicesKey = servicesKey,
+                ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                LastNode = "current",
+                Assurance = new ConnectionAssurance {
+                    Scope = scope,
+                    Standbys = new List<StandbyNode>(),
+                    AutomaticSwitches = new List<AutomaticSwitchRecord> {
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-5), From = "old", To = "current" }
+                    }
+                },
+                Nodes = new List<NodeExperience> {
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OpportunityServiceProbe(mihomo, 1000, 750),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now }, new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
+
+            worker.Run(preferences);
+
+            ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal<PendingOptimization>(null, after.Assurance.PendingOptimization,
+                "recent switch rejects an optimization below thirty percent improvement");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "a recent switch permits a faster ranked node while the switch budget allows it");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+private static void RunBudgetedOpportunityConfirmationOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-opportunity-budget-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 20, 14, 0, 0, DateTimeKind.Utc);
+            string[] alternatives = new[] { "node-01", "node-02", "node-03" };
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            var pending = new PendingOptimization { Scope = scope, Current = "current", Target = "node-01",
+                BaselineResponse = 1000, TargetResponse = 150, CreatedUtc = now.AddSeconds(-30) };
+            var persisted = new ExperienceData {
+                ActiveScope = scope,
+                ActiveServicesKey = servicesKey,
+                ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                LastNode = "current",
+                Assurance = new ConnectionAssurance {
+                    Scope = scope,
+                    PendingOptimization = pending,
+                    Decision = new AutomaticDecisionTransaction {
+                        State = AutomaticDecisionState.ConfirmingOptimization,
+                        Scope = scope, Current = "current", Target = "node-01",
+                        BaselineResponse = 1000, TargetResponse = 150,
+                        StartedUtc = now.AddSeconds(-30), Revision = 2
+                    },
+                    AutomaticSwitches = new List<AutomaticSwitchRecord> {
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b" },
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "current" }
+                    }
+                },
+                Nodes = new List<NodeExperience> {
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OpportunityServiceProbe(mihomo),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now }, new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.Run(preferences);
+
+            ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal("current", mihomo.GetSelected("shared"),
+                "optimization confirmation respects the automatic switch budget");
+            Equal(AutomaticDecisionState.Stabilization, after.Assurance.Decision.State,
+                "budgeted optimization enters stabilization");
+            Equal<PendingOptimization>(null, after.Assurance.PendingOptimization,
+                "budgeted optimization clears its pending target");
         }
         finally
         {
@@ -1920,13 +2805,13 @@ internal static class Tests
     {
         DateTime now = new DateTime(2026, 9, 20, 10, 0, 0, DateTimeKind.Utc);
         Equal(true, OpportunityOptimizationPolicy.ShouldScan(true, false,
-            new[] { 900d, 850d, 801d }, DateTime.MinValue, now),
+            new[] { 900d, 850d, 801d, 900d, 900d }, DateTime.MinValue, now),
             "slow current schedules automatic opportunity discovery");
+        Equal(true, OpportunityOptimizationPolicy.ShouldScan(true, false,
+            new[] { 900d, 900d, 800d, 700d, 700d }, DateTime.MinValue, now),
+            "a working current still schedules a ranked comparison when due");
         Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
-            new[] { 900d, 800d, 700d }, DateTime.MinValue, now),
-            "good current does not schedule opportunity discovery");
-        Equal(false, OpportunityOptimizationPolicy.ShouldScan(true, false,
-            new[] { 900d, 850d, 801d }, now.AddMinutes(-2), now),
+            new[] { 900d, 850d, 801d, 900d, 900d }, now.AddMinutes(-2), now),
             "opportunity discovery is limited to one round per three minutes");
         Equal(true, OpportunityOptimizationPolicy.MateriallyBetter(1000, 800),
             "twenty percent faster target is material");
@@ -1962,6 +2847,316 @@ internal static class Tests
             basic.ServiceResults, "0000000000000000000000000000000000000000000000000000000000000002", "HK");
         Equal(false, OpportunityOptimizationPolicy.IsPerformanceComparable(unsupported, required),
             "unsupported actual exit cannot participate in proactive comparison");
+    }
+
+    private static void RankedOpportunitySelectionBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc);
+        var required = new[] { ServiceKind.ChatGPT, ServiceKind.Gemini };
+        var ranking = new[] {
+            new CandidateLatencyMeasurement("first", "JP", 30, new[] {
+                new ServiceMeasurement(ServiceKind.ChatGPT, true, 100, "ok"),
+                new ServiceMeasurement(ServiceKind.Gemini, true, 120, "ok") }, now),
+            new CandidateLatencyMeasurement("second", "JP", 40, new[] {
+                new ServiceMeasurement(ServiceKind.ChatGPT, true, 200, "ok"),
+                new ServiceMeasurement(ServiceKind.Gemini, true, 220, "ok") }, now),
+            new CandidateLatencyMeasurement("third", "JP", 50, new[] {
+                new ServiceMeasurement(ServiceKind.ChatGPT, true, 950, "ok"),
+                new ServiceMeasurement(ServiceKind.Gemini, true, 980, "ok") }, now)
+        };
+        var checkedNodes = new List<string>();
+        RankedOpportunitySelection selected = RankedOpportunitySelector.Select(ranking, 900, required, node => {
+            checkedNodes.Add(node);
+            return new CandidateScanResult(node,
+                node == "first" ? CandidateHealth.ServiceFailed : CandidateHealth.Compatible,
+                node == "first" ? (ServiceKind?)ServiceKind.ChatGPT : null,
+                node == "first" ? "blocked" : "ok", 400, 2,
+                new Dictionary<ServiceKind, ProbeResult> {
+                    { ServiceKind.ChatGPT, node == "first" ? ProbeResult.ServiceFailure("blocked", 100) : ProbeResult.Success(200) },
+                    { ServiceKind.Gemini, ProbeResult.Success(220) }
+                }, null, "JP");
+        });
+        Equal("second", selected.Node, "ranked selector advances after a failed full recheck");
+        Equal("first,second", String.Join(",", checkedNodes),
+            "ranked selector checks website order and stops after the first eligible target");
+        Equal(2, selected.Rechecked, "ranked selector reports its full recheck count");
+        Equal(2, selected.Rank, "ranked selector reports the displayed one-based rank");
+        Equal(220d, selected.ResponseMilliseconds,
+            "ranked selector retains full selected-service response, not quick ranking latency");
+
+        checkedNodes.Clear();
+        RankedOpportunitySelection none = RankedOpportunitySelector.Select(ranking, 130, required, node => {
+            checkedNodes.Add(node);
+            return new CandidateScanResult(node, CandidateHealth.ServiceFailed, ServiceKind.ChatGPT, "blocked");
+        });
+        Equal<string>(null, none.Node, "ranked selector retains a faster current node");
+        Equal("first", String.Join(",", checkedNodes),
+            "ranked selector stops before rows that cannot beat the current response");
+    }
+
+    private static void RunUnhelpfulSevereLatencyOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-latency-unhelpful-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 3)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var probe = new SevereLatencyProbe(mihomo, 2100, 1950);
+            DateTime now = new DateTime(2026, 9, 21, 9, 0, 0, DateTimeKind.Utc);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo, probe,
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "severe degradation keeps current when absolute improvement is too small");
+            ExperienceData persisted = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal(AutomaticDecisionState.Degraded, persisted.Assurance.Decision.State,
+                "rejected severe degradation ends in degraded state");
+            string log = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, log.Contains("state_from=") && log.Contains("state_to=") &&
+                log.Contains("event=") && log.Contains("evidence=") &&
+                log.Contains("directive=") && log.Contains("switches_10m=") &&
+                log.Contains("switches_30m="),
+                "decision trace records bounded transition fields");
+            Equal(true, log.Contains("required_relative=") &&
+                log.Contains("required_absolute_ms=") && log.Contains("accepted=false"),
+                "decision trace records active improvement thresholds and rejection");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunBudgetedSevereLatencyOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-latency-budget-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 21, 9, 10, 0, DateTimeKind.Utc);
+            var persisted = new ExperienceData {
+                Assurance = new ConnectionAssurance {
+                    AutomaticSwitches = new List<AutomaticSwitchRecord> {
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b" },
+                        new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "current" }
+                    }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            string[] alternatives = Enumerable.Range(1, 3)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current",
+                new[] { "current" }.Concat(alternatives), delays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new SevereLatencyProbe(mihomo, 2100, 300),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "switch budget blocks severe degradation churn");
+            ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
+            Equal(AutomaticDecisionState.Stabilization, after.Assurance.Decision.State,
+                "exhausted switch budget enters stabilization");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void AutomaticDecisionPolicyBehavior()
+    {
+        var regionBlocked = new CandidateScanResult("current", CandidateHealth.RegionBlocked,
+            ServiceKind.ChatGPT, "unsupported", 100, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.RegionFailure("unsupported", 100) }
+            });
+        var serviceFailed = new CandidateScanResult("current", CandidateHealth.ServiceFailed,
+            ServiceKind.Gemini, "rejected", 100, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.Gemini, ProbeResult.ServiceFailure("rejected", 100) }
+            });
+        var stillSlowButPassed = new CandidateScanResult("current", CandidateHealth.Compatible,
+            null, "slow", 2100, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(2100) }
+            });
+        var unknown = new CandidateScanResult("current", CandidateHealth.Unknown, null, "unknown");
+        var healthy = new CandidateScanResult("current", CandidateHealth.Compatible, null, "ok", 500, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(500) }
+            });
+        var normallySlow = new CandidateScanResult("current", CandidateHealth.Compatible, null, "slow", 900, 1,
+            new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(900) }
+            });
+
+        Equal(DecisionEvidenceClass.HardFailure,
+            DecisionEvidencePolicy.Classify(regionBlocked, false),
+            "region rejection is a hard failure");
+        Equal(DecisionEvidenceClass.HardFailure,
+            DecisionEvidencePolicy.Classify(serviceFailed, false),
+            "definite service rejection is a hard failure");
+        Equal(DecisionEvidenceClass.SevereDegradation,
+            DecisionEvidencePolicy.Classify(stillSlowButPassed, true),
+            "confirmed two-second latency is degradation not failure");
+        Equal(DecisionEvidenceClass.Unknown,
+            DecisionEvidencePolicy.Classify(unknown, false),
+            "missing evidence remains unknown");
+        Equal(DecisionEvidenceClass.Healthy,
+            DecisionEvidencePolicy.Classify(healthy, false),
+            "usable bounded evidence is healthy");
+        Equal(DecisionEvidenceClass.NormalDegradation,
+            DecisionEvidencePolicy.Classify(normallySlow, false),
+            "usable response above the experience target is normal degradation");
+
+        Equal(false, MaterialImprovementPolicy.Evaluate(200, 150, false).Accepted,
+            "small absolute gain cannot switch despite relative gain");
+        Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, false).Accepted,
+            "normal improvement requires twenty percent and two hundred milliseconds");
+        Equal(false, MaterialImprovementPolicy.Evaluate(1200, 850, true).Accepted,
+            "recent switch raises relative requirement to thirty percent");
+        Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, true).Accepted,
+            "recent switch accepts a thirty-percent material improvement");
+    }
+
+    private static void AutomaticDecisionStateMachineBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 21, 8, 0, 0, DateTimeKind.Utc);
+        var current = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.Healthy,
+            Scope = "scope",
+            Current = "current",
+            StartedUtc = now
+        };
+        DecisionTransition transition = AutomaticDecisionStateMachine.Transition(current,
+            AutomaticDecisionEvent.NormalDegradation,
+            new AutomaticDecisionContext { NowUtc = now, Evidence = DecisionEvidenceClass.NormalDegradation });
+        Equal(AutomaticDecisionState.Degraded, transition.Transaction.State,
+            "normal degradation enters degraded state");
+        Equal(AutomaticDecisionDirective.None, transition.Directive,
+            "normal degradation does not start an automatic transaction");
+
+        transition = AutomaticDecisionStateMachine.Transition(current,
+            AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now, Evidence = DecisionEvidenceClass.HardFailure,
+                Service = ServiceKind.ChatGPT, Reason = "region blocked" });
+        Equal(AutomaticDecisionState.ConfirmingFailure, transition.Transaction.State,
+            "hard failure preempts healthy state");
+        Equal(AutomaticDecisionDirective.ConfirmCurrent, transition.Directive,
+            "hard failure requests focused confirmation");
+
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.FailureConfirmed,
+            new AutomaticDecisionContext { NowUtc = now.AddSeconds(1),
+                Evidence = DecisionEvidenceClass.HardFailure });
+        Equal(AutomaticDecisionState.Recovering, transition.Transaction.State,
+            "confirmed hard failure enters recovery");
+        Equal(AutomaticDecisionDirective.SearchRecovery, transition.Directive,
+            "confirmed hard failure requests candidate recovery");
+
+        var optimization = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.SearchingOptimization,
+            Scope = "scope", Current = "current", StartedUtc = now
+        };
+        transition = AutomaticDecisionStateMachine.Transition(optimization,
+            AutomaticDecisionEvent.OptimizationTargetPrepared,
+            new AutomaticDecisionContext { NowUtc = now, Target = "target", BaselineResponse = 1200,
+                TargetResponse = 700, Reason = "candidate ready" });
+        Equal(AutomaticDecisionState.ConfirmingOptimization, transition.Transaction.State,
+            "prepared optimization target enters confirmation");
+        Equal(AutomaticDecisionDirective.ConfirmOptimization, transition.Directive,
+            "prepared target requests delayed confirmation");
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now.AddSeconds(2),
+                Evidence = DecisionEvidenceClass.HardFailure, Service = ServiceKind.Gemini });
+        Equal(AutomaticDecisionState.ConfirmingFailure, transition.Transaction.State,
+            "hard failure cancels pending optimization");
+        Equal<string>(null, transition.Transaction.Target,
+            "hard failure clears stale optimization target");
+
+        var switching = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.Switching, Current = "current", Target = "target",
+            Previous = "current", StartedUtc = now
+        };
+        transition = AutomaticDecisionStateMachine.Transition(switching,
+            AutomaticDecisionEvent.SwitchSucceeded,
+            new AutomaticDecisionContext { NowUtc = now.AddSeconds(3) });
+        Equal(AutomaticDecisionState.Observing, transition.Transaction.State,
+            "successful switch enters observation");
+        Equal(AutomaticDecisionDirective.Observe, transition.Directive,
+            "successful switch requests observation");
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.ObservationComplete,
+            new AutomaticDecisionContext { NowUtc = now.AddMinutes(2),
+                ExpiresUtc = now.AddMinutes(32) });
+        Equal(AutomaticDecisionState.Cooldown, transition.Transaction.State,
+            "completed observation enters cooldown");
+        transition = AutomaticDecisionStateMachine.Transition(transition.Transaction,
+            AutomaticDecisionEvent.CooldownExpired,
+            new AutomaticDecisionContext { NowUtc = now.AddMinutes(32) });
+        Equal(AutomaticDecisionState.Healthy, transition.Transaction.State,
+            "expired cooldown returns to healthy state");
+
+        transition = AutomaticDecisionStateMachine.Transition(optimization,
+            AutomaticDecisionEvent.ManualNodeChanged,
+            new AutomaticDecisionContext { NowUtc = now, Current = "manual" });
+        Equal(AutomaticDecisionState.Cooldown, transition.Transaction.State,
+            "manual selection cancels automatic transaction into cooldown");
+        Equal(AutomaticDecisionDirective.Cancel, transition.Directive,
+            "manual selection emits cancellation directive");
+        Equal<string>(null, transition.Transaction.Target,
+            "manual selection clears pending target");
+
+        var stabilizing = new AutomaticDecisionTransaction {
+            State = AutomaticDecisionState.Stabilization, Current = "current",
+            ExpiresUtc = now.AddMinutes(5)
+        };
+        transition = AutomaticDecisionStateMachine.Transition(stabilizing,
+            AutomaticDecisionEvent.HardFailure,
+            new AutomaticDecisionContext { NowUtc = now,
+                Evidence = DecisionEvidenceClass.HardFailure, Service = ServiceKind.ChatGPT });
+        Equal(AutomaticDecisionState.ConfirmingFailure, transition.Transaction.State,
+            "hard failure bypasses stabilization");
+
+        var oneRecent = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "a", To = "b" }
+        };
+        Equal(true, SwitchBudgetPolicy.CanSwitch(oneRecent, now).Allowed,
+            "second switch inside ten minutes remains allowed");
+        var twoRecent = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "a", To = "b" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "b", To = "c" }
+        };
+        Equal(false, SwitchBudgetPolicy.CanSwitch(twoRecent, now).Allowed,
+            "third switch inside ten minutes enters stabilization");
+        var fourRecent = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-29), From = "a", To = "b" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-20), From = "b", To = "c" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-11), From = "c", To = "d" },
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "d", To = "e" }
+        };
+        Equal(false, SwitchBudgetPolicy.CanSwitch(fourRecent, now).Allowed,
+            "fifth switch inside thirty minutes enters stabilization");
+        Equal(true, SwitchBudgetPolicy.CanSwitch(twoRecent, now.AddMinutes(2)).Allowed,
+            "budget automatically releases when the rolling slot expires");
     }
 
     private static void RunEligibleFastFailoverOrchestration()
@@ -2127,12 +3322,25 @@ internal static class Tests
             Equal(ProbeFailureKind.Service,
                 snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT).Evidence,
                 "service consensus snapshot retains the real current-cycle failure evidence");
-            Equal(false, new StateStore(FastWorkerConfiguration(root).StatePath).Load().Records.ContainsKey("current"),
-                "shared service incident is not persisted as a current-node health failure");
-            Equal(0, new QualityStateStore(FastWorkerConfiguration(root).QualityStatePath).Load().Count,
-                "shared service incident is not persisted in node quality history");
-            Equal(0, new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load().Nodes.Count,
-                "shared service incident does not lower any node experience history");
+            HealthState history = new StateStore(FastWorkerConfiguration(root).StatePath).Load();
+            Equal(true, history.Records.ContainsKey("current"),
+                "unaffected services still contribute current-node health history");
+            Equal(CandidateHealth.Compatible, history.Records["current"].Health,
+                "shared failure is excluded from the current-node health result");
+            QualitySample currentQuality = new QualityStateStore(
+                FastWorkerConfiguration(root).QualityStatePath).Load().Last(x => x.Name == "current");
+            Equal(100.0, currentQuality.ResponseMedianMs,
+                "shared failure latency is excluded from node quality history");
+            NodeExperience currentExperience = new ExperienceStore(
+                Path.Combine(root, "state", "experience.json")).Load().Nodes.Last(x => x.Node == "current");
+            Equal(true, currentExperience.LastPassed,
+                "shared failure does not lower current-node experience history");
+            Equal(100.0, currentExperience.ResponseMs,
+                "experience response uses only attributable services");
+            string log = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
+            Equal(true, log.Contains("service incident consensus service=ChatGPT fingerprints=3 " +
+                "countries=1 asns=2 passed=True reason=none"),
+                "incident trace contains only safe aggregate diversity evidence");
         }
         finally
         {
@@ -2366,12 +3574,20 @@ internal static class Tests
     {
         private readonly OrchestratedMihomo mihomo;
         private readonly long retryMilliseconds;
+        private readonly long alternativeMilliseconds;
         private int currentChatGptCalls;
 
         public SevereLatencyProbe(OrchestratedMihomo mihomo, long retryMilliseconds)
+            : this(mihomo, retryMilliseconds, 300)
+        {
+        }
+
+        public SevereLatencyProbe(OrchestratedMihomo mihomo, long retryMilliseconds,
+            long alternativeMilliseconds)
         {
             this.mihomo = mihomo;
             this.retryMilliseconds = retryMilliseconds;
+            this.alternativeMilliseconds = alternativeMilliseconds;
         }
 
         public int CurrentChatGptCalls { get { return currentChatGptCalls; } }
@@ -2386,7 +3602,7 @@ internal static class Tests
                 int call = Interlocked.Increment(ref currentChatGptCalls);
                 return ProbeResult.Success(call == 1 ? 2100 : retryMilliseconds);
             }
-            return ProbeResult.Success(300);
+            return ProbeResult.Success(alternativeMilliseconds);
         }
     }
 
@@ -2413,19 +3629,130 @@ internal static class Tests
         }
     }
 
-    private sealed class OpportunityServiceProbe : IServiceProbe
+    private sealed class RankingServiceProbe : IServiceProbe
     {
         private readonly OrchestratedMihomo mihomo;
-        public OpportunityServiceProbe(OrchestratedMihomo mihomo) { this.mihomo = mihomo; }
+
+        public RankingServiceProbe(OrchestratedMihomo mihomo)
+        {
+            this.mihomo = mihomo;
+        }
+
         public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
         {
             OrchestratedScanEvent scan = mihomo.ActiveScan();
             scan.ObserveTimeout(timeout);
             scan.ObserveService(service);
-            if (scan.Node == "current") return ProbeResult.Success(1000);
+            if (scan.Node == "current") return ProbeResult.Success(250);
+            int number;
+            if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 99;
+            long elapsed = 200 - number * 10;
+            if (scan.Node == "node-01" && service == ServiceKind.Gemini)
+                return ProbeResult.ServiceFailure("blocked", elapsed);
+            return service == ServiceKind.ChatGPT || service == ServiceKind.Gemini
+                ? ProbeResult.Partial("entry reachable", elapsed)
+                : ProbeResult.Success(elapsed);
+        }
+    }
+
+    private sealed class RankedSelectionProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly long currentMilliseconds;
+        public RankedSelectionProbe(OrchestratedMihomo mihomo, long currentMilliseconds)
+        {
+            this.mihomo = mihomo;
+            this.currentMilliseconds = currentMilliseconds;
+        }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current") return ProbeResult.Success(currentMilliseconds);
+            int number = Int32.Parse(scan.Node.Substring("node-".Length));
+            if (number == 1 && timeout > TimeSpan.FromSeconds(2) && service == ServiceKind.ChatGPT)
+                return ProbeResult.ServiceFailure("full recheck failed", 100);
+            return number == 2 && service == ServiceKind.ChatGPT
+                ? ProbeResult.Partial("entry reachable", 100 + number * 50)
+                : ProbeResult.Success(100 + number * 50);
+        }
+    }
+
+    private sealed class BlockingRankedSelectionProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        public BlockingRankedSelectionProbe(OrchestratedMihomo mihomo) { this.mihomo = mihomo; }
+        public bool WaitUntilRankingStarts(int milliseconds) { return entered.Wait(milliseconds); }
+        public void Release() { released.Set(); }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "node-01" && timeout == TimeSpan.FromSeconds(2) &&
+                service == ServiceKind.ChatGPT)
+            {
+                entered.Set();
+                released.Wait(TimeSpan.FromSeconds(15));
+            }
+            return ProbeResult.Success(scan.Node == "current" ? 900 : 150);
+        }
+    }
+
+    private sealed class BlockingFullRecheckProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        private int currentChecks;
+        public BlockingFullRecheckProbe(OrchestratedMihomo mihomo) { this.mihomo = mihomo; }
+        public bool WaitUntilFullRecheck(int milliseconds) { return entered.Wait(milliseconds); }
+        public bool WaitForCurrentChecks(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => Volatile.Read(ref currentChecks) >= count, milliseconds); }
+        public void Release() { released.Set(); }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current" && service == ServiceKind.ChatGPT)
+                Interlocked.Increment(ref currentChecks);
+            if (scan.Node == "node-01" && timeout > TimeSpan.FromSeconds(2) &&
+                service == ServiceKind.ChatGPT)
+            {
+                entered.Set();
+                released.Wait(TimeSpan.FromSeconds(15));
+            }
+            return ProbeResult.Success(scan.Node == "current" ? 900 : 150);
+        }
+    }
+
+    private sealed class OpportunityServiceProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly long currentMilliseconds;
+        private readonly long firstAlternativeMilliseconds;
+        public OpportunityServiceProbe(OrchestratedMihomo mihomo)
+            : this(mihomo, 1000, 150) { }
+        public OpportunityServiceProbe(OrchestratedMihomo mihomo, long currentMilliseconds,
+            long firstAlternativeMilliseconds)
+        {
+            this.mihomo = mihomo;
+            this.currentMilliseconds = currentMilliseconds;
+            this.firstAlternativeMilliseconds = firstAlternativeMilliseconds;
+        }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current") return ProbeResult.Success(currentMilliseconds);
             int number;
             if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 9;
-            long elapsed = 100 + number * 50;
+            long elapsed = firstAlternativeMilliseconds + (number - 1) * 50;
             return service == ServiceKind.ChatGPT || service == ServiceKind.Gemini
                 ? ProbeResult.Partial("entry reachable", elapsed)
                 : ProbeResult.Success(elapsed);
@@ -2448,7 +3775,9 @@ internal static class Tests
             int number;
             if (!Int32.TryParse(scan.Node.Replace("node-", ""), out number)) number = 999;
             string country = unsupportedAlternatives && scan.Node != "current" ? "HK" : "JP";
-            return new ExitIdentity(((long)number + 10000).ToString("X64"), country, "ok");
+            long asn = scan.Node == "current" ? 64530 : 64531;
+            return new ExitIdentity(((long)number + 10000).ToString("X64"), country, "ok", asn,
+                new DateTime(2026, 9, 21, 4, 0, 0, DateTimeKind.Utc));
         }
     }
 
@@ -2586,6 +3915,10 @@ internal static class Tests
         var qualityStore = new QualityStateStore(qualityPath);
         qualityStore.Save(stableHistory.Concat(new[] { stable, jittery }));
         Equal(5, qualityStore.Load().Count, "quality state roundtrip");
+        string qualityNodeId = "node-v1-" + new string('D', 43);
+        qualityStore.Save(new[] { new QualitySample("renamed display", qualityNodeId, now, true, 123, 4, 0, null) });
+        QualitySample identityQuality = qualityStore.Load().Single();
+        Equal(qualityNodeId, identityQuality.NodeId, "quality state preserves stable node identity");
         File.WriteAllText(qualityPath, "broken", Encoding.UTF8);
         Equal(0, qualityStore.Load().Count, "quality corrupt recovery");
         Equal(true, Directory.GetFiles(directory, "quality.state.corrupt-*").Length == 1, "quality corrupt archived");
@@ -2632,27 +3965,35 @@ internal static class Tests
         Equal("良好", QualityPolicy.LatencyBand(500), "good latency band boundary");
         Equal("可用但偏慢", QualityPolicy.LatencyBand(800), "usable but slow latency band boundary");
         Equal("较慢", QualityPolicy.LatencyBand(801), "slow latency band starts above 800");
-        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 1000.0 }), "current latency needs three samples");
-        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 800.0, 900.0 }), "current median at 800 holds");
-        Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 900.0 }), "current median above 800 may optimize");
+        LatencyWindowSummary spikyWindow = LatencyWindowStatistics.Summarize(new[] { 250.0, 260.0, 270.0, 280.0, 1500.0 });
+        Equal(5, spikyWindow.Count, "latency statistics retain the recent sample count");
+        Equal(270.0, spikyWindow.MedianMilliseconds, "latency statistics expose median");
+        Equal(280.0, spikyWindow.P75Milliseconds, "latency statistics expose P75");
+        Equal(1500.0, spikyWindow.P90Milliseconds, "latency statistics expose P90");
+        Equal(1230.0, spikyWindow.JitterMilliseconds, "latency jitter uses P90 minus median");
+        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 900.0, 900.0, 900.0 }), "current latency needs five samples");
+        Equal(false, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 700.0, 800.0, 900.0, 900.0 }), "current median at 800 holds");
+        Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 700.0, 801.0, 801.0, 900.0, 900.0 }), "current median above 800 may optimize");
+        Equal(true, QualityPolicy.CurrentNeedsOptimization(new[] { 900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 100.0, 100.0, 100.0, 100.0 }), "current evaluation uses the complete recent ten-sample window");
         Equal(true, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 500.0, 500.0 }), "candidate median 500 and jitter pass");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 501.0, 501.0, 501.0 }), "candidate median above 500 is not preferred");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 300.0, 400.0, 500.0, 600.0 }), "candidate latency needs five samples");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }), "candidate maximum above 1500 fails");
         Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 100.0, 300.0, 500.0, 700.0, 800.0 }), "candidate jitter above 150 fails");
+        Equal(false, QualityPolicy.CandidateLatencyIsPreferred(new[] { 250.0, 260.0, 270.0, 280.0, 1500.0 }), "candidate tail spike fails robust jitter gate");
         var responsiveServices = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1400, 2,
             new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1500) } });
         var slowService = new CandidateScanResult("target", CandidateHealth.Compatible, null, "ok", 1401, 2,
             new Dictionary<ServiceKind, ProbeResult> { { ServiceKind.Google, ProbeResult.Success(400) }, { ServiceKind.GitHub, ProbeResult.Success(1501) } });
         Equal(true, QualityPolicy.ServicesWithinLimit(responsiveServices), "service response at 1500 passes");
         Equal(false, QualityPolicy.ServicesWithinLimit(slowService), "single slow service rejects quality candidate");
-        double[] slowCurrent = { 700, 801, 900 };
+        double[] slowCurrent = { 700, 801, 801, 900, 900 };
         double[] preferredTarget = { 300, 400, 500, 500, 500 };
         Equal(false, controller.DecideQuality(70, 82, false, true, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "under 20 percent holds");
         Equal(true, controller.DecideQuality(70, 85, false, true, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "over 20 percent switches to preferred latency");
         Equal(false, controller.DecideQuality(70, 90, false, false, true, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "fresh verification required");
         Equal(false, controller.DecideQuality(70, 90, false, true, false, slowCurrent, preferredTarget, responsiveServices).ShouldSwitch, "proven stable history required");
-        Equal(false, controller.DecideQuality(70, 90, false, true, true, new[] { 700.0, 800.0, 900.0 }, preferredTarget, responsiveServices).ShouldSwitch, "current latency not persistently slow holds");
+        Equal(false, controller.DecideQuality(70, 90, false, true, true, new[] { 700.0, 700.0, 800.0, 900.0, 900.0 }, preferredTarget, responsiveServices).ShouldSwitch, "current latency not persistently slow holds");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, new[] { 650.0, 700.0, 800.0, 900.0, 1501.0 }, responsiveServices).ShouldSwitch, "candidate history outside preferred latency cannot switch");
         Equal(false, controller.DecideQuality(70, 90, false, true, true, slowCurrent, preferredTarget, slowService).ShouldSwitch, "single slow service cannot quality switch");
         var reachableTarget = new CandidateScanResult("target", CandidateHealth.BasicCompatible, null, "challenge", 100, 1,
@@ -2683,13 +4024,17 @@ internal static class Tests
         string statePath = Path.Combine(Path.GetTempPath(), "clash-monitor-state-" + Guid.NewGuid().ToString("N"), "health.state");
         var state = new HealthState("old");
         state.Records["节点\t一"] = new NodeHealthRecord("节点\t一", CandidateHealth.Compatible, clock.UtcNow, clock.UtcNow, false);
-        state.Records["香港"] = new NodeHealthRecord("香港", CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
-        state.RememberPreferred("节点\t一", CandidateHealth.Compatible, clock.UtcNow);
+        string healthNodeId = "node-v1-" + new string('I', 43);
+        state.Records["香港"] = new NodeHealthRecord("香港", healthNodeId,
+            CandidateHealth.RegionBlocked, clock.UtcNow, clock.UtcNow, true);
+        state.RememberPreferred("节点\t一", healthNodeId, CandidateHealth.Compatible, clock.UtcNow);
         var store = new StateStore(statePath);
         store.Save(state, state.Records.Keys);
         var loaded = store.Load();
         Equal(2, loaded.Records.Count, "state roundtrip count");
         Equal("节点\t一", loaded.PreferredNode, "preferred node roundtrip");
+        Equal(healthNodeId, loaded.PreferredNodeId, "preferred stable identity roundtrip");
+        Equal(healthNodeId, loaded.Records["香港"].NodeId, "health record stable identity roundtrip");
         Equal(clock.UtcNow, loaded.PreferredNodeVerifiedUtc, "preferred time roundtrip");
         loaded.RememberPreferred("失败节点", CandidateHealth.Transient, clock.UtcNow.AddMinutes(1));
         Equal("节点\t一", loaded.PreferredNode, "failure does not replace preferred node");
@@ -2724,6 +4069,105 @@ internal static class Tests
         private readonly ExitIdentity identity;
         public FakeExitIdentityProbe(ExitIdentity identity) { this.identity = identity; }
         public ExitIdentity Probe(TimeSpan timeout) { return identity; }
+    }
+
+    private static void OpportunityCandidatePlanningBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 21, 11, 0, 0, DateTimeKind.Utc);
+        string scope = "scope";
+        CandidateNode[] candidates = new[] { "current" }
+            .Concat(Enumerable.Range(1, 9).Select(x => "node-" + x.ToString("D2")))
+            .Select(x => new CandidateNode(x, null)).ToArray();
+        Dictionary<string, int> delays = Enumerable.Range(1, 9)
+            .ToDictionary(x => "node-" + x.ToString("D2"), x => x * 10, StringComparer.Ordinal);
+        var experience = new ExperienceData {
+            Nodes = new List<NodeExperience> {
+                new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddHours(-1),
+                    LastUtc = now.AddMinutes(-1), Samples = 6, Success = 1, LastPassed = true,
+                    ResponseMs = 300, RecentResponseMilliseconds = new List<double> { 300, 310, 290 } },
+                new NodeExperience { Scope = scope, Node = "node-07", FirstUtc = now.AddHours(-1),
+                    LastUtc = now.AddMinutes(-2), Samples = 5, Success = 1, LastPassed = true,
+                    ResponseMs = 350, RecentResponseMilliseconds = new List<double> { 350, 340, 360 } }
+            }
+        };
+
+        OpportunityCandidatePlan plan = OpportunityCandidatePlanner.Create(
+            candidates, delays, "current", experience, scope, now);
+
+        Equal("node-01:LiveDelay,node-06:Historical,node-08:Exploration,node-02:LiveDelay," +
+            "node-07:Historical,node-03:LiveDelay,node-04:LiveDelay,node-05:LiveDelay",
+            String.Join(",", plan.Candidates.Select(x => x.Name + ":" + x.Source)),
+            "opportunity plan interleaves five live two historical and one exploration candidate");
+        Equal(8, plan.Candidates.Count, "opportunity plan remains bounded to eight candidates");
+        Equal(5, plan.LiveDelayCount, "opportunity plan carries five live-delay candidates");
+        Equal(2, plan.HistoricalCount, "opportunity plan carries two historical candidates");
+        Equal(1, plan.ExplorationCount, "opportunity plan carries one under-tested candidate");
+        Equal(0, plan.FillCount, "complete source quotas need no fill");
+        Equal(false, plan.Candidates.Any(x => x.Name == "current"),
+            "opportunity plan excludes the current node");
+
+        experience.Nodes.Insert(0, new NodeExperience { Scope = scope, Node = "node-02",
+            FirstUtc = now.AddHours(-1), LastUtc = now.AddMinutes(-1), Samples = 8,
+            Success = 1, LastPassed = true, ResponseMs = 100,
+            RecentResponseMilliseconds = new List<double> { 100, 100, 100 } });
+        OpportunityCandidatePlan overlap = OpportunityCandidatePlanner.Create(
+            candidates, delays, "current", experience, scope, now);
+        Equal(true, overlap.DuplicateRemovalCount > 0,
+            "historical overlap is recorded and never duplicates a live candidate");
+        Equal(overlap.Candidates.Count, overlap.Candidates.Select(x => x.Name).Distinct(StringComparer.Ordinal).Count(),
+            "opportunity plan contains distinct nodes");
+
+        OpportunityCandidatePlan fallback = OpportunityCandidatePlanner.Create(
+            candidates.Take(8), delays, "current", new ExperienceData(), scope, now);
+        Equal("node-01:LiveDelay,node-06:Exploration,node-02:LiveDelay,node-03:LiveDelay," +
+            "node-04:LiveDelay,node-05:LiveDelay,node-07:Fill",
+            String.Join(",", fallback.Candidates.Select(x => x.Name + ":" + x.Source)),
+            "missing history safely falls back to exploration and live-delay fill");
+
+        string[] recovery = StartupRecovery.RankFastCandidates(candidates, delays, "current", 8);
+        Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08",
+            String.Join(",", recovery),
+            "failure recovery remains strict live-delay order");
+
+        OpportunityCandidatePlan empty = OpportunityCandidatePlanner.Create(
+            null, null, "current", null, scope, now);
+        Equal(0, empty.Candidates.Count, "empty opportunity input produces an empty safe plan");
+
+        var stale = new ExperienceData { Nodes = new List<NodeExperience> {
+            new NodeExperience { Scope = scope, Node = "node-06", FirstUtc = now.AddDays(-9),
+                LastUtc = now.AddDays(-8), Samples = 20, Success = 1, LastPassed = true,
+                ResponseMs = 1, RecentResponseMilliseconds = new List<double> { 1, 1, 1 } },
+            new NodeExperience { Scope = "other-scope", Node = "node-07", FirstUtc = now.AddHours(-1),
+                LastUtc = now.AddMinutes(-1), Samples = 20, Success = 1, LastPassed = true,
+                ResponseMs = 1, RecentResponseMilliseconds = new List<double> { 1, 1, 1 } }
+        } };
+        OpportunityCandidatePlan stalePlan = OpportunityCandidatePlanner.Create(
+            candidates, delays, "current", stale, scope, now);
+        Equal(0, stalePlan.HistoricalCount,
+            "stale and foreign-scope history cannot enter opportunity history slots");
+        Equal("node-07", stalePlan.Candidates.First(x => x.Source == OpportunityCandidateSource.Exploration).Name,
+            "foreign-scope history is treated as unseen for deterministic exploration");
+
+        Dictionary<string, int> tiedDelays = candidates.Where(x => x.Name != "current")
+            .ToDictionary(x => x.Name, x => 100, StringComparer.Ordinal);
+        OpportunityCandidatePlan tied = OpportunityCandidatePlanner.Create(
+            candidates, tiedDelays, "current", new ExperienceData(), scope, now);
+        Equal("node-01", tied.Candidates.First().Name,
+            "ordinal node name resolves equal live-delay ordering deterministically");
+        Equal(true, tied.Candidates.Count <= OpportunityCandidatePlanner.MaximumCandidates,
+            "every opportunity plan respects the hard maximum");
+    }
+
+    private sealed class FakeExitAsnResolver : IExitAsnResolver
+    {
+        private readonly ExitAsnResolution resolution;
+        public int Calls { get; private set; }
+        public FakeExitAsnResolver(ExitAsnResolution resolution) { this.resolution = resolution; }
+        public ExitAsnResolution Resolve(ExitIdentity expected, TimeSpan timeout)
+        {
+            Calls++;
+            return resolution;
+        }
     }
 
     private sealed class FakeClock : IClock
@@ -3004,6 +4448,92 @@ internal static class Tests
                 "coordinator distinguishes startup, requested, and scheduled diagnostics");
         }
 
+        var rankingRunner = new TriggeredCycleRunner();
+        using (var coordinator = new MonitorCoordinator(rankingRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, rankingRunner.WaitForRunCount(1, 1000), "candidate ranking waits for initial cycle");
+            coordinator.RequestCandidateRanking();
+            Equal(true, SpinWait.SpinUntil(() => rankingRunner.RankingCount == 1, 1000),
+                "candidate ranking request starts a dedicated measurement");
+            Equal("Startup", String.Join(",", rankingRunner.Triggers()),
+                "candidate ranking request does not execute a monitor decision cycle");
+            Equal(1, coordinator.Latest.CandidateLatencies.Count,
+                "dedicated candidate ranking is published without replacing current status");
+            Equal(MonitorRunState.Running, coordinator.Latest.State,
+                "candidate ranking progress does not replace the main monitor state");
+            Equal("ok", coordinator.Latest.Decision,
+                "candidate ranking progress does not replace the main monitor decision");
+            Equal(true, coordinator.Latest.NextCheckUtc < DateTime.MaxValue,
+                "candidate ranking progress does not suspend the next main check");
+            coordinator.UpdatePreferences(new UserPreferences {
+                FirstRunComplete = true,
+                RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Discord }
+            });
+            Equal(0, coordinator.Latest.CandidateLatencies.Count,
+                "service selection changes clear stale candidate website columns");
+            Equal(1, rankingRunner.InvalidationCount,
+                "service selection changes invalidate the runner-side ranking cache");
+        }
+
+
+        var throwingRankingRunner = new ThrowingCandidateLatencyRunner();
+        using (var coordinator = new MonitorCoordinator(throwingRankingRunner,
+            TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, throwingRankingRunner.WaitForRunCount(1, 1000),
+                "ranking failure fixture completes initial monitor cycle");
+            MonitorSnapshot before = coordinator.Latest;
+            coordinator.RequestCandidateRanking();
+            Equal(true, SpinWait.SpinUntil(() => throwingRankingRunner.RankingCount == 1, 1000),
+                "ranking failure fixture executes the dedicated request");
+            Thread.Sleep(80);
+            Equal(before.State, coordinator.Latest.State,
+                "candidate ranking failure does not degrade the main monitor state");
+            Equal(before.Decision, coordinator.Latest.Decision,
+                "candidate ranking failure does not replace the main monitor decision");
+            Equal(before.NextCheckUtc, coordinator.Latest.NextCheckUtc,
+                "candidate ranking failure does not replace the next main check");
+        }
+
+        var delayedRankingRunner = new BlockingCandidateLatencyRunner();
+        using (var coordinator = new MonitorCoordinator(delayedRankingRunner,
+            TimeSpan.FromHours(1), TimeSpan.FromSeconds(5)))
+        {
+            int preferencesChanged = 0;
+            int staleRankings = 0;
+            coordinator.SnapshotChanged += snapshot => {
+                if (Volatile.Read(ref preferencesChanged) != 0 && snapshot.CandidateLatencies.Count > 0)
+                    Interlocked.Increment(ref staleRankings);
+            };
+            coordinator.Start();
+            Equal(true, delayedRankingRunner.WaitForRunCount(1, 1000),
+                "delayed ranking fixture completes the initial cycle");
+            coordinator.RequestCandidateRanking();
+            try
+            {
+                Equal(true, delayedRankingRunner.WaitUntilRankingStarts(1000),
+                    "delayed ranking fixture pauses candidate measurement");
+                Interlocked.Exchange(ref preferencesChanged, 1);
+                coordinator.UpdatePreferences(new UserPreferences {
+                    FirstRunComplete = true,
+                    RequiredServices = new List<ServiceKind> {
+                        ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Discord }
+                });
+            }
+            finally { delayedRankingRunner.Release(); }
+            Equal(true, delayedRankingRunner.WaitForRunCount(2, 1000),
+                "preference change starts a fresh cycle after the old ranking");
+            Equal(0, staleRankings,
+                "old dedicated ranking cannot publish after selected services change");
+        }
+
+    }
+
+    private sealed class FixedTrafficMeter : ITrafficMeter
+    {
+        public long GetTotalBytes() { return 0; }
     }
 
     private static void BrowserVerificationUiBehavior()
@@ -3167,10 +4697,12 @@ internal static class Tests
         public void Release() { released.Set(); }
     }
 
-    private sealed class TriggeredCycleRunner : ITriggeredCycleRunner
+    private sealed class TriggeredCycleRunner : ITriggeredCycleRunner, ICandidateLatencyRunner, IProgressCycleRunner
     {
         private readonly object gate = new object();
         private readonly List<MonitorCycleTrigger> triggers = new List<MonitorCycleTrigger>();
+        private int rankingCount;
+        private int invalidationCount;
         public MonitorSnapshot Run(UserPreferences preferences)
         { return Run(preferences, MonitorCycleTrigger.Scheduled); }
         public MonitorSnapshot Run(UserPreferences preferences, MonitorCycleTrigger trigger)
@@ -3183,6 +4715,82 @@ internal static class Tests
         public bool WaitForRunCount(int count, int milliseconds)
         { return SpinWait.SpinUntil(() => { lock (gate) return triggers.Count >= count; }, milliseconds); }
         public MonitorCycleTrigger[] Triggers() { lock (gate) return triggers.ToArray(); }
+        public int RankingCount { get { return Volatile.Read(ref rankingCount); } }
+        public int InvalidationCount { get { return Volatile.Read(ref invalidationCount); } }
+        public event Action<MonitorSnapshot> Progress;
+        public Func<bool> ShouldStop { get; set; }
+        public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref rankingCount);
+            var progress = Progress;
+            if (progress != null)
+                progress(MonitorSnapshot.CreateState(MonitorRunState.Checking,
+                    "正在实测候选", DateTime.UtcNow, DateTime.MaxValue));
+            return new List<CandidateLatencyMeasurement> {
+                new CandidateLatencyMeasurement("candidate", "JP", 50,
+                    new[] { new ServiceMeasurement(ServiceKind.ChatGPT, true, 100, "ok") },
+                    DateTime.UtcNow)
+            }.AsReadOnly();
+        }
+        public void InvalidateCandidateLatencies()
+        {
+            Interlocked.Increment(ref invalidationCount);
+        }
+    }
+
+    private sealed class ThrowingCandidateLatencyRunner : IMonitorCycleRunner, ICandidateLatencyRunner, IProgressCycleRunner
+    {
+        private int runCount;
+        private int rankingCount;
+        public int RankingCount { get { return Volatile.Read(ref rankingCount); } }
+        public event Action<MonitorSnapshot> Progress;
+        public Func<bool> ShouldStop { get; set; }
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "main healthy",
+                DateTime.UtcNow, DateTime.UtcNow.AddHours(1));
+        }
+        public bool WaitForRunCount(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= count, milliseconds); }
+        public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref rankingCount);
+            var progress = Progress;
+            if (progress != null)
+                progress(MonitorSnapshot.CreateState(MonitorRunState.Checking,
+                    "正在实测候选后失败", DateTime.UtcNow, DateTime.MaxValue));
+            throw new InvalidOperationException("ranking failed");
+        }
+        public void InvalidateCandidateLatencies() { }
+    }
+
+    private sealed class BlockingCandidateLatencyRunner : IMonitorCycleRunner, ICandidateLatencyRunner
+    {
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        private int runCount;
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "ok",
+                DateTime.UtcNow, DateTime.UtcNow.AddHours(1));
+        }
+        public bool WaitForRunCount(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= count, milliseconds); }
+        public bool WaitUntilRankingStarts(int milliseconds) { return entered.Wait(milliseconds); }
+        public void Release() { released.Set(); }
+        public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+        {
+            entered.Set();
+            released.Wait(TimeSpan.FromSeconds(5));
+            return new List<CandidateLatencyMeasurement> {
+                new CandidateLatencyMeasurement("old-candidate", "JP", 50,
+                    new[] { new ServiceMeasurement(ServiceKind.ChatGPT, true, 100, "ok") },
+                    DateTime.UtcNow)
+            }.AsReadOnly();
+        }
+        public void InvalidateCandidateLatencies() { }
     }
 
     private sealed class DegradedCycleRunner : IMonitorCycleRunner
@@ -3282,7 +4890,7 @@ internal static class Tests
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.6"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.15"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

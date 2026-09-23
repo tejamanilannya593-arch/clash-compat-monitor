@@ -6,7 +6,7 @@ using System.Windows.Forms;
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.7.0-preview.6";
+    public const string Version = "0.7.0-preview.15";
 }
 
 public static class Program
@@ -16,6 +16,9 @@ public static class Program
     {
         MonitorOptions options = MonitorOptions.Parse(args);
         MonitorConfiguration config = MonitorConfiguration.CreateDefault();
+        byte[] identityKey = ExitIdentityKey.LoadOrCreate(config.IdentityKeyPath);
+        var nodeIdentities = new ClashNodeIdentitySource(
+            config.ClashConfigPath, config.ClashProfilesPath, identityKey);
         var logger = new BoundedLogger(config.LogPath, 1024 * 1024);
         try
         {
@@ -37,10 +40,10 @@ public static class Program
                     if (!headlessClient.IsAvailable()) throw new InvalidOperationException("Mihomo pipe is unavailable.");
                     using (var probe = new HttpServiceProbe(config.ProbeProxy))
                     {
-                        var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
-                            Path.Combine(config.RootPath, "state", "identity.key"));
+                        var exitProbe = new CloudflareExitIdentityProbe(
+                            config.ProbeProxy, identityKey, config.ExitNetworkEvidencePath);
                         var worker = new MonitorWorker(config, headlessClient, probe, logger, new SystemClock(), exitProbe,
-                            new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"));
+                            new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"), nodeIdentities);
                         worker.RunOnce(options.DryRun, new UserPreferenceStore(config.PreferencesPath).Load());
                     }
                 }
@@ -57,10 +60,10 @@ public static class Program
                 Application.SetCompatibleTextRenderingDefault(false);
                 using (var probe = new HttpServiceProbe(config.ProbeProxy))
                 {
-                    var exitProbe = new CloudflareExitIdentityProbe(config.ProbeProxy,
-                        Path.Combine(config.RootPath, "state", "identity.key"));
+                    var exitProbe = new CloudflareExitIdentityProbe(
+                        config.ProbeProxy, identityKey, config.ExitNetworkEvidencePath);
                     var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe,
-                        new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"));
+                        new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"), nodeIdentities);
                     using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
                     using (var tray = new TrayHost(coordinator, preferenceStore, preferences))
                     {
@@ -127,8 +130,11 @@ public sealed class MonitorConfiguration
     public string StatePath;
     public string QualityStatePath;
     public string PreferencesPath;
+    public string ExitNetworkEvidencePath;
     public string LogPath;
     public string ClashConfigPath;
+    public string ClashProfilesPath;
+    public string IdentityKeyPath;
     public string DelayProbeUrl = "https://www.gstatic.com/generate_204";
     public string ThroughputProbeUrl = "https://speed.cloudflare.com/__down?bytes=1048576";
     public TimeSpan QualityRefreshInterval = TimeSpan.FromHours(6);
@@ -144,8 +150,11 @@ public sealed class MonitorConfiguration
             StatePath = Path.Combine(root, "state", "health.state"),
             QualityStatePath = Path.Combine(root, "state", "quality.state"),
             PreferencesPath = Path.Combine(root, "state", "preferences.state"),
+            ExitNetworkEvidencePath = Path.Combine(root, "state", "exit-network.state"),
             LogPath = Path.Combine(root, "logs", "monitor.log"),
-            ClashConfigPath = Path.Combine(roaming, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml")
+            ClashConfigPath = Path.Combine(roaming, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml"),
+            ClashProfilesPath = Path.Combine(roaming, "io.github.clash-verge-rev.clash-verge-rev", "profiles.yaml"),
+            IdentityKeyPath = Path.Combine(root, "state", "identity.key")
         };
     }
 }

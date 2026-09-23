@@ -82,7 +82,7 @@ try {
         Where-Object { $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath) -eq [IO.Path]::GetFullPath($target) })
     if ($running.Count -ne 1) { throw 'Expected exactly one monitor process.' }
     foreach ($record in $before) { if ((Get-FileHash -LiteralPath $record.Path).Hash -ne $record.Hash) { throw 'A protected Clash file changed.' } }
-    [pscustomobject]@{Version='0.7.0-preview.6';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true;LegacyBrowserCompanionRemoved=$true} | ConvertTo-Json -Compress
+    [pscustomobject]@{Version='0.7.0-preview.15';ProcessId=$running[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true;LegacyBrowserCompanionRemoved=$true} | ConvertTo-Json -Compress
 } catch {
     Stop-InstalledMonitor
     Stop-LegacyHost

@@ -10,17 +10,27 @@ using System.Threading;
 
 public sealed class ExitIdentity
 {
-    public ExitIdentity(string fingerprint, string countryCode, string detail)
+    public ExitIdentity(string fingerprint, string countryCode, string detail,
+        long? asn = null, DateTime? observedUtc = null)
     {
         Fingerprint = fingerprint ?? "";
         CountryCode = countryCode ?? "";
         Detail = detail ?? "";
+        Asn = asn;
+        ObservedUtc = observedUtc ?? DateTime.MinValue;
     }
 
     public string Fingerprint { get; private set; }
     public string CountryCode { get; private set; }
     public string Detail { get; private set; }
+    public long? Asn { get; private set; }
+    public DateTime ObservedUtc { get; private set; }
     public bool Known { get { return Fingerprint.Length > 0 && CountryCode.Length == 2; } }
+
+    public ExitIdentity WithAsn(long asn, DateTime observedUtc)
+    {
+        return new ExitIdentity(Fingerprint, CountryCode, Detail, asn, observedUtc);
+    }
 }
 
 public static class ExitIdentityParser
@@ -44,10 +54,7 @@ public static class ExitIdentityParser
             return new ExitIdentity("", "", "trace did not contain a two-letter country code");
 
         country = country.Trim().ToUpperInvariant();
-        byte[] digest;
-        using (var hmac = new HMACSHA256(key))
-            digest = hmac.ComputeHash(Encoding.UTF8.GetBytes(ip.Trim()));
-        return new ExitIdentity(BitConverter.ToString(digest).Replace("-", ""), country, "ok");
+        return new ExitIdentity(ExitIdentityKey.Fingerprint(ip, key), country, "ok");
     }
 }
 
@@ -61,11 +68,37 @@ public sealed class CloudflareExitIdentityProbe : IExitIdentityProbe
     private static readonly Uri Endpoint = new Uri("https://www.cloudflare.com/cdn-cgi/trace");
     private readonly string proxyUrl;
     private readonly byte[] key;
+    private readonly ExitNetworkEvidenceEnricher enricher;
+    private readonly IClock clock;
 
     public CloudflareExitIdentityProbe(string proxyUrl, string keyPath)
+        : this(proxyUrl, keyPath, Path.Combine(Path.GetDirectoryName(keyPath) ?? "", "exit-network.state"))
+    {
+    }
+
+    public CloudflareExitIdentityProbe(string proxyUrl, string keyPath, string evidencePath)
+        : this(proxyUrl, ExitIdentityKey.LoadOrCreate(keyPath), evidencePath)
+    {
+    }
+
+    public CloudflareExitIdentityProbe(string proxyUrl, byte[] identityKey, string evidencePath)
+    {
+        this.proxyUrl = proxyUrl;
+        if (identityKey == null || identityKey.Length < 16)
+            throw new ArgumentException("Identity key is unavailable.", "identityKey");
+        key = (byte[])identityKey.Clone();
+        clock = new SystemClock();
+        enricher = new ExitNetworkEvidenceEnricher(new IpWhoExitAsnResolver(proxyUrl, key),
+            new ExitNetworkEvidenceStore(evidencePath));
+    }
+
+    public CloudflareExitIdentityProbe(string proxyUrl, string keyPath,
+        IExitAsnResolver resolver, ExitNetworkEvidenceStore store, IClock clock)
     {
         this.proxyUrl = proxyUrl;
         key = ExitIdentityKey.LoadOrCreate(keyPath);
+        this.clock = clock ?? new SystemClock();
+        enricher = new ExitNetworkEvidenceEnricher(resolver, store);
     }
 
     public ExitIdentity Probe(TimeSpan timeout)
@@ -88,7 +121,12 @@ public sealed class CloudflareExitIdentityProbe : IExitIdentityProbe
                     using (Stream stream = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
                     {
                         byte[] body = HttpServiceProbe.ReadLimitedAsync(stream, 4096, cancellation.Token).GetAwaiter().GetResult();
-                        return ExitIdentityParser.Parse(Encoding.UTF8.GetString(body), key);
+                        ExitIdentity parsed = ExitIdentityParser.Parse(Encoding.UTF8.GetString(body), key);
+                        if (!parsed.Known) return parsed;
+                        DateTime observedUtc = clock.UtcNow;
+                        var observed = new ExitIdentity(parsed.Fingerprint, parsed.CountryCode,
+                            parsed.Detail, null, observedUtc);
+                        return enricher.Enrich(observed, observedUtc, timeout);
                     }
                 }
             }
@@ -103,6 +141,14 @@ public sealed class CloudflareExitIdentityProbe : IExitIdentityProbe
 
 public static class ExitIdentityKey
 {
+    public static string Fingerprint(string rawIp, byte[] key)
+    {
+        if (String.IsNullOrWhiteSpace(rawIp) || key == null || key.Length == 0) return "";
+        using (var hmac = new HMACSHA256(key))
+            return BitConverter.ToString(hmac.ComputeHash(Encoding.UTF8.GetBytes(rawIp.Trim())))
+                .Replace("-", "");
+    }
+
     public static byte[] LoadOrCreate(string path)
     {
         if (String.IsNullOrWhiteSpace(path)) throw new ArgumentException("Identity key path is required.", "path");

@@ -39,8 +39,55 @@ public sealed class BoundedLogger
     }
 }
 
+internal sealed class CandidateLatencyStore
+{
+    private readonly object gate = new object();
+    private int generation;
+    private IList<CandidateLatencyMeasurement> current = Empty();
+
+    public IList<CandidateLatencyMeasurement> Current
+    {
+        get { lock (gate) return current; }
+    }
+
+    public int BeginMeasurement()
+    {
+        lock (gate) return generation;
+    }
+
+    public bool TryPublish(int measuredGeneration, IList<CandidateLatencyMeasurement> value,
+        out IList<CandidateLatencyMeasurement> published)
+    {
+        lock (gate)
+        {
+            if (measuredGeneration != generation)
+            {
+                published = Empty();
+                return false;
+            }
+            current = value ?? Empty();
+            published = current;
+            return true;
+        }
+    }
+
+    public void Invalidate()
+    {
+        lock (gate)
+        {
+            generation++;
+            current = Empty();
+        }
+    }
+
+    private static IList<CandidateLatencyMeasurement> Empty()
+    {
+        return new List<CandidateLatencyMeasurement>().AsReadOnly();
+    }
+}
+
 public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner, IAccountVerificationRunner,
-    ITriggeredCycleRunner
+    ITriggeredCycleRunner, ICandidateLatencyRunner
 {
     private readonly MonitorConfiguration config;
     private readonly IMihomoClient mihomo;
@@ -49,8 +96,16 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly IClock clock;
     private readonly FailoverController controller;
     private readonly TrafficGuard trafficGuard;
+    private readonly ITrafficMeter trafficMeter;
     private readonly IProxyPathHealthChecker pathHealthChecker;
     private readonly Func<RuntimeSnapshot> runtimeSnapshotProvider;
+    private readonly INodeIdentitySource nodeIdentitySource;
+    private IDictionary<string, CandidateNode> activeCandidatesByName =
+        new Dictionary<string, CandidateNode>(StringComparer.Ordinal);
+    private IDictionary<string, string> activeStrongIdsByName =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+    private IDictionary<string, string> activeNamesByStrongId =
+        new Dictionary<string, string>(StringComparer.Ordinal);
     private DateTime lastQualityRefreshUtc = DateTime.MinValue;
     private int running;
     private int accountCommandRunning;
@@ -62,6 +117,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private ExperienceData experience;
     private readonly RegionEligibilityStore regionEligibilityStore;
     private readonly RegionEligibilityCache regionEligibility;
+    private readonly CandidateLatencyStore candidateLatencyStore = new CandidateLatencyStore();
     private bool firstCompletedCycle = true;
     public event Action<MonitorSnapshot> Progress;
     public Func<bool> ShouldStop { get; set; }
@@ -72,29 +128,32 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     {
         CheckStop();
         var handler = Progress;
-        if (handler != null) handler(evidence == null
+        if (handler != null) handler((evidence == null
             ? MonitorSnapshot.CreateState(MonitorRunState.Checking, stage, DateTime.MinValue, DateTime.MaxValue)
-            : evidence.WithProgress(stage));
+            : evidence.WithProgress(stage)).WithCandidateLatencies(candidateLatencyStore.Current));
     }
 
     public MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe, BoundedLogger logger, IClock clock,
-        IExitIdentityProbe exitIdentityProbe = null, IProxyPathHealthChecker pathHealthChecker = null)
-        : this(config, mihomo, probe, logger, clock, exitIdentityProbe, pathHealthChecker, null)
+        IExitIdentityProbe exitIdentityProbe = null, IProxyPathHealthChecker pathHealthChecker = null,
+        INodeIdentitySource nodeIdentitySource = null)
+        : this(config, mihomo, probe, logger, clock, exitIdentityProbe, pathHealthChecker, null, nodeIdentitySource)
     {
     }
 
     internal MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe,
         BoundedLogger logger, IClock clock, IExitIdentityProbe exitIdentityProbe,
-        IProxyPathHealthChecker pathHealthChecker, Func<RuntimeSnapshot> runtimeSnapshotProvider)
+        IProxyPathHealthChecker pathHealthChecker, Func<RuntimeSnapshot> runtimeSnapshotProvider,
+        INodeIdentitySource nodeIdentitySource = null, ITrafficMeter trafficMeter = null)
     {
         this.config = config;
         this.mihomo = mihomo;
-        this.scanner = new CompatibilityScanner(mihomo, probe, config.ProbeGroup, exitIdentityProbe);
+        this.scanner = new CompatibilityScanner(mihomo, probe, config.ProbeGroup, exitIdentityProbe, clock);
         scanner.ShouldStop = StopRequired;
         this.logger = logger;
         this.clock = clock;
         this.pathHealthChecker = pathHealthChecker;
         this.runtimeSnapshotProvider = runtimeSnapshotProvider ?? delegate { return RuntimeInspector.Capture(mihomo); };
+        this.nodeIdentitySource = nodeIdentitySource;
         experienceStore = new ExperienceStore(Path.Combine(config.RootPath, "state", "experience.json"));
         experience = experienceStore.Load();
         regionEligibilityStore = new RegionEligibilityStore(
@@ -103,6 +162,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         if (experience.Assurance == null || experience.Assurance.Standbys == null) experience.Assurance = new ConnectionAssurance();
         controller = new FailoverController(clock, config.MinimumHold);
         trafficGuard = new TrafficGuard(clock, 3.0 * 1024 * 1024, TimeSpan.FromMinutes(5));
+        this.trafficMeter = trafficMeter ?? new SystemTrafficMeter();
     }
 
     public void RunOnce(bool dryRun)
@@ -121,6 +181,37 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         return RunOnce(false, preferences);
     }
 
+    public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+    {
+        if (preferences == null) throw new ArgumentNullException("preferences");
+        if (preferences.RequiredServices == null || preferences.RequiredServices.Count == 0)
+            throw new ArgumentException("At least one required service is needed.", "preferences");
+        if (System.Threading.Interlocked.Exchange(ref running, 1) != 0) return candidateLatencyStore.Current;
+        try
+        {
+            int generation = candidateLatencyStore.BeginMeasurement();
+            cycleTimer = Stopwatch.StartNew();
+            IList<CandidateNode> candidates = DiscoverCandidates();
+            string current = mihomo.GetSelected(config.SharedGroup);
+            IList<CandidateLatencyMeasurement> measured = MeasureCandidateLatencies(candidates, current,
+                UserPreferencePolicy.NormalizeServices(preferences.RequiredServices));
+            IList<CandidateLatencyMeasurement> published;
+            candidateLatencyStore.TryPublish(generation, measured, out published);
+            return published;
+        }
+        finally
+        {
+            cycleTimer = null;
+            System.Threading.Volatile.Write(ref running, 0);
+            MemoryTrimmer.TrimIdleWorkingSet();
+        }
+    }
+
+    public void InvalidateCandidateLatencies()
+    {
+        candidateLatencyStore.Invalidate();
+    }
+
     public bool RestorePrevious()
     {
         if (String.IsNullOrWhiteSpace(previousSelectedNode)) return false;
@@ -133,6 +224,12 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         CheckStop();
         if (mihomo.GetSelected(config.SharedGroup) != current) return false;
         SelectRecorded(current, target, "用户恢复上一个节点（已复检）");
+        ConnectionAssurance assurance = experience.Assurance;
+        assurance.EnsureDecisionState(target, clock.UtcNow);
+        ApplyDecision(assurance, AutomaticDecisionEvent.ManualNodeChanged,
+            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = target,
+                ExpiresUtc = clock.UtcNow.AddMinutes(10),
+                Reason = "user restored previous node" });
         previousSelectedNode = current;
         controller.RecordSwitch();
         logger.Write("restored previous node=" + SafeName(target));
@@ -160,7 +257,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 !String.Equals(mihomo.GetSelected(config.SharedGroup), node, StringComparison.Ordinal)) return false;
             AccountVerificationMemory.MarkBrowserConversation(experience, experience.ActiveScope, node,
                 fresh.ExitFingerprint, service, verifiedUtc, protocolVersion);
-            experienceStore.Save(experience, verifiedUtc);
+            SaveExperience(verifiedUtc);
             logger.Write("browser conversation proof recorded node=" + SafeName(node) + " service=" + service);
             return true;
         }
@@ -193,12 +290,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 if (ServiceEvidencePolicy.CanEmergencySwitch(verified) && mihomo.GetSelected(config.SharedGroup) == current &&
                     assurance.CanUserFeedbackRollback(current, clock.UtcNow))
                 {
-                    SelectRecorded(current, previous, "用户反馈 AI 服务失败，旧节点复检通过，自动回退");
-                    previousSelectedNode = current;
-                    assurance.Target = null;
-                    assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
-                    controller.RecordSwitch();
-                    logger.Write("user feedback rollback node=" + SafeName(previous));
+                    DecisionTransition authorization = ApplyDecision(assurance,
+                        AutomaticDecisionEvent.RollbackRequired,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                            Current = current, Previous = current, Target = previous,
+                            Reason = "user feedback rollback verified" });
+                    if (ApplyAutomaticSwitch(assurance, authorization, current, previous,
+                        "用户反馈 AI 服务失败，旧节点复检通过，自动回退",
+                        assurance.PreviousResponse, false, false))
+                    {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.ObservationComplete,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = previous, ExpiresUtc = clock.UtcNow.AddMinutes(30),
+                                Reason = "user feedback rollback completed" });
+                        assurance.Target = null;
+                        assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
+                        logger.Write("user feedback rollback node=" + SafeName(previous));
+                    }
                 }
             }
             finally
@@ -207,7 +315,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 System.Threading.Volatile.Write(ref accountCommandRunning, 0);
             }
         }
-        experienceStore.Save(experience, reportedUtc);
+        SaveExperience(reportedUtc);
     }
 
     public void ReportBrowserConversationFailure(string node, string exitFingerprint, ServiceKind service,
@@ -246,12 +354,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             mihomo.GetSelected(config.SharedGroup) == current &&
                             assurance.ShouldRecheckPreviousAfterBrowserResult(current, outcome, messageSent, clock.UtcNow))
                         {
-                            SelectRecorded(current, previous, "浏览器真实对话失败，旧节点复检通过，自动回退");
-                            previousSelectedNode = current;
-                            assurance.Target = null;
-                            assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
-                            controller.RecordSwitch();
-                            logger.Write("browser proof rollback node=" + SafeName(previous));
+                            DecisionTransition authorization = ApplyDecision(assurance,
+                                AutomaticDecisionEvent.RollbackRequired,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Previous = current, Target = previous,
+                                    Reason = "browser proof rollback verified" });
+                            if (ApplyAutomaticSwitch(assurance, authorization, current, previous,
+                                "浏览器真实对话失败，旧节点复检通过，自动回退",
+                                assurance.PreviousResponse, false, false))
+                            {
+                                ApplyDecision(assurance, AutomaticDecisionEvent.ObservationComplete,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = previous, ExpiresUtc = clock.UtcNow.AddMinutes(30),
+                                        Reason = "browser proof rollback completed" });
+                                assurance.Target = null;
+                                assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
+                                logger.Write("browser proof rollback node=" + SafeName(previous));
+                            }
                         }
                     }
                 }
@@ -262,7 +381,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 System.Threading.Volatile.Write(ref accountCommandRunning, 0);
             }
         }
-        experienceStore.Save(experience, reportedUtc);
+        SaveExperience(reportedUtc);
     }
 
     public MonitorSnapshot RunOnce(bool dryRun, UserPreferences preferences)
@@ -293,16 +412,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 return MonitorSnapshot.CreateState(MonitorRunState.Degraded, ipv6Action, clock.UtcNow,
                     clock.UtcNow.Add(config.CycleInterval));
             }
-            IDictionary<string, string> runtimeTypes = null;
-            var catalogClient = mihomo as MihomoPipeClient;
-            if (catalogClient != null)
-            {
-                try { runtimeTypes = catalogClient.GetProxyTypes(); }
-                catch (IOException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
-                catch (TimeoutException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
-                catch (ArgumentException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
-            }
-            IList<CandidateNode> candidates = CandidateCatalog.Filter(mihomo.GetChoices(config.SharedGroup), runtimeTypes);
+            IList<CandidateNode> candidates = DiscoverCandidates();
             if (candidates.Count == 0)
             {
                 logger.Write("no eligible candidates");
@@ -311,12 +421,23 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             }
             var store = new StateStore(config.StatePath);
             HealthState state = store.Load();
-            string fingerprint = Fingerprint(candidates);
+            if (nodeIdentitySource != null) ReconcileHealthState(state);
             string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
-            string memoryScope = experience.ResolveScope(fingerprint, candidates.Select(x => x.Name), servicesKey);
-            logger.Write("subscription candidates=" + candidates.Count + " continuity=" + experience.ScopeContinuityReason);
+            IList<string> strongNodeIds = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+                NodeIdentity.IsStrong(x.NodeId)).Select(x => x.NodeId).Distinct(StringComparer.Ordinal).ToList();
+            IList<string> scopeNodeKeys = nodeIdentitySource == null
+                ? candidates.Select(x => x.Name).ToList() : strongNodeIds;
+            string fingerprint = Fingerprint(scopeNodeKeys);
+            string memoryScope = experience.ResolveScope(fingerprint, scopeNodeKeys, servicesKey);
+            logger.Write("subscription candidates=" + candidates.Count + " strong_identities=" + strongNodeIds.Count +
+                " continuity=" + experience.ScopeContinuityReason);
             ConnectionAssurance assurance = experience.Assurance;
             assurance.SetScope(memoryScope);
+            if (nodeIdentitySource != null)
+            {
+                assurance.ReconcileIdentities(activeNamesByStrongId, clock.UtcNow);
+                ReconcileAccountVerifications();
+            }
             var requiredServices = preferences.RequiredServices.Distinct().ToList();
             var suppressedServices = requiredServices.Where(x =>
                 ServiceIncidentPolicy.IsActive(experience.ServiceIncidents, x, clock.UtcNow)).ToList();
@@ -325,14 +446,28 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             if (suppressedServices.Count > 0)
                 logger.Write("service circuit active services=" + String.Join(",", suppressedServices));
             bool subscriptionChanged = !String.Equals(state.SubscriptionFingerprint, fingerprint, StringComparison.Ordinal);
+            if (subscriptionChanged) InvalidateCandidateLatencies();
             state.ApplySubscriptionFingerprint(fingerprint);
             var qualityStore = new QualityStateStore(config.QualityStatePath);
             List<QualitySample> qualityHistory = qualityStore.Load();
             string current = mihomo.GetSelected(config.SharedGroup);
+            string previouslyObservedNode = experience.LastNode;
+            assurance.EnsureDecisionState(current, clock.UtcNow);
+            if (!String.IsNullOrEmpty(previouslyObservedNode) &&
+                !String.Equals(previouslyObservedNode, current, StringComparison.Ordinal))
+            {
+                ApplyDecision(assurance, AutomaticDecisionEvent.ManualNodeChanged,
+                    new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                        ExpiresUtc = clock.UtcNow.AddMinutes(10), Reason = "external selector change" });
+                assurance.Target = null;
+                assurance.Previous = null;
+                assurance.PendingOptimization = null;
+                assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(10);
+            }
             ProxyPathHealth pathHealth = null;
             string cycleStartNode = current;
             experience.RecordChange(experience.LastNode, current, "检测到外部变更（Clash 手动选择或核心重载）", clock.UtcNow);
-            experienceStore.Save(experience, clock.UtcNow);
+            SaveExperience(clock.UtcNow);
             Report("正在检测当前节点：" + current, null);
             CandidateNode currentCandidate = candidates.FirstOrDefault(x => x.Name == current);
             CandidateScanResult currentScan = currentCandidate == null ? new CandidateScanResult(current ?? "", CandidateHealth.Transient, null, "current not eligible") : scanner.ScanSelected(currentCandidate, requiredServices);
@@ -351,7 +486,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             logger.Write("current check completed elapsed_seconds=" + cycleTimer.Elapsed.TotalSeconds.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) +
                 " health=" + currentScan.Health);
             string assuranceDecision = null;
-            bool observing = !String.IsNullOrEmpty(assurance.Target);
+            bool observing = assurance.Decision.State == AutomaticDecisionState.Observing;
             string serviceIncidentDecision = suppressedServices.Count == 0 || currentScan.Health != CandidateHealth.Unknown ? null :
                 ServiceIncidentText(suppressedServices) + " 多节点同类异常，熔断观察中，不归因于节点";
             var scans = new Dictionary<string, CandidateScanResult>(StringComparer.Ordinal);
@@ -386,10 +521,31 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 currentFailureConfirmed = severeLatency
                     ? StartupRecovery.ConfirmsSevereLatency(confirmation, failedService)
                     : confirmation.Health != CandidateHealth.Unknown && !ConnectionAssurance.Passed(confirmation);
+                DecisionEvidenceClass evidenceClass = DecisionEvidencePolicy.Classify(
+                    confirmation, severeLatency && currentFailureConfirmed);
                 logger.Write("current failure confirmation node=" + SafeName(current) + " service=" + failedService +
-                    " health=" + confirmation.Health + " confirmed=" + currentFailureConfirmed.ToString().ToLowerInvariant());
+                    " health=" + confirmation.Health + " confirmed=" + currentFailureConfirmed.ToString().ToLowerInvariant() +
+                    " evidence=" + evidenceClass);
                 if (currentFailureConfirmed)
                 {
+                    assurance.ClearPendingOptimization();
+                    if (evidenceClass == DecisionEvidenceClass.HardFailure)
+                    {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.HardFailure,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Service = failedService, Evidence = evidenceClass,
+                                Reason = "confirmed hard failure" });
+                        ApplyDecision(assurance, AutomaticDecisionEvent.FailureConfirmed,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Service = failedService, Evidence = evidenceClass });
+                    }
+                    else
+                    {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.SevereDegradation,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Service = failedService, Evidence = evidenceClass,
+                                Reason = "confirmed severe degradation" });
+                    }
                     var incidentChecks = new List<CandidateScanResult>();
                     List<CandidateNode> delayPool = candidates.Where(x => x.Name != current).ToList();
                     Stopwatch delayTimer = Stopwatch.StartNew();
@@ -445,13 +601,47 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(replacementScan);
                         double selectedResponse = QualityMeasurement.ResponseMilliseconds(replacementScan, 5000);
                         selectedResponseForLog = selectedResponse;
+                        if (severeLatency)
+                        {
+                            ProbeResult slowResult;
+                            double severeBaseline = confirmation.ServiceResults.TryGetValue(failedService, out slowResult) &&
+                                slowResult != null ? slowResult.ElapsedMilliseconds : failedNodeResponse;
+                            MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
+                                severeBaseline, selectedResponse,
+                                assurance.HasRecentAutomaticSwitch(clock.UtcNow));
+                            logger.Write("severe degradation target=" + SafeName(standby) +
+                                " baseline_ms=" + severeBaseline.ToString("F0") +
+                                " target_ms=" + selectedResponse.ToString("F0") +
+                                " relative=" + improvement.RelativeImprovement.ToString("P1") +
+                                " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                                " required_relative=" + improvement.RequiredRelativeImprovement.ToString("P0") +
+                                " required_absolute_ms=" + improvement.RequiredAbsoluteImprovementMilliseconds.ToString("F0") +
+                                " accepted=" + improvement.Accepted.ToString().ToLowerInvariant() +
+                                " reason=" + improvement.Reason);
+                            if (!improvement.Accepted) break;
+                            SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
+                            if (!budget.Allowed)
+                            {
+                                ApplyDecision(assurance, AutomaticDecisionEvent.BudgetExhausted,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = current, ExpiresUtc = budget.AllowedAtUtc,
+                                        Evidence = evidenceClass, Reason = budget.Reason });
+                                assuranceDecision = "自动切换次数达到预算，进入稳定观察";
+                                break;
+                            }
+                        }
+                        DecisionTransition switchTransition = ApplyDecision(assurance,
+                            AutomaticDecisionEvent.RecoveryTargetReady,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = failedNode, Previous = failedNode, Target = standby,
+                                Service = failedService, Evidence = evidenceClass,
+                                BaselineResponse = failedNodeResponse,
+                                TargetResponse = selectedResponse });
                         string fastSelectionSummary = StartupRecovery.FastSelectionSummary(selectedResponse);
                         string fastReason = severeLatency ? "当前节点单项响应超过 2000 ms，" + fastSelectionSummary + "完整验证通过" :
                             "当前节点故障，" + fastSelectionSummary + "完整验证通过，快速切换";
-                        SelectRecorded(failedNode, standby, fastReason);
-                        assurance.Begin(failedNode, standby, failedNodeResponse, false, provisional, clock.UtcNow);
-                        previousSelectedNode = failedNode;
-                        controller.RecordSwitch();
+                        if (!ApplyAutomaticSwitch(assurance, switchTransition, failedNode,
+                            standby, fastReason, failedNodeResponse, false, provisional)) continue;
                         current = standby;
                         currentCandidate = standbyCandidate;
                         currentScan = replacementScan;
@@ -466,34 +656,57 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             " response_ms=" + selectedResponse.ToString("F0"));
                         break;
                     }
+                    if (!fastSwitched && severeLatency &&
+                        assurance.Decision.State != AutomaticDecisionState.Stabilization)
+                    {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.NoRecoveryTarget,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Evidence = DecisionEvidenceClass.SevereDegradation,
+                                Reason = "no materially better severe-degradation target" });
+                    }
                     logger.Write("fast selection delay_ms=" + delayTimer.ElapsedMilliseconds +
                         " checked=" + comparedCandidates + " eligible=" + verifiedTargets.Length +
                         " selected_response_ms=" + selectedResponseForLog.ToString("F0",
                             System.Globalization.CultureInfo.InvariantCulture));
-                    if (!fastSwitched && !severeLatency && ServiceIncidentPolicy.HasConsensus(confirmation, incidentChecks, failedService))
+                    if (!fastSwitched && !severeLatency)
                     {
-                        ProbeFailureKind kind = ServiceIncidentPolicy.FailureKind(confirmation, failedService);
-                        ServiceIncidentPolicy.Open(experience.ServiceIncidents, failedService, kind,
-                            clock.UtcNow, TimeSpan.FromMinutes(10));
-                        if (!suppressedServices.Contains(failedService)) suppressedServices.Add(failedService);
-                        servicesToProbe = ServiceIncidentPolicy.ServicesToProbe(requiredServices,
-                            experience.ServiceIncidents, clock.UtcNow);
-                        currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
-                        scans[currentScan.Name] = currentScan;
-                        currentEvidence = MonitorSnapshot.CreateRunning(current, currentScan, null,
-                            "已识别服务端异常", clock.UtcNow, DateTime.MaxValue)
-                            .WithSelectionReason(experience.SelectionSummary(current, firstCompletedCycle && current == cycleStartNode));
-                        currentFailureConfirmed = false;
-                        if (!observing) controller.Decide(true, false, current, null);
-                        serviceIncidentDecision = MonitorPresentation.ServiceLabel(failedService) +
-                            " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟";
-                        logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
-                            " confirmations=3 duration_minutes=10");
-                        experienceStore.Save(experience, clock.UtcNow);
+                        ServiceIncidentConsensus consensus = ServiceIncidentPolicy.EvaluateConsensus(
+                            confirmation, incidentChecks, failedService);
+                        logger.Write("service incident consensus service=" + failedService +
+                            " fingerprints=" + consensus.DistinctFingerprintCount +
+                            " countries=" + consensus.DistinctCountryCount +
+                            " asns=" + consensus.DistinctAsnCount +
+                            " passed=" + consensus.Passed +
+                            " reason=" + consensus.RejectionReason);
+                        if (consensus.Passed)
+                        {
+                            ProbeFailureKind kind = ServiceIncidentPolicy.FailureKind(confirmation, failedService);
+                            ServiceIncidentPolicy.Open(experience.ServiceIncidents, failedService, kind,
+                                clock.UtcNow, TimeSpan.FromMinutes(10));
+                            if (!suppressedServices.Contains(failedService)) suppressedServices.Add(failedService);
+                            servicesToProbe = ServiceIncidentPolicy.ServicesToProbe(requiredServices,
+                                experience.ServiceIncidents, clock.UtcNow);
+                            currentScan = ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices);
+                            scans[currentScan.Name] = currentScan;
+                            currentEvidence = MonitorSnapshot.CreateRunning(current, currentScan, null,
+                                "已识别服务端异常", clock.UtcNow, DateTime.MaxValue)
+                                .WithSelectionReason(experience.SelectionSummary(current, firstCompletedCycle && current == cycleStartNode));
+                            currentFailureConfirmed = false;
+                            if (!observing) controller.Decide(true, false, current, null);
+                            serviceIncidentDecision = MonitorPresentation.ServiceLabel(failedService) +
+                                " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟";
+                            logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
+                                " confirmations=3 duration_minutes=10");
+                            SaveExperience(clock.UtcNow);
+                        }
                     }
                 }
                 else
                 {
+                    ApplyDecision(assurance, AutomaticDecisionEvent.FailureRecovered,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            Evidence = DecisionEvidenceClass.Healthy,
+                            Reason = "focused confirmation recovered" });
                     currentScan = StartupRecovery.ApplySuccessfulConfirmation(currentScan, confirmation, failedService);
                     scans[currentScan.Name] = currentScan;
                     scanTimes[currentScan.Name] = clock.UtcNow;
@@ -511,6 +724,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 assurance.Target = null;
                 assurance.HoldUntilUtc = experience.ServiceIncidents.Where(x => x != null &&
                     suppressedServices.Contains(x.Service)).Select(x => x.UntilUtc).DefaultIfEmpty(clock.UtcNow.AddMinutes(10)).Max();
+                ApplyDecision(assurance, AutomaticDecisionEvent.OutageDetected,
+                    new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                        ExpiresUtc = assurance.HoldUntilUtc,
+                        Reason = "service incident interrupted observation" });
                 observing = false;
                 assuranceDecision = serviceIncidentDecision;
             }
@@ -518,6 +735,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             {
                 if (assurance.Target != current)
                 {
+                    ApplyDecision(assurance, AutomaticDecisionEvent.ManualNodeChanged,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            ExpiresUtc = clock.UtcNow.AddMinutes(10),
+                            Reason = "selector changed during observation" });
                     assurance.Target = null;
                     assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(10);
                     assuranceDecision = "检测到外部切换，取消自动回退";
@@ -535,46 +756,70 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             (!ConnectionAssurance.Passed(currentScan) || QualityMeasurement.ResponseMilliseconds(oldScan, 5000) < QualityMeasurement.ResponseMilliseconds(currentScan, 5000) * 0.8) &&
                             mihomo.GetSelected(config.SharedGroup) == current)
                         {
-                            SelectRecorded(current, old.Name, "切换后效果不佳，旧节点复检通过，自动回退");
-                            current = old.Name; currentCandidate = old; currentScan = oldScan;
-                            controller.RecordSwitch();
-                            assuranceDecision = "已安全回退，暂停性能寻优 30 分钟";
+                            DecisionTransition rollbackAuthorization = ApplyDecision(assurance,
+                                AutomaticDecisionEvent.RollbackRequired,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Previous = current, Target = old.Name,
+                                    BaselineResponse = QualityMeasurement.ResponseMilliseconds(currentScan, 5000),
+                                    TargetResponse = QualityMeasurement.ResponseMilliseconds(oldScan, 5000),
+                                    Reason = "observation rollback target verified" });
+                            if (ApplyAutomaticSwitch(assurance, rollbackAuthorization, current,
+                                old.Name, "切换后效果不佳，旧节点复检通过，自动回退",
+                                QualityMeasurement.ResponseMilliseconds(currentScan, 5000), false, false))
+                            {
+                                current = old.Name; currentCandidate = old; currentScan = oldScan;
+                                assuranceDecision = "已安全回退，继续观察连接稳定性";
+                            }
                         }
                         else assuranceDecision = "切换效果不佳，旧节点不满足安全回退条件；暂停寻优";
                     }
                     if (assurance.VerificationCount >= 2)
                     {
                         if (!rollback) assuranceDecision = ConnectionAssurance.Passed(currentScan) ? "切换后复检通过，保持连接" : "切换后证据不足，暂缓寻优";
+                        ApplyDecision(assurance, AutomaticDecisionEvent.ObservationComplete,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                ExpiresUtc = clock.UtcNow.AddMinutes(30),
+                                Reason = "switch observation completed" });
                         assurance.Target = null;
                         assurance.HoldUntilUtc = clock.UtcNow.AddMinutes(30);
                     }
                 }
-                experienceStore.Save(experience, clock.UtcNow);
+                SaveExperience(clock.UtcNow);
             }
-            bool sharedIncidentFailure = serviceIncidentDecision != null &&
-                ServiceIncidentPolicy.IsSuppressedFailure(currentScan, suppressedServices);
-            if (currentScan.Health != CandidateHealth.Unknown && !sharedIncidentFailure)
+            CandidateScanResult currentHistoryScan = ServiceIncidentPolicy.ForNodeHealth(
+                ServiceIncidentPolicy.AttachSuppressed(currentScan, suppressedServices));
+            if (currentHistoryScan.Health != CandidateHealth.Unknown)
             {
-                state.Records[currentScan.Name] = Record(currentScan);
-                state.RememberPreferred(currentScan.Name, currentScan.Health, clock.UtcNow);
+                state.Records[currentHistoryScan.Name] = Record(currentHistoryScan);
+                state.RememberPreferred(currentHistoryScan.Name, EvidenceKey(currentHistoryScan.Name),
+                    currentHistoryScan.Health, clock.UtcNow);
             }
             scans[currentScan.Name] = currentScan;
             scanTimes[currentScan.Name] = clock.UtcNow;
             currentEvidence = MonitorSnapshot.CreateRunning(current, currentScan, null, "当前节点检测完成", clock.UtcNow, DateTime.MaxValue)
                 .WithSelectionReason(experience.SelectionSummary(current, firstCompletedCycle && current == cycleStartNode));
             Report("当前节点检测完成，正在评估稳定性", currentEvidence);
-            bool trafficIdle = trafficGuard.SampleAndMayProbe(new SystemTrafficMeter());
+            bool trafficIdle = trafficGuard.SampleAndMayProbe(trafficMeter);
 
-            QualitySample priorCurrent = Latest(qualityHistory, current);
+            string currentEvidenceKey = EvidenceKey(current);
+            QualitySample priorCurrent = Latest(qualityHistory, currentEvidenceKey);
             double currentResponse = QualityMeasurement.ResponseMilliseconds(currentScan, priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
-            if (currentScan.Health != CandidateHealth.Unknown && !sharedIncidentFailure) qualityHistory.Add(new QualitySample(currentScan.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(currentScan),
-                currentResponse, Jitter(qualityHistory, currentScan.Name, currentResponse), priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
+            double currentHistoryResponse = QualityMeasurement.ResponseMilliseconds(currentHistoryScan,
+                priorCurrent == null ? 5000 : priorCurrent.ResponseMedianMs);
+            if (currentHistoryScan.Health != CandidateHealth.Unknown && currentEvidenceKey.Length > 0)
+                qualityHistory.Add(new QualitySample(
+                currentHistoryScan.Name, currentEvidenceKey, clock.UtcNow,
+                ServiceEvidencePolicy.CanEmergencySwitch(currentHistoryScan),
+                currentHistoryResponse, Jitter(qualityHistory, currentEvidenceKey, currentHistoryResponse),
+                priorCurrent == null ? 0 : priorCurrent.ThroughputBytesPerSecond,
                 currentCandidate == null ? (double?)null : currentCandidate.Multiplier));
-            if (!sharedIncidentFailure) experience.Observe(memoryScope, currentScan, null, clock.UtcNow);
+            if (currentEvidenceKey.Length > 0)
+                experience.Observe(memoryScope, currentEvidenceKey, currentHistoryScan, null, clock.UtcNow);
 
             bool opportunityActivity = false;
             bool opportunitySwitched = false;
-            IList<double> recentCurrentResponses = experience.RecentResponses(memoryScope, current, 3);
+            IList<double> recentCurrentResponses = experience.RecentResponses(memoryScope, currentEvidenceKey,
+                LatencyWindowStatistics.MaximumSamples);
             PendingOptimization pendingOptimization = assurance.PendingOptimization;
             if (pendingOptimization != null)
             {
@@ -594,6 +839,9 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 if (cancelReason != null)
                 {
                     logger.Write("opportunity pending cancelled reason=" + cancelReason);
+                    ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            Target = pendingOptimization.Target, Reason = cancelReason });
                     assurance.ClearPendingOptimization();
                     assuranceDecision = "自动寻优已取消：" + cancelReason;
                 }
@@ -602,6 +850,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     CandidateNode pendingCandidate = candidates.FirstOrDefault(x => x.Name == pendingOptimization.Target);
                     if (pendingCandidate == null)
                     {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                Target = pendingOptimization.Target,
+                                Reason = "pending target removed" });
                         assurance.ClearPendingOptimization();
                         assuranceDecision = "自动寻优目标已不在候选列表";
                     }
@@ -616,39 +868,72 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             pendingOptimization.BaselineResponse);
                         double confirmedTarget = QualityMeasurement.ResponseMilliseconds(targetScan,
                             pendingOptimization.TargetResponse);
-                        bool confirmed = OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices) &&
-                            OpportunityOptimizationPolicy.MateriallyBetter(confirmedBaseline, confirmedTarget) &&
+                        bool comparable = OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices);
+                        MaterialImprovementDecision improvement = MaterialImprovementPolicy.Evaluate(
+                            confirmedBaseline, confirmedTarget,
+                            assurance.HasRecentAutomaticSwitch(clock.UtcNow));
+                        bool confirmed = comparable && improvement.Accepted &&
                             String.Equals(mihomo.GetSelected(config.SharedGroup), pendingOptimization.Current,
                                 StringComparison.Ordinal);
                         if (confirmed && !dryRun)
                         {
                             string oldCurrent = current;
-                            SelectRecorded(oldCurrent, pendingCandidate.Name,
-                                "自动寻优：30 秒复检确认目标至少快 20% 且不超过 800 ms");
-                            bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(targetScan);
-                            assurance.Begin(oldCurrent, pendingCandidate.Name, confirmedBaseline, true,
-                                provisional, clock.UtcNow);
-                            previousSelectedNode = oldCurrent;
-                            controller.RecordSwitch();
-                            current = pendingCandidate.Name;
-                            currentCandidate = pendingCandidate;
-                            currentScan = targetScan;
-                            currentResponse = confirmedTarget;
-                            observing = true;
-                            opportunitySwitched = true;
-                            assuranceDecision = "自动寻优复检通过，已切换到实测更快节点";
-                            logger.Write("opportunity switched from=" + SafeName(oldCurrent) + " to=" +
-                                SafeName(current) + " baseline_ms=" + confirmedBaseline.ToString("F0") +
-                                " target_ms=" + confirmedTarget.ToString("F0"));
+                            SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
+                            if (!budget.Allowed)
+                            {
+                                ApplyDecision(assurance, AutomaticDecisionEvent.BudgetExhausted,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = current, ExpiresUtc = budget.AllowedAtUtc,
+                                        Reason = budget.Reason });
+                                assurance.PendingOptimization = null;
+                                assuranceDecision = "自动寻优达到切换预算，进入稳定观察";
+                            }
+                            else
+                            {
+                                DecisionTransition authorization = ApplyDecision(assurance,
+                                    AutomaticDecisionEvent.SwitchAuthorized,
+                                    new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                        Current = oldCurrent, Previous = oldCurrent,
+                                        Target = pendingCandidate.Name,
+                                        BaselineResponse = confirmedBaseline,
+                                        TargetResponse = confirmedTarget,
+                                        Reason = "confirmed material optimization" });
+                                bool provisional = !ServiceEvidencePolicy.CanEmergencySwitch(targetScan);
+                                string switchReason = "自动寻优：30 秒复检通过相对与绝对改善阈值";
+                                if (ApplyAutomaticSwitch(assurance, authorization, oldCurrent,
+                                    pendingCandidate.Name, switchReason, confirmedBaseline, true, provisional))
+                                {
+                                    current = pendingCandidate.Name;
+                                    currentCandidate = pendingCandidate;
+                                    currentScan = targetScan;
+                                    currentResponse = confirmedTarget;
+                                    observing = true;
+                                    opportunitySwitched = true;
+                                    assuranceDecision = "自动寻优复检通过，已切换到实测更快节点";
+                                    logger.Write("opportunity switched from=" + SafeName(oldCurrent) + " to=" +
+                                        SafeName(current) + " baseline_ms=" + confirmedBaseline.ToString("F0") +
+                                        " target_ms=" + confirmedTarget.ToString("F0"));
+                                }
+                            }
                         }
                         else
                         {
+                            ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationRejected,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                    Target = pendingCandidate.Name,
+                                    BaselineResponse = confirmedBaseline,
+                                    TargetResponse = confirmedTarget,
+                                    Reason = "optimization confirmation rejected" });
                             assurance.ClearPendingOptimization();
                             assuranceDecision = dryRun ? "自动寻优演练完成，未切换" : "自动寻优目标复检未达到切换标准";
                             logger.Write("opportunity pending rejected target=" + SafeName(pendingCandidate.Name) +
                                 " baseline_ms=" + confirmedBaseline.ToString("F0") + " target_ms=" +
-                                confirmedTarget.ToString("F0") + " comparable=" +
-                                OpportunityOptimizationPolicy.IsPerformanceComparable(targetScan, requiredServices).ToString().ToLowerInvariant());
+                                confirmedTarget.ToString("F0") + " comparable=" + comparable.ToString().ToLowerInvariant() +
+                                " relative=" + improvement.RelativeImprovement.ToString("P1") +
+                                " absolute_ms=" + improvement.AbsoluteImprovementMilliseconds.ToString("F0") +
+                                " required_relative=" + improvement.RequiredRelativeImprovement.ToString("P0") +
+                                " required_absolute_ms=" + improvement.RequiredAbsoluteImprovementMilliseconds.ToString("F0") +
+                                " reason=" + improvement.Reason);
                         }
                     }
                 }
@@ -657,67 +942,94 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
 
             bool opportunityDue = !opportunityActivity && !fastSwitched && serviceIncidentDecision == null &&
                 suppressedServices.Count == 0 && trafficIdle && (pathHealth == null || pathHealth.CanAutoSwitch) &&
+                (assurance.Decision.State == AutomaticDecisionState.Healthy ||
+                 assurance.Decision.State == AutomaticDecisionState.Degraded) &&
                 clock.UtcNow >= assurance.HoldUntilUtc && OpportunityOptimizationPolicy.ShouldScan(
                     preferences.AutomaticOptimization, observing, recentCurrentResponses,
                     assurance.LastOpportunityScanUtc, clock.UtcNow);
             if (opportunityDue)
             {
                 opportunityActivity = true;
+                ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationDue,
+                    new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                        Reason = "scheduled opportunity scan" });
                 assurance.LastOpportunityScanUtc = clock.UtcNow;
-                List<CandidateNode> opportunityPool = candidates.Where(x => x.Name != current).ToList();
                 Stopwatch opportunityTimer = Stopwatch.StartNew();
-                Dictionary<string, int> opportunityDelays = MeasureLiveDelays(opportunityPool);
-                string[] ranked = StartupRecovery.RankFastCandidates(opportunityPool, opportunityDelays,
-                    current, Int32.MaxValue);
-                ServiceKind[] quickServices = StartupRecovery.FastProbeServices(requiredServices, ServiceKind.ChatGPT);
-                var comparableScans = new List<CandidateScanResult>();
-                int checkedCandidates = 0;
-                foreach (string candidateName in ranked)
+                int rankingGeneration = candidateLatencyStore.BeginMeasurement();
+                IList<CandidateLatencyMeasurement> ranking = MeasureCandidateLatencies(candidates,
+                    current, requiredServices);
+                IList<CandidateLatencyMeasurement> publishedRanking;
+                if (!candidateLatencyStore.TryPublish(rankingGeneration, ranking, out publishedRanking))
+                    ranking = publishedRanking;
+                double baseline = QualityMeasurement.ResponseMilliseconds(currentScan, 5000);
+                RankedOpportunitySelection selected = RankedOpportunitySelector.Select(ranking,
+                    baseline, requiredServices, name =>
                 {
-                    if (StartupRecovery.ShouldStopAfterCheckedCandidates(checkedCandidates) ||
-                        StartupRecovery.ShouldStopAfterEligibleCandidates(comparableScans.Count)) break;
-                    CandidateNode candidate = candidates.First(x => x.Name == candidateName);
-                    Report("正在自动比较低延迟候选：" + candidateName, currentEvidence);
-                    CandidateScanResult quickScan = scanner.ScanSelected(candidate, quickServices,
-                        TimeSpan.FromSeconds(2));
-                    RememberRegionEligibility(memoryScope, quickScan);
-                    scans[candidateName] = quickScan;
-                    scanTimes[candidateName] = clock.UtcNow;
-                    checkedCandidates++;
-                    if (OpportunityOptimizationPolicy.IsPerformanceComparable(quickScan, quickServices))
-                        comparableScans.Add(quickScan);
-                }
-                string[] opportunityTargets = StartupRecovery.RankPerformanceComparableTargets(
-                    comparableScans, opportunityDelays);
-                if (opportunityTargets.Length > 0)
-                {
-                    string target = opportunityTargets[0];
-                    CandidateNode targetCandidate = candidates.First(x => x.Name == target);
-                    Report("正在完整验证自动寻优目标：" + target, currentEvidence);
-                    CandidateScanResult fullTargetScan = scanner.ScanSelected(targetCandidate, requiredServices);
+                    CandidateNode candidate = candidates.First(x => x.Name == name);
+                    Report("正在按网站延迟排行复检候选：" + name, currentEvidence);
+                    CandidateScanResult fullTargetScan = scanner.ScanSelected(candidate, requiredServices);
                     RememberRegionEligibility(memoryScope, fullTargetScan);
-                    scans[target] = fullTargetScan;
-                    scanTimes[target] = clock.UtcNow;
-                    List<double> orderedResponses = recentCurrentResponses.OrderBy(x => x).ToList();
-                    double baseline = orderedResponses.Count == 0 ? currentResponse :
-                        orderedResponses[orderedResponses.Count / 2];
-                    double targetResponse = QualityMeasurement.ResponseMilliseconds(fullTargetScan, 5000);
-                    if (OpportunityOptimizationPolicy.IsPerformanceComparable(fullTargetScan, requiredServices) &&
-                        OpportunityOptimizationPolicy.MateriallyBetter(baseline, targetResponse))
+                    scans[name] = fullTargetScan;
+                    scanTimes[name] = clock.UtcNow;
+                    return fullTargetScan;
+                });
+                if (selected.Node != null && !dryRun)
+                {
+                    SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
+                    if (!budget.Allowed)
                     {
-                        assurance.PendingOptimization = new PendingOptimization { Scope = memoryScope,
-                            Current = current, Target = target, BaselineResponse = baseline,
-                            TargetResponse = targetResponse, CreatedUtc = clock.UtcNow };
-                        assuranceDecision = "已找到更快候选，30 秒后自动确认";
-                        logger.Write("opportunity pending target=" + SafeName(target) + " baseline_ms=" +
-                            baseline.ToString("F0") + " target_ms=" + targetResponse.ToString("F0"));
+                        ApplyDecision(assurance, AutomaticDecisionEvent.BudgetExhausted,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                                ExpiresUtc = budget.AllowedAtUtc, Reason = budget.Reason });
+                        assuranceDecision = "自动切换达到预算，保持当前节点";
                     }
-                    else assurance.ClearPendingOptimization();
+                    else
+                    {
+                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
+                                Current = current, Target = selected.Node, BaselineResponse = baseline,
+                                TargetResponse = selected.ResponseMilliseconds,
+                                Reason = "ranked candidate fully rechecked" });
+                        DecisionTransition authorization = ApplyDecision(assurance,
+                            AutomaticDecisionEvent.SwitchAuthorized,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = current, Previous = current, Target = selected.Node,
+                                BaselineResponse = baseline,
+                                TargetResponse = selected.ResponseMilliseconds,
+                                Reason = "website latency ranked selection" });
+                        if (ApplyAutomaticSwitch(assurance, authorization, current, selected.Node,
+                            "自动按网站延迟排行切换", baseline, true,
+                            !ServiceEvidencePolicy.CanEmergencySwitch(selected.Scan)))
+                        {
+                            string oldCurrent = current;
+                            current = selected.Node;
+                            currentCandidate = candidates.First(x => x.Name == selected.Node);
+                            currentScan = selected.Scan;
+                            currentResponse = selected.ResponseMilliseconds;
+                            observing = true;
+                            opportunitySwitched = true;
+                            assuranceDecision = "已按网站延迟排行切换到更快节点";
+                            logger.Write("ranked selection from=" + SafeName(oldCurrent) +
+                                " to=" + SafeName(current) + " rank=" + selected.Rank +
+                                " baseline_ms=" + baseline.ToString("F0") +
+                                " target_ms=" + selected.ResponseMilliseconds.ToString("F0"));
+                        }
+                    }
                 }
-                else assurance.ClearPendingOptimization();
+                if (!opportunitySwitched && assurance.Decision.State == AutomaticDecisionState.SearchingOptimization)
+                {
+                    bool currentUsable = ServiceEvidencePolicy.CanHold(currentScan);
+                    ApplyDecision(assurance, currentUsable ? AutomaticDecisionEvent.HealthyEvidence :
+                        AutomaticDecisionEvent.OptimizationRejected,
+                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
+                            Reason = "no better fully verified ranked candidate" });
+                    assuranceDecision = dryRun ? "演练完成，未切换节点" :
+                        "前十名中没有通过完整复检且更快的节点";
+                }
                 opportunityTimer.Stop();
-                logger.Write("opportunity scan elapsed_ms=" + opportunityTimer.ElapsedMilliseconds +
-                    " checked=" + checkedCandidates + " eligible=" + comparableScans.Count);
+                logger.Write("ranked selection elapsed_ms=" + opportunityTimer.ElapsedMilliseconds +
+                    " ranked=" + ranking.Count + " rechecked=" + selected.Rechecked +
+                    " switched=" + opportunitySwitched.ToString().ToLowerInvariant());
             }
 
             if (lastQualityRefreshUtc == DateTime.MinValue)
@@ -746,10 +1058,17 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     RememberRegionEligibility(memoryScope, standbyScan);
                     scans[standby] = standbyScan;
                     scanTimes[standby] = clock.UtcNow;
-                    if (suppressedServices.Count == 0) assurance.Remember(standbyScan, current, clock.UtcNow);
+                    CandidateScanResult standbyHistory = ServiceIncidentPolicy.ForNodeHealth(
+                        ServiceIncidentPolicy.AttachSuppressed(standbyScan, suppressedServices));
+                    if (standbyHistory.Health != CandidateHealth.Unknown)
+                    {
+                        assurance.Remember(standbyHistory, current, clock.UtcNow);
+                        if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
+                    }
                     if (ServiceEvidencePolicy.CanEmergencySwitch(standbyScan)) delays[standby] = (int)Math.Min(Int32.MaxValue, QualityMeasurement.ResponseMilliseconds(standbyScan, 5000));
                 }
-                foreach (var remembered in experience.Recommend(memoryScope, candidates.Select(x => x.Name), clock.UtcNow).Take(3))
+                foreach (var remembered in experience.Recommend(memoryScope,
+                    candidates.Select(x => EvidenceKey(x.Name)).Where(x => x.Length > 0), clock.UtcNow).Take(3))
                 {
                     Report("正在复检历史优选节点：" + remembered.Node, currentEvidence);
                     delays[remembered.Node] = mihomo.GetDelay(remembered.Node, config.DelayProbeUrl, 3000);
@@ -780,16 +1099,26 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                         scanTimes[candidate.Name] = clock.UtcNow;
                     }
                     scans[candidate.Name] = scan;
-                    if (suppressedServices.Count == 0) assurance.Remember(scan, current, clock.UtcNow);
-                    CandidateScanResult historicalScan = ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices);
+                    CandidateScanResult historicalScan = ServiceIncidentPolicy.ForNodeHealth(
+                        ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices));
+                    if (historicalScan.Health != CandidateHealth.Unknown)
+                    {
+                        assurance.Remember(historicalScan, current, clock.UtcNow);
+                        if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
+                    }
                     if (historicalScan.Health != CandidateHealth.Unknown) state.Records[candidate.Name] = Record(historicalScan);
                     if (ServiceEvidencePolicy.CanEmergencySwitch(scan)) { compatible.Add(candidate); freshlyVerified.Add(candidate.Name); }
-                    QualitySample previous = Latest(qualityHistory, candidate.Name);
-                    double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
-                    if (suppressedServices.Count == 0 && scan.Health != CandidateHealth.Unknown) qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, ServiceEvidencePolicy.CanEmergencySwitch(scan),
-                        MedianResponse(qualityHistory, candidate.Name, response), Jitter(qualityHistory, candidate.Name, response),
+                    string candidateEvidenceKey = EvidenceKey(candidate.Name);
+                    QualitySample previous = Latest(qualityHistory, candidateEvidenceKey);
+                    double response = QualityMeasurement.ResponseMilliseconds(historicalScan, 5000);
+                    if (historicalScan.Health != CandidateHealth.Unknown && candidateEvidenceKey.Length > 0)
+                        qualityHistory.Add(new QualitySample(candidate.Name, candidateEvidenceKey, clock.UtcNow,
+                        ServiceEvidencePolicy.CanEmergencySwitch(historicalScan),
+                        MedianResponse(qualityHistory, candidateEvidenceKey, response),
+                        Jitter(qualityHistory, candidateEvidenceKey, response),
                         previous == null ? 0 : previous.ThroughputBytesPerSecond, candidate.Multiplier));
-                    experience.Observe(memoryScope, historicalScan, null, clock.UtcNow);
+                    if (candidateEvidenceKey.Length > 0)
+                        experience.Observe(memoryScope, candidateEvidenceKey, historicalScan, null, clock.UtcNow);
                     if (!ServiceEvidencePolicy.CanHold(scan))
                     {
                         string failureKey = scan.FailedService.HasValue ? scan.FailedService.Value.ToString() : scan.Health.ToString();
@@ -802,7 +1131,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
 
                 string throughputStatus = "not-due";
-                if (throughputDue && trafficIdle && trafficGuard.SampleAndMayProbe(new SystemTrafficMeter()))
+                if (throughputDue && trafficIdle && trafficGuard.SampleAndMayProbe(trafficMeter))
                 {
                     throughputStatus = "sampled";
                     var budget = new ThroughputBudget(5L * ThroughputProbe.SampleBytes);
@@ -815,8 +1144,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             if (!budget.TryReserve(ThroughputProbe.SampleBytes)) break;
                             mihomo.Select(config.ProbeGroup, candidate.Name);
                             ThroughputResult measured = throughputProbe.Probe();
-                            QualitySample previous = Latest(qualityHistory, candidate.Name);
-                            qualityHistory.Add(new QualitySample(candidate.Name, clock.UtcNow, true,
+                            string candidateEvidenceKey = EvidenceKey(candidate.Name);
+                            QualitySample previous = Latest(qualityHistory, candidateEvidenceKey);
+                            if (candidateEvidenceKey.Length == 0) continue;
+                            qualityHistory.Add(new QualitySample(candidate.Name, candidateEvidenceKey, clock.UtcNow, true,
                                 previous == null ? 5000 : previous.ResponseMedianMs,
                                 previous == null ? 0 : previous.JitterMs, measured.BytesPerSecond, candidate.Multiplier));
                             speedSamples[candidate.Name] = qualityHistory[qualityHistory.Count - 1];
@@ -837,21 +1168,25 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             }
 
             qualityHistory = QualityStateStore.Bound(qualityHistory);
-            var latestCohort = candidates.Select(x => Latest(qualityHistory, x.Name)).Where(x => x != null && x.Compatible && freshlyVerified.Contains(x.Name)).ToList();
+            var latestCohort = candidates.Select(x => Latest(qualityHistory, EvidenceKey(x.Name)))
+                .Where(x => x != null && x.Compatible && freshlyVerified.Contains(x.Name)).ToList();
             var scores = new Dictionary<string, QualityBreakdown>(StringComparer.Ordinal);
             foreach (QualitySample sample in latestCohort)
-                scores[sample.Name] = QualityScorer.Score(sample, qualityHistory.Where(x => x.Name == sample.Name), latestCohort, clock.UtcNow);
+                scores[sample.Name] = QualityScorer.Score(sample,
+                    qualityHistory.Where(x => QualityMatches(x, EvidenceKey(sample.Name))), latestCohort, clock.UtcNow);
             if (suppressedServices.Count > 0)
             {
                 var incidentCohort = scans.Values.Where(x => freshlyVerified.Contains(x.Name) && ServiceEvidencePolicy.CanEmergencySwitch(x))
-                    .Select(x => new QualitySample(x.Name, clock.UtcNow, true,
+                    .Select(x => new QualitySample(x.Name, EvidenceKey(x.Name), clock.UtcNow, true,
                         QualityMeasurement.ResponseMilliseconds(x, 5000), 0, 0,
                         candidates.First(y => y.Name == x.Name).Multiplier)).ToList();
                 foreach (QualitySample sample in incidentCohort)
                     scores[sample.Name] = QualityScorer.Score(sample, new[] { sample }, incidentCohort, clock.UtcNow);
             }
-            foreach (var remembered in experience.Recommend(memoryScope, scores.Keys, clock.UtcNow))
-                scores[remembered.Node].Score = 0.8 * scores[remembered.Node].Score + 0.2 * remembered.Rank(clock.UtcNow);
+            foreach (var remembered in experience.Recommend(memoryScope,
+                scores.Keys.Select(EvidenceKey).Where(x => x.Length > 0), clock.UtcNow))
+                if (scores.ContainsKey(remembered.Node))
+                    scores[remembered.Node].Score = 0.8 * scores[remembered.Node].Score + 0.2 * remembered.Rank(clock.UtcNow);
             QualityBreakdown currentScore = null;
             var best = scores.OrderByDescending(x => {
                 CandidateScanResult candidateScan;
@@ -898,8 +1233,10 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     else
                     {
                         FailoverDecision qualityDecision = controller.DecideQuality(currentScore.Score, best.Value.Score, false,
-                            freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, best.Key, clock.UtcNow),
-                            experience.RecentResponses(memoryScope, current, 3), experience.RecentResponses(memoryScope, best.Key, 5), selectedTargetScan);
+                            freshlyVerified.Contains(best.Key), experience.IsProvenStable(memoryScope, EvidenceKey(best.Key), clock.UtcNow),
+                            experience.RecentResponses(memoryScope, currentEvidenceKey, LatencyWindowStatistics.MaximumSamples),
+                            experience.RecentResponses(memoryScope, EvidenceKey(best.Key),
+                                LatencyWindowStatistics.MaximumSamples), selectedTargetScan);
                         shouldSwitch = qualityDecision.ShouldSwitch;
                         reason = qualityDecision.Reason;
                     }
@@ -941,15 +1278,42 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                     bool provisional = !ServiceEvidencePolicy.CanQualitySwitch(selectedTargetScan,
                         experience, memoryScope, requiredServices, clock.UtcNow);
                     if (!currentCompatible && provisional) reason = "provisional emergency failover";
-                    SelectRecorded(current, best.Key, "自动切换：" + StatusReport.DecisionText(reason));
-                    assurance.Begin(current, best.Key, currentResponse, currentCompatible, provisional, clock.UtcNow);
-                    experienceStore.Save(experience, clock.UtcNow);
-                    previousSelectedNode = current;
-                    controller.RecordSwitch();
-                    switched = true;
-                    reportedScore = suppressedServices.Count == 0 ? (double?)best.Value.Score : null;
-                    decision = "已切换：" + reason;
-                    logger.Write("switched node=" + SafeName(best.Key) + " score=" + best.Value.Score.ToString("F1") + " reason=" + reason);
+                    if (currentCompatible)
+                    {
+                        shouldSwitch = false;
+                        decision = "性能寻优需经过两阶段确认，保留当前节点";
+                    }
+                    else
+                    {
+                        if (assurance.Decision.State != AutomaticDecisionState.Recovering)
+                        {
+                            ApplyDecision(assurance, AutomaticDecisionEvent.HardFailure,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Evidence = DecisionEvidenceClass.HardFailure,
+                                    Reason = "confirmed failure fallback" });
+                            ApplyDecision(assurance, AutomaticDecisionEvent.FailureConfirmed,
+                                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                    Current = current, Evidence = DecisionEvidenceClass.HardFailure });
+                        }
+                        DecisionTransition authorization = ApplyDecision(assurance,
+                            AutomaticDecisionEvent.RecoveryTargetReady,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = current, Previous = current, Target = best.Key,
+                                Evidence = DecisionEvidenceClass.HardFailure,
+                                BaselineResponse = currentResponse,
+                                TargetResponse = QualityMeasurement.ResponseMilliseconds(selectedTargetScan, 5000),
+                                Reason = reason });
+                        if (ApplyAutomaticSwitch(assurance, authorization, current, best.Key,
+                            "自动切换：" + StatusReport.DecisionText(reason), currentResponse,
+                            false, provisional))
+                        {
+                            SaveExperience(clock.UtcNow);
+                            switched = true;
+                            reportedScore = suppressedServices.Count == 0 ? (double?)best.Value.Score : null;
+                            decision = "已切换：" + reason;
+                            logger.Write("switched node=" + SafeName(best.Key) + " score=" + best.Value.Score.ToString("F1") + " reason=" + reason);
+                        }
+                    }
                 }
             }
             if (dryRun) logger.Write("dry-run quality evaluation completed; shared selector unchanged");
@@ -976,16 +1340,18 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             experience.RecordChange(experience.LastNode, actual, "检测期间发现外部选择变更", clock.UtcNow);
             foreach (var scan in scans.Values)
             {
-                if (serviceIncidentDecision != null &&
-                    ServiceIncidentPolicy.IsSuppressedFailure(scan, suppressedServices)) continue;
                 QualitySample speed;
                 speedSamples.TryGetValue(scan.Name, out speed);
-                experience.Observe(memoryScope, ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices), speed, clock.UtcNow);
+                CandidateScanResult historicalScan = ServiceIncidentPolicy.ForNodeHealth(
+                    ServiceIncidentPolicy.AttachSuppressed(scan, suppressedServices));
+                string scanEvidenceKey = EvidenceKey(scan.Name);
+                if (scanEvidenceKey.Length > 0)
+                    experience.Observe(memoryScope, scanEvidenceKey, historicalScan, speed, clock.UtcNow);
             }
             TimeSpan nextInterval = assurance.Interval(actualScan);
             if (assurance.PendingOptimization != null) nextInterval = OpportunityOptimizationPolicy.ConfirmationInterval;
             decision = StatusReport.DecisionText(decision) + " · 近期备用 " + assurance.Available(candidates.Select(x => x.Name), actual, clock.UtcNow).Length + "/2";
-            experienceStore.Save(experience, clock.UtcNow);
+            SaveExperience(clock.UtcNow);
             if (!dryRun)
             {
                 CandidateHealth status = actualScan.Health;
@@ -1004,7 +1370,8 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             firstCompletedCycle = false;
             MonitorSnapshot completed = MonitorSnapshot.CreateRunning(actual, actualScan, reportedScore, decision, clock.UtcNow,
                 clock.UtcNow.Add(nextInterval))
-                .WithSelectionReason(selectionSummary);
+                .WithSelectionReason(selectionSummary)
+                .WithCandidateLatencies(candidateLatencyStore.Current);
             return pathHealth != null && pathHealth.Mismatch
                 ? completed.WithState(MonitorRunState.Degraded, decision, clock.UtcNow.Add(nextInterval)) : completed;
         }
@@ -1037,8 +1404,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private void RememberRegionEligibility(string scope, CandidateScanResult scan)
     {
         if (scan == null) return;
-        regionEligibility.TryRemember(scope, scan.Name, scan.ExitFingerprint,
-            scan.ExitCountryCode, clock.UtcNow);
+        string nodeId = EvidenceKey(scan.Name);
+        if (NodeIdentity.IsStrong(nodeId))
+            regionEligibility.TryRemember(scope, scan.Name, nodeId, scan.ExitFingerprint,
+                scan.ExitCountryCode, clock.UtcNow);
+        else if (nodeIdentitySource == null)
+            regionEligibility.TryRemember(scope, scan.Name, scan.ExitFingerprint,
+                scan.ExitCountryCode, clock.UtcNow);
     }
 
     private void SaveRegionEligibility()
@@ -1055,6 +1427,76 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         catch { }
     }
 
+    private DecisionTransition ApplyDecision(ConnectionAssurance assurance,
+        AutomaticDecisionEvent value, AutomaticDecisionContext context)
+    {
+        DecisionTransition transition = assurance.Apply(value, context);
+        if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
+        DateTime now = context == null || context.NowUtc == DateTime.MinValue
+            ? clock.UtcNow : context.NowUtc;
+        IList<AutomaticSwitchRecord> history = assurance.AutomaticSwitches ??
+            new List<AutomaticSwitchRecord>();
+        int switches10 = history.Count(x => x != null && x.Utc <= now &&
+            x.Utc > now.AddMinutes(-10));
+        int switches30 = history.Count(x => x != null && x.Utc <= now &&
+            x.Utc > now.AddMinutes(-30));
+        AutomaticDecisionTransaction transaction = transition.Transaction ??
+            assurance.Decision ?? new AutomaticDecisionTransaction();
+        logger.Write("decision transition state_from=" + transition.PreviousState +
+            " state_to=" + transaction.State + " event=" + value +
+            " evidence=" + transaction.Evidence + " directive=" + transition.Directive +
+            " accepted=" + transition.Accepted.ToString().ToLowerInvariant() +
+            " switches_10m=" + switches10 + " switches_30m=" + switches30 +
+            " reason=" + transition.Reason);
+        return transition;
+    }
+
+    private bool ApplyAutomaticSwitch(ConnectionAssurance assurance,
+        DecisionTransition authorization, string expectedSource, string target,
+        string reason, double baselineResponse, bool quality, bool provisional)
+    {
+        if (nodeIdentitySource != null && !NodeIdentity.IsStrong(EvidenceKey(target)) &&
+            (authorization == null || authorization.Transaction == null ||
+             authorization.Transaction.Evidence != DecisionEvidenceClass.HardFailure))
+        {
+            logger.Write("automatic switch rejected identity_strength=session-only");
+            return false;
+        }
+        if (authorization == null || !authorization.Accepted ||
+            (authorization.Directive != AutomaticDecisionDirective.Switch &&
+             authorization.Directive != AutomaticDecisionDirective.Rollback))
+            return false;
+        if (!String.Equals(mihomo.GetSelected(config.SharedGroup), expectedSource,
+            StringComparison.Ordinal))
+        {
+            ApplyDecision(assurance, AutomaticDecisionEvent.SwitchFailed,
+                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                    Current = expectedSource, Target = target,
+                    Reason = "selector changed before authorized switch" });
+            return false;
+        }
+
+        try
+        {
+            SelectRecorded(expectedSource, target, reason);
+            assurance.RecordAutomaticSwitch(expectedSource, target, reason, clock.UtcNow);
+            assurance.Begin(expectedSource, target, baselineResponse, quality,
+                provisional, clock.UtcNow);
+            if (nodeIdentitySource != null) assurance.CaptureIdentities(activeStrongIdsByName);
+            previousSelectedNode = expectedSource;
+            controller.RecordSwitch();
+            return true;
+        }
+        catch
+        {
+            ApplyDecision(assurance, AutomaticDecisionEvent.SwitchFailed,
+                new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                    Current = expectedSource, Target = target,
+                    Reason = "authorized selector write failed" });
+            throw;
+        }
+    }
+
     private void SelectRecorded(string from, string to, string reason)
     {
         CheckStop();
@@ -1062,7 +1504,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         if (mihomo.GetSelected(config.SharedGroup) != to) throw new InvalidOperationException("节点切换未确认，未写入成功记录");
         RunStatistics.SelectionConfirmed();
         experience.RecordChange(from, to, reason, clock.UtcNow);
-        experienceStore.Save(experience, clock.UtcNow);
+        SaveExperience(clock.UtcNow);
         FollowGeneralNode();
     }
 
@@ -1083,14 +1525,112 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         return false;
     }
 
-    private NodeHealthRecord Record(CandidateScanResult result)
+    private IList<CandidateNode> DiscoverCandidates()
     {
-        return new NodeHealthRecord(result.Name, result.Health, clock.UtcNow, HealthPolicy.CooldownUntil(result.Health, clock.UtcNow), false);
+        IDictionary<string, string> runtimeTypes = null;
+        var catalogClient = mihomo as MihomoPipeClient;
+        if (catalogClient != null)
+        {
+            try { runtimeTypes = catalogClient.GetProxyTypes(); }
+            catch (IOException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+            catch (TimeoutException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+            catch (ArgumentException ex) { logger.Write("runtime proxy kinds unavailable " + ex.GetType().Name); }
+        }
+        IList<CandidateNode> discovered = CandidateCatalog.Filter(
+            mihomo.GetChoices(config.SharedGroup), runtimeTypes);
+        IDictionary<string, ResolvedNodeIdentity> resolvedIdentities = null;
+        if (nodeIdentitySource != null)
+        {
+            try { resolvedIdentities = nodeIdentitySource.Resolve(discovered.Select(x => x.Name)); }
+            catch (IOException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+            catch (UnauthorizedAccessException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+            catch (ArgumentException ex) { logger.Write("node identity unavailable " + ex.GetType().Name); }
+        }
+        IList<CandidateNode> candidates = CandidateCatalog.Filter(
+            discovered.Select(x => x.Name), runtimeTypes, resolvedIdentities);
+        activeCandidatesByName = candidates.ToDictionary(x => x.Name, x => x, StringComparer.Ordinal);
+        activeStrongIdsByName = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+            NodeIdentity.IsStrong(x.NodeId)).ToDictionary(x => x.Name, x => x.NodeId, StringComparer.Ordinal);
+        activeNamesByStrongId = candidates.Where(x => x.IdentityStrength == NodeIdentityStrength.Strong &&
+            NodeIdentity.IsStrong(x.NodeId)).GroupBy(x => x.NodeId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.OrderBy(y => y.Name.Length)
+                .ThenBy(y => y.Name, StringComparer.Ordinal).First().Name, StringComparer.Ordinal);
+        return candidates;
     }
 
-    private static string Fingerprint(IEnumerable<CandidateNode> candidates)
+    private IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(
+        IList<CandidateNode> candidates, string current, IList<ServiceKind> requiredServices)
     {
-        byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", candidates.Select(x => x.Name).Distinct(StringComparer.Ordinal)
+        List<CandidateNode> alternatives = (candidates ?? new List<CandidateNode>())
+            .Where(x => !String.Equals(x.Name, current, StringComparison.Ordinal)).ToList();
+        Dictionary<string, int> delays = MeasureLiveDelays(alternatives);
+        string[] ranked = StartupRecovery.RankFastCandidates(
+            alternatives, delays, current, 10);
+        var measured = new List<CandidateLatencyMeasurement>();
+        foreach (string name in ranked)
+        {
+            CheckStop();
+            CandidateNode candidate = alternatives.First(x => x.Name == name);
+            CandidateScanResult scan = scanner.ScanSelected(candidate, requiredServices,
+                TimeSpan.FromSeconds(2));
+            int mihomoDelay;
+            if (!delays.TryGetValue(name, out mihomoDelay)) mihomoDelay = Int32.MaxValue;
+            measured.Add(new CandidateLatencyMeasurement(name, scan.ExitCountryCode,
+                mihomoDelay, scan.ServiceResults.OrderBy(x => x.Key)
+                    .Select(x => new ServiceMeasurement(x.Key, x.Value.Passed,
+                        x.Value.ElapsedMilliseconds, x.Value.Detail, x.Value.FailureKind)),
+                clock.UtcNow));
+        }
+        IList<CandidateLatencyMeasurement> result = measured
+            .OrderBy(x => RankedOpportunitySelector.ResponseMilliseconds(x))
+            .ThenBy(x => x.MihomoMilliseconds)
+            .ThenBy(x => x.Node, StringComparer.Ordinal)
+            .ToList().AsReadOnly();
+        logger.Write("candidate latency ranking measured=" + result.Count +
+            " services=" + requiredServices.Distinct().Count());
+        return result;
+    }
+
+    private NodeHealthRecord Record(CandidateScanResult result)
+    {
+        return new NodeHealthRecord(result.Name, EvidenceKey(result.Name), result.Health, clock.UtcNow,
+            HealthPolicy.CooldownUntil(result.Health, clock.UtcNow), false);
+    }
+
+    private void ReconcileHealthState(HealthState state)
+    {
+        if (state == null) return;
+        var records = new Dictionary<string, NodeHealthRecord>(StringComparer.Ordinal);
+        foreach (NodeHealthRecord record in state.Records.Values)
+        {
+            string name;
+            if (record != null && NodeIdentity.IsStrong(record.NodeId) &&
+                activeNamesByStrongId.TryGetValue(record.NodeId, out name))
+            {
+                CandidateNode candidate;
+                if (activeCandidatesByName.TryGetValue(name, out candidate))
+                    records[name] = new NodeHealthRecord(name, record.NodeId, record.Health,
+                        record.CheckedUtc, record.CooldownUntilUtc, record.ExplicitLocalExclusion);
+            }
+        }
+        state.Records.Clear();
+        foreach (KeyValuePair<string, NodeHealthRecord> item in records) state.Records[item.Key] = item.Value;
+        string preferredName;
+        if (NodeIdentity.IsStrong(state.PreferredNodeId) &&
+            activeNamesByStrongId.TryGetValue(state.PreferredNodeId, out preferredName))
+            state.PreferredNode = preferredName;
+        else
+        {
+            state.PreferredNode = "";
+            state.PreferredNodeId = "";
+            state.PreferredNodeVerifiedUtc = DateTime.MinValue;
+        }
+    }
+
+    private static string Fingerprint(IEnumerable<string> nodeKeys)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", (nodeKeys ?? Enumerable.Empty<string>())
+            .Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal)
             .OrderBy(x => x, StringComparer.Ordinal)));
         using (SHA256 hash = SHA256.Create()) return Convert.ToBase64String(hash.ComputeHash(bytes));
     }
@@ -1108,26 +1648,78 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             .Select(MonitorPresentation.ServiceLabel));
     }
 
-    private static QualitySample Latest(IEnumerable<QualitySample> samples, string name)
+    private string EvidenceKey(string name)
     {
-        return (samples ?? Enumerable.Empty<QualitySample>()).Where(x => String.Equals(x.Name, name, StringComparison.Ordinal))
+        CandidateNode candidate;
+        if (activeCandidatesByName != null && activeCandidatesByName.TryGetValue(name ?? "", out candidate) &&
+            candidate.IdentityStrength == NodeIdentityStrength.Strong && NodeIdentity.IsStrong(candidate.NodeId))
+            return candidate.NodeId;
+        return nodeIdentitySource == null ? name ?? "" : "";
+    }
+
+    private void SaveExperience(DateTime now)
+    {
+        if (nodeIdentitySource != null && activeStrongIdsByName.Count > 0)
+        {
+            experience.Assurance.CaptureIdentities(activeStrongIdsByName);
+            ReconcileAccountVerificationsForSave();
+        }
+        experienceStore.Save(experience, now);
+    }
+
+    private void ReconcileAccountVerifications()
+    {
+        if (experience.AccountVerifications == null)
+            experience.AccountVerifications = new List<AccountVerificationRecord>();
+        experience.AccountVerifications = experience.AccountVerifications.Where(x => x != null &&
+            NodeIdentity.IsStrong(x.NodeId) && activeNamesByStrongId.ContainsKey(x.NodeId)).ToList();
+        foreach (AccountVerificationRecord item in experience.AccountVerifications)
+            item.Node = activeNamesByStrongId[item.NodeId];
+    }
+
+    private void ReconcileAccountVerificationsForSave()
+    {
+        if (experience.AccountVerifications == null)
+            experience.AccountVerifications = new List<AccountVerificationRecord>();
+        foreach (AccountVerificationRecord item in experience.AccountVerifications)
+        {
+            string nodeId;
+            item.NodeId = item != null && !String.IsNullOrEmpty(item.Node) &&
+                activeStrongIdsByName.TryGetValue(item.Node, out nodeId) ? nodeId : "";
+        }
+        experience.AccountVerifications = experience.AccountVerifications.Where(x => x != null &&
+            NodeIdentity.IsStrong(x.NodeId)).ToList();
+    }
+
+    private static bool QualityMatches(QualitySample sample, string nodeKey)
+    {
+        if (sample == null || String.IsNullOrEmpty(nodeKey)) return false;
+        if (NodeIdentity.IsStrong(nodeKey)) return String.Equals(sample.NodeId, nodeKey, StringComparison.Ordinal);
+        return !NodeIdentity.IsStrong(sample.NodeId) && String.Equals(sample.Name, nodeKey, StringComparison.Ordinal);
+    }
+
+    private static QualitySample Latest(IEnumerable<QualitySample> samples, string nodeKey)
+    {
+        return (samples ?? Enumerable.Empty<QualitySample>()).Where(x => QualityMatches(x, nodeKey))
             .OrderByDescending(x => x.CheckedUtc).FirstOrDefault();
     }
 
-    private static double MedianResponse(IEnumerable<QualitySample> samples, string name, double current)
+    private static double MedianResponse(IEnumerable<QualitySample> samples, string nodeKey, double current)
     {
-        var values = samples.Where(x => x.Name == name && x.ResponseMedianMs > 0).OrderByDescending(x => x.CheckedUtc)
-            .Take(4).Select(x => x.ResponseMedianMs).Concat(new[] { current }).OrderBy(x => x).ToList();
-        return values.Count % 2 == 1 ? values[values.Count / 2] : (values[values.Count / 2 - 1] + values[values.Count / 2]) / 2.0;
+        var values = samples.Where(x => QualityMatches(x, nodeKey) && x.ResponseMedianMs > 0)
+            .OrderByDescending(x => x.CheckedUtc)
+            .Take(LatencyWindowStatistics.MaximumSamples - 1).Select(x => x.ResponseMedianMs).Reverse()
+            .Concat(new[] { current });
+        return LatencyWindowStatistics.Summarize(values).MedianMilliseconds;
     }
 
-    private static double Jitter(IEnumerable<QualitySample> samples, string name, double current)
+    private static double Jitter(IEnumerable<QualitySample> samples, string nodeKey, double current)
     {
-        var values = samples.Where(x => x.Name == name && x.ResponseMedianMs > 0).OrderByDescending(x => x.CheckedUtc)
-            .Take(4).Select(x => x.ResponseMedianMs).Concat(new[] { current }).ToList();
-        if (values.Count < 2) return 0;
-        double mean = values.Average();
-        return Math.Sqrt(values.Sum(x => (x - mean) * (x - mean)) / values.Count);
+        var values = samples.Where(x => QualityMatches(x, nodeKey) && x.ResponseMedianMs > 0)
+            .OrderByDescending(x => x.CheckedUtc)
+            .Take(LatencyWindowStatistics.MaximumSamples - 1).Select(x => x.ResponseMedianMs).Reverse()
+            .Concat(new[] { current });
+        return LatencyWindowStatistics.Summarize(values).JitterMilliseconds;
     }
 }
 
