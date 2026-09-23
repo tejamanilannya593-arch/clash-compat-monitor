@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.14", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.15", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -88,6 +88,7 @@ internal static class Tests
         QualityScoringAndState();
         ThroughputAndTraffic();
         OpportunityOptimizationBehavior();
+        RankedOpportunitySelectionBehavior();
         OpportunityCandidatePlanningBehavior();
         AutomaticDecisionPolicyBehavior();
         AutomaticDecisionStateMachineBehavior();
@@ -2717,7 +2718,8 @@ private static void RunRecentSwitchOpportunityHysteresisOrchestration()
                 new OpportunityServiceProbe(mihomo, 1000, 750),
                 new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
                 new FakeClock { UtcNow = now }, new OrchestratedExitIdentityProbe(mihomo, false), null,
-                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
 
             worker.Run(preferences);
 
@@ -2845,6 +2847,51 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             basic.ServiceResults, "0000000000000000000000000000000000000000000000000000000000000002", "HK");
         Equal(false, OpportunityOptimizationPolicy.IsPerformanceComparable(unsupported, required),
             "unsupported actual exit cannot participate in proactive comparison");
+    }
+
+    private static void RankedOpportunitySelectionBehavior()
+    {
+        DateTime now = new DateTime(2026, 9, 23, 12, 0, 0, DateTimeKind.Utc);
+        var required = new[] { ServiceKind.ChatGPT, ServiceKind.Gemini };
+        var ranking = new[] {
+            new CandidateLatencyMeasurement("first", "JP", 30, new[] {
+                new ServiceMeasurement(ServiceKind.ChatGPT, true, 100, "ok"),
+                new ServiceMeasurement(ServiceKind.Gemini, true, 120, "ok") }, now),
+            new CandidateLatencyMeasurement("second", "JP", 40, new[] {
+                new ServiceMeasurement(ServiceKind.ChatGPT, true, 200, "ok"),
+                new ServiceMeasurement(ServiceKind.Gemini, true, 220, "ok") }, now),
+            new CandidateLatencyMeasurement("third", "JP", 50, new[] {
+                new ServiceMeasurement(ServiceKind.ChatGPT, true, 950, "ok"),
+                new ServiceMeasurement(ServiceKind.Gemini, true, 980, "ok") }, now)
+        };
+        var checkedNodes = new List<string>();
+        RankedOpportunitySelection selected = RankedOpportunitySelector.Select(ranking, 900, required, node => {
+            checkedNodes.Add(node);
+            return new CandidateScanResult(node,
+                node == "first" ? CandidateHealth.ServiceFailed : CandidateHealth.Compatible,
+                node == "first" ? (ServiceKind?)ServiceKind.ChatGPT : null,
+                node == "first" ? "blocked" : "ok", 400, 2,
+                new Dictionary<ServiceKind, ProbeResult> {
+                    { ServiceKind.ChatGPT, node == "first" ? ProbeResult.ServiceFailure("blocked", 100) : ProbeResult.Success(200) },
+                    { ServiceKind.Gemini, ProbeResult.Success(220) }
+                }, null, "JP");
+        });
+        Equal("second", selected.Node, "ranked selector advances after a failed full recheck");
+        Equal("first,second", String.Join(",", checkedNodes),
+            "ranked selector checks website order and stops after the first eligible target");
+        Equal(2, selected.Rechecked, "ranked selector reports its full recheck count");
+        Equal(2, selected.Rank, "ranked selector reports the displayed one-based rank");
+        Equal(220d, selected.ResponseMilliseconds,
+            "ranked selector retains full selected-service response, not quick ranking latency");
+
+        checkedNodes.Clear();
+        RankedOpportunitySelection none = RankedOpportunitySelector.Select(ranking, 130, required, node => {
+            checkedNodes.Add(node);
+            return new CandidateScanResult(node, CandidateHealth.ServiceFailed, ServiceKind.ChatGPT, "blocked");
+        });
+        Equal<string>(null, none.Node, "ranked selector retains a faster current node");
+        Equal("first", String.Join(",", checkedNodes),
+            "ranked selector stops before rows that cannot beat the current response");
     }
 
     private static void RunUnhelpfulSevereLatencyOrchestration()
@@ -4484,6 +4531,11 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
     }
 
+    private sealed class FixedTrafficMeter : ITrafficMeter
+    {
+        public long GetTotalBytes() { return 0; }
+    }
+
     private static void BrowserVerificationUiBehavior()
     {
         Equal("自动实测当前节点", BrowserVerificationForm.ActionText(true, true),
@@ -4838,7 +4890,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.14"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.15"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

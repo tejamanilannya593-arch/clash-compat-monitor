@@ -96,6 +96,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     private readonly IClock clock;
     private readonly FailoverController controller;
     private readonly TrafficGuard trafficGuard;
+    private readonly ITrafficMeter trafficMeter;
     private readonly IProxyPathHealthChecker pathHealthChecker;
     private readonly Func<RuntimeSnapshot> runtimeSnapshotProvider;
     private readonly INodeIdentitySource nodeIdentitySource;
@@ -142,7 +143,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
     internal MonitorWorker(MonitorConfiguration config, IMihomoClient mihomo, IServiceProbe probe,
         BoundedLogger logger, IClock clock, IExitIdentityProbe exitIdentityProbe,
         IProxyPathHealthChecker pathHealthChecker, Func<RuntimeSnapshot> runtimeSnapshotProvider,
-        INodeIdentitySource nodeIdentitySource = null)
+        INodeIdentitySource nodeIdentitySource = null, ITrafficMeter trafficMeter = null)
     {
         this.config = config;
         this.mihomo = mihomo;
@@ -161,6 +162,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
         if (experience.Assurance == null || experience.Assurance.Standbys == null) experience.Assurance = new ConnectionAssurance();
         controller = new FailoverController(clock, config.MinimumHold);
         trafficGuard = new TrafficGuard(clock, 3.0 * 1024 * 1024, TimeSpan.FromMinutes(5));
+        this.trafficMeter = trafficMeter ?? new SystemTrafficMeter();
     }
 
     public void RunOnce(bool dryRun)
@@ -797,7 +799,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             currentEvidence = MonitorSnapshot.CreateRunning(current, currentScan, null, "当前节点检测完成", clock.UtcNow, DateTime.MaxValue)
                 .WithSelectionReason(experience.SelectionSummary(current, firstCompletedCycle && current == cycleStartNode));
             Report("当前节点检测完成，正在评估稳定性", currentEvidence);
-            bool trafficIdle = trafficGuard.SampleAndMayProbe(new SystemTrafficMeter());
+            bool trafficIdle = trafficGuard.SampleAndMayProbe(trafficMeter);
 
             string currentEvidenceKey = EvidenceKey(current);
             QualitySample priorCurrent = Latest(qualityHistory, currentEvidenceKey);
@@ -960,22 +962,19 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 if (!candidateLatencyStore.TryPublish(rankingGeneration, ranking, out publishedRanking))
                     ranking = publishedRanking;
                 double baseline = QualityMeasurement.ResponseMilliseconds(currentScan, 5000);
-                int checkedCandidates = 0;
-                foreach (CandidateLatencyMeasurement ranked in ranking)
+                RankedOpportunitySelection selected = RankedOpportunitySelector.Select(ranking,
+                    baseline, requiredServices, name =>
                 {
-                    double rankedResponse = CandidateLatencyResponse(ranked);
-                    if (rankedResponse >= baseline) break;
-                    CandidateNode targetCandidate = candidates.First(x => x.Name == ranked.Node);
-                    Report("正在按网站延迟排行复检候选：" + ranked.Node, currentEvidence);
-                    CandidateScanResult fullTargetScan = scanner.ScanSelected(targetCandidate, requiredServices);
+                    CandidateNode candidate = candidates.First(x => x.Name == name);
+                    Report("正在按网站延迟排行复检候选：" + name, currentEvidence);
+                    CandidateScanResult fullTargetScan = scanner.ScanSelected(candidate, requiredServices);
                     RememberRegionEligibility(memoryScope, fullTargetScan);
-                    scans[ranked.Node] = fullTargetScan;
-                    scanTimes[ranked.Node] = clock.UtcNow;
-                    checkedCandidates++;
-                    double targetResponse = QualityMeasurement.ResponseMilliseconds(fullTargetScan, 5000);
-                    if (!OpportunityOptimizationPolicy.IsPerformanceComparable(fullTargetScan, requiredServices) ||
-                        targetResponse >= baseline) continue;
-                    if (dryRun) break;
+                    scans[name] = fullTargetScan;
+                    scanTimes[name] = clock.UtcNow;
+                    return fullTargetScan;
+                });
+                if (selected.Node != null && !dryRun)
+                {
                     SwitchBudgetDecision budget = assurance.AutomaticSwitchBudget(clock.UtcNow);
                     if (!budget.Allowed)
                     {
@@ -983,36 +982,39 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             new AutomaticDecisionContext { NowUtc = clock.UtcNow, Current = current,
                                 ExpiresUtc = budget.AllowedAtUtc, Reason = budget.Reason });
                         assuranceDecision = "自动切换达到预算，保持当前节点";
-                        break;
                     }
-                    ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
-                        new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
-                            Current = current, Target = ranked.Node, BaselineResponse = baseline,
-                            TargetResponse = targetResponse, Reason = "ranked candidate fully rechecked" });
-                    DecisionTransition authorization = ApplyDecision(assurance,
-                        AutomaticDecisionEvent.SwitchAuthorized,
-                        new AutomaticDecisionContext { NowUtc = clock.UtcNow,
-                            Current = current, Previous = current, Target = ranked.Node,
-                            BaselineResponse = baseline, TargetResponse = targetResponse,
-                            Reason = "website latency ranked selection" });
-                    if (ApplyAutomaticSwitch(assurance, authorization, current, ranked.Node,
-                        "自动按网站延迟排行切换", baseline, true,
-                        !ServiceEvidencePolicy.CanEmergencySwitch(fullTargetScan)))
+                    else
                     {
-                        string oldCurrent = current;
-                        current = ranked.Node;
-                        currentCandidate = targetCandidate;
-                        currentScan = fullTargetScan;
-                        currentResponse = targetResponse;
-                        observing = true;
-                        opportunitySwitched = true;
-                        assuranceDecision = "已按网站延迟排行切换到更快节点";
-                        logger.Write("ranked selection from=" + SafeName(oldCurrent) +
-                            " to=" + SafeName(current) + " rank=" + (ranking.IndexOf(ranked) + 1) +
-                            " baseline_ms=" + baseline.ToString("F0") +
-                            " target_ms=" + targetResponse.ToString("F0"));
+                        ApplyDecision(assurance, AutomaticDecisionEvent.OptimizationTargetPrepared,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow, Scope = memoryScope,
+                                Current = current, Target = selected.Node, BaselineResponse = baseline,
+                                TargetResponse = selected.ResponseMilliseconds,
+                                Reason = "ranked candidate fully rechecked" });
+                        DecisionTransition authorization = ApplyDecision(assurance,
+                            AutomaticDecisionEvent.SwitchAuthorized,
+                            new AutomaticDecisionContext { NowUtc = clock.UtcNow,
+                                Current = current, Previous = current, Target = selected.Node,
+                                BaselineResponse = baseline,
+                                TargetResponse = selected.ResponseMilliseconds,
+                                Reason = "website latency ranked selection" });
+                        if (ApplyAutomaticSwitch(assurance, authorization, current, selected.Node,
+                            "自动按网站延迟排行切换", baseline, true,
+                            !ServiceEvidencePolicy.CanEmergencySwitch(selected.Scan)))
+                        {
+                            string oldCurrent = current;
+                            current = selected.Node;
+                            currentCandidate = candidates.First(x => x.Name == selected.Node);
+                            currentScan = selected.Scan;
+                            currentResponse = selected.ResponseMilliseconds;
+                            observing = true;
+                            opportunitySwitched = true;
+                            assuranceDecision = "已按网站延迟排行切换到更快节点";
+                            logger.Write("ranked selection from=" + SafeName(oldCurrent) +
+                                " to=" + SafeName(current) + " rank=" + selected.Rank +
+                                " baseline_ms=" + baseline.ToString("F0") +
+                                " target_ms=" + selected.ResponseMilliseconds.ToString("F0"));
+                        }
                     }
-                    break;
                 }
                 if (!opportunitySwitched && assurance.Decision.State == AutomaticDecisionState.SearchingOptimization)
                 {
@@ -1026,7 +1028,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
                 opportunityTimer.Stop();
                 logger.Write("ranked selection elapsed_ms=" + opportunityTimer.ElapsedMilliseconds +
-                    " ranked=" + ranking.Count + " rechecked=" + checkedCandidates +
+                    " ranked=" + ranking.Count + " rechecked=" + selected.Rechecked +
                     " switched=" + opportunitySwitched.ToString().ToLowerInvariant());
             }
 
@@ -1129,7 +1131,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 }
 
                 string throughputStatus = "not-due";
-                if (throughputDue && trafficIdle && trafficGuard.SampleAndMayProbe(new SystemTrafficMeter()))
+                if (throughputDue && trafficIdle && trafficGuard.SampleAndMayProbe(trafficMeter))
                 {
                     throughputStatus = "sampled";
                     var budget = new ThroughputBudget(5L * ThroughputProbe.SampleBytes);
@@ -1580,24 +1582,13 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                 clock.UtcNow));
         }
         IList<CandidateLatencyMeasurement> result = measured
-            .OrderBy(x => CandidateLatencyResponse(x))
+            .OrderBy(x => RankedOpportunitySelector.ResponseMilliseconds(x))
             .ThenBy(x => x.MihomoMilliseconds)
             .ThenBy(x => x.Node, StringComparer.Ordinal)
             .ToList().AsReadOnly();
         logger.Write("candidate latency ranking measured=" + result.Count +
             " services=" + requiredServices.Distinct().Count());
         return result;
-    }
-
-    private static double CandidateLatencyResponse(CandidateLatencyMeasurement candidate)
-    {
-        if (candidate == null || candidate.Services.Count == 0 ||
-            candidate.Services.Any(x => !x.Available)) return Double.MaxValue;
-        List<long> values = candidate.Services.Where(x => x.Available && x.Milliseconds > 0)
-            .Select(x => x.Milliseconds).OrderBy(x => x).ToList();
-        if (values.Count == 0) return Double.MaxValue;
-        int rank = (int)Math.Ceiling(values.Count * 0.75);
-        return values[Math.Max(0, rank - 1)];
     }
 
     private NodeHealthRecord Record(CandidateScanResult result)
