@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.13", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.14", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -2469,6 +2469,57 @@ internal static class Tests
                 "invalidated website ranking is not published by the automatic cycle");
         }
         finally { DeleteDirectoryEventually(invalidatedRoot); }
+
+        string preferencesRoot = Path.Combine(Path.GetTempPath(),
+            "monitor-ranked-preferences-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(preferencesRoot);
+        try
+        {
+            var mihomo = new OrchestratedMihomo("current", new[] { "current", "node-01" },
+                new Dictionary<string, int> { { "node-01", 10 } });
+            var probe = new BlockingFullRecheckProbe(mihomo);
+            var worker = new MonitorWorker(FastWorkerConfiguration(preferencesRoot), mihomo,
+                probe, new BoundedLogger(Path.Combine(preferencesRoot, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 40, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+            var oldPreferences = UserPreferences.Defaults();
+            oldPreferences.AutomaticOptimization = true;
+            using (var coordinator = new MonitorCoordinator(worker, TimeSpan.FromHours(1),
+                TimeSpan.FromSeconds(10)))
+            {
+                int changedPreferences = 0;
+                int staleSnapshots = 0;
+                int attentionCount = 0;
+                coordinator.SnapshotChanged += snapshot => {
+                    if (Volatile.Read(ref changedPreferences) != 0 && snapshot.ActualNode == "node-01")
+                        Interlocked.Increment(ref staleSnapshots);
+                };
+                coordinator.AttentionRequired += delegate { Interlocked.Increment(ref attentionCount); };
+                coordinator.UpdatePreferences(oldPreferences);
+                coordinator.Start();
+                try
+                {
+                    Equal(true, probe.WaitUntilFullRecheck(5000),
+                        "preference-change fixture pauses the old candidate full recheck");
+                    var changed = UserPreferences.Defaults();
+                    changed.AutomaticOptimization = false;
+                    changed.RequiredServices.Add(ServiceKind.Discord);
+                    Interlocked.Exchange(ref changedPreferences, 1);
+                    coordinator.UpdatePreferences(changed);
+                }
+                finally { probe.Release(); }
+                Equal(true, probe.WaitForCurrentChecks(2, 5000),
+                    "changed preferences start a new current-node cycle");
+                Equal("current", mihomo.GetSelected("shared"),
+                    "old selected-service results cannot switch after preferences change");
+                Equal(0, staleSnapshots,
+                    "cancelled old cycle cannot publish its old selected-service snapshot");
+                Equal(0, attentionCount,
+                    "preference cancellation does not raise a false monitor failure alert");
+            }
+        }
+        finally { DeleteDirectoryEventually(preferencesRoot); }
     }
 
     private static void RunRecoveredSevereLatencyOrchestration()
@@ -3604,6 +3655,34 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         }
     }
 
+    private sealed class BlockingFullRecheckProbe : IServiceProbe
+    {
+        private readonly OrchestratedMihomo mihomo;
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        private int currentChecks;
+        public BlockingFullRecheckProbe(OrchestratedMihomo mihomo) { this.mihomo = mihomo; }
+        public bool WaitUntilFullRecheck(int milliseconds) { return entered.Wait(milliseconds); }
+        public bool WaitForCurrentChecks(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => Volatile.Read(ref currentChecks) >= count, milliseconds); }
+        public void Release() { released.Set(); }
+        public ProbeResult Probe(ServiceKind service, TimeSpan timeout)
+        {
+            OrchestratedScanEvent scan = mihomo.ActiveScan();
+            scan.ObserveTimeout(timeout);
+            scan.ObserveService(service);
+            if (scan.Node == "current" && service == ServiceKind.ChatGPT)
+                Interlocked.Increment(ref currentChecks);
+            if (scan.Node == "node-01" && timeout > TimeSpan.FromSeconds(2) &&
+                service == ServiceKind.ChatGPT)
+            {
+                entered.Set();
+                released.Wait(TimeSpan.FromSeconds(15));
+            }
+            return ProbeResult.Success(scan.Node == "current" ? 900 : 150);
+        }
+    }
+
     private sealed class OpportunityServiceProbe : IServiceProbe
     {
         private readonly OrchestratedMihomo mihomo;
@@ -4371,6 +4450,38 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "candidate ranking failure does not replace the next main check");
         }
 
+        var delayedRankingRunner = new BlockingCandidateLatencyRunner();
+        using (var coordinator = new MonitorCoordinator(delayedRankingRunner,
+            TimeSpan.FromHours(1), TimeSpan.FromSeconds(5)))
+        {
+            int preferencesChanged = 0;
+            int staleRankings = 0;
+            coordinator.SnapshotChanged += snapshot => {
+                if (Volatile.Read(ref preferencesChanged) != 0 && snapshot.CandidateLatencies.Count > 0)
+                    Interlocked.Increment(ref staleRankings);
+            };
+            coordinator.Start();
+            Equal(true, delayedRankingRunner.WaitForRunCount(1, 1000),
+                "delayed ranking fixture completes the initial cycle");
+            coordinator.RequestCandidateRanking();
+            try
+            {
+                Equal(true, delayedRankingRunner.WaitUntilRankingStarts(1000),
+                    "delayed ranking fixture pauses candidate measurement");
+                Interlocked.Exchange(ref preferencesChanged, 1);
+                coordinator.UpdatePreferences(new UserPreferences {
+                    FirstRunComplete = true,
+                    RequiredServices = new List<ServiceKind> {
+                        ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Discord }
+                });
+            }
+            finally { delayedRankingRunner.Release(); }
+            Equal(true, delayedRankingRunner.WaitForRunCount(2, 1000),
+                "preference change starts a fresh cycle after the old ranking");
+            Equal(0, staleRankings,
+                "old dedicated ranking cannot publish after selected services change");
+        }
+
     }
 
     private static void BrowserVerificationUiBehavior()
@@ -4602,6 +4713,34 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         public void InvalidateCandidateLatencies() { }
     }
 
+    private sealed class BlockingCandidateLatencyRunner : IMonitorCycleRunner, ICandidateLatencyRunner
+    {
+        private readonly ManualResetEventSlim entered = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        private int runCount;
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            Interlocked.Increment(ref runCount);
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "ok",
+                DateTime.UtcNow, DateTime.UtcNow.AddHours(1));
+        }
+        public bool WaitForRunCount(int count, int milliseconds)
+        { return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= count, milliseconds); }
+        public bool WaitUntilRankingStarts(int milliseconds) { return entered.Wait(milliseconds); }
+        public void Release() { released.Set(); }
+        public IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences)
+        {
+            entered.Set();
+            released.Wait(TimeSpan.FromSeconds(5));
+            return new List<CandidateLatencyMeasurement> {
+                new CandidateLatencyMeasurement("old-candidate", "JP", 50,
+                    new[] { new ServiceMeasurement(ServiceKind.ChatGPT, true, 100, "ok") },
+                    DateTime.UtcNow)
+            }.AsReadOnly();
+        }
+        public void InvalidateCandidateLatencies() { }
+    }
+
     private sealed class DegradedCycleRunner : IMonitorCycleRunner
     {
         private int runCount;
@@ -4699,7 +4838,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.13"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.14"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

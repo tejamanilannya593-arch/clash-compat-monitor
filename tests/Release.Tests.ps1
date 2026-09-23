@@ -5,7 +5,7 @@ $required = @(
     'SECURITY.md','CONTRIBUTING.md','CODE_OF_CONDUCT.md',
     'scripts\install.ps1','scripts\upgrade.ps1','scripts\uninstall.ps1','scripts\diagnose.ps1',
     'clash\enhancement.js','assets\ClashCompatibilityMonitor.manifest','assets\ClashCompatibilityMonitor.ico',
-    'assets\social-preview.png','docs\images\service-incident-flow.png','docs\release-notes\v0.7.0-preview.13.md'
+    'assets\social-preview.png','docs\images\service-incident-flow.png','docs\release-notes\v0.7.0-preview.14.md'
 )
 foreach ($relative in $required) {
     if (!(Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf)) { throw "Missing release file: $relative" }
@@ -23,12 +23,12 @@ $currentDocs = $readme + (Get-Content -LiteralPath (Join-Path $root 'README.en.m
 
 if ($build.Contains('BrowserHost') -or $build.Contains('browser-extension') -or
     $package.Contains('BrowserHost') -or $package.Contains('browser-extension')) { throw 'Release still packages the removed browser companion.' }
-if (!$package.Contains('ClashCompatibilityMonitor-v0.7.0-preview.13') -or
-    !$program.Contains('Version = "0.7.0-preview.13"')) { throw 'Release version is inconsistent.' }
+if (!$package.Contains('ClashCompatibilityMonitor-v0.7.0-preview.14') -or
+    !$program.Contains('Version = "0.7.0-preview.14"')) { throw 'Release version is inconsistent.' }
 if ($worker.Contains('EnsureIpv4Compatibility') -or $mihomo.Contains('PUT", "/configs')) { throw 'Monitor may rewrite the complete Mihomo configuration.' }
 if ($install -match '(?i)Set-Content[^\r\n]*(profiles\.yaml|clash-verge\.yaml)' -or
     $install -match '(?i)Copy-Item[^\r\n]+-Destination[^\r\n]+\$clashRoot') { throw 'Installer may write a protected Clash file.' }
-if (!$install.Contains("Version='0.7.0-preview.13'") -or !$install.Contains('LegacyBrowserCompanionRemoved=$true') -or
+if (!$install.Contains("Version='0.7.0-preview.14'") -or !$install.Contains('LegacyBrowserCompanionRemoved=$true') -or
     !$install.Contains("diagnosis.Status -ne 'CONFIG_READY'")) { throw 'Installer upgrade safeguards are incomplete.' }
 if (!$package.Contains('$checksumFile = $zip + ''.sha256''') -or !$package.Contains('Encoding ASCII')) { throw 'SHA-256 sidecar is missing.' }
 if ($currentDocs -match '(?i)JMComic|18comic') { throw 'Current documentation advertises a retired probe.' }
@@ -58,7 +58,7 @@ if (!$currentDocs.Contains('stable node identity') -or !$currentDocs.Contains('s
 $exe = Join-Path $root 'bin\ClashCompatibilityMonitor.exe'
 if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Main executable was not built.' }
 $version = (Get-Item -LiteralPath $exe).VersionInfo
-if ($version.FileVersion -ne '0.7.0.0' -or $version.ProductVersion -ne '0.7.0-preview.13') { throw 'Windows version metadata is incorrect.' }
+if ($version.FileVersion -ne '0.7.0.0' -or $version.ProductVersion -ne '0.7.0-preview.14') { throw 'Windows version metadata is incorrect.' }
 
 $manifest = Join-Path $root 'assets\ClashCompatibilityMonitor.manifest'
 if (!(Select-String -LiteralPath $manifest -SimpleMatch 'PerMonitorV2' -Quiet) -or

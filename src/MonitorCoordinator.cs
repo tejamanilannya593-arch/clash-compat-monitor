@@ -68,6 +68,7 @@ public sealed class MonitorCoordinator : IDisposable
     private int restoreRequested;
     private int stopping;
     private int cancelCycle;
+    private int preferencesRevision;
     private readonly bool persistStatistics;
     private BrowserVerificationStatus browserStatus = BrowserVerificationStatus.None;
     private string browserStatusDetail = "";
@@ -257,7 +258,12 @@ public sealed class MonitorCoordinator : IDisposable
     {
         if (value == null || value.RequiredServices == null || value.RequiredServices.Count == 0)
             throw new ArgumentException("At least one required service is needed.", "value");
-        lock (preferencesGate) preferences = Copy(value);
+        Interlocked.Exchange(ref cancelCycle, 1);
+        lock (preferencesGate)
+        {
+            preferences = Copy(value);
+            Interlocked.Increment(ref preferencesRevision);
+        }
         browserCoordinator.SetConsent(value.BrowserConversationVerification);
         var latencyRunner = runner as ICandidateLatencyRunner;
         if (latencyRunner != null) latencyRunner.InvalidateCandidateLatencies();
@@ -313,10 +319,15 @@ public sealed class MonitorCoordinator : IDisposable
             bool restore = !rankingRequested && Interlocked.Exchange(ref restoreRequested, 0) != 0;
             Interlocked.Exchange(ref cancelCycle, 0);
             UserPreferences current;
-            lock (preferencesGate) current = Copy(preferences);
+            int cyclePreferencesRevision;
+            lock (preferencesGate)
+            {
+                current = Copy(preferences);
+                cyclePreferencesRevision = preferencesRevision;
+            }
             if (rankingRequested)
             {
-                RunCandidateLatencyRanking(current);
+                RunCandidateLatencyRanking(current, cyclePreferencesRevision);
                 continue;
             }
             Publish(Latest.WithState(MonitorRunState.Checking, "正在检测当前节点及所选服务", DateTime.MaxValue), false);
@@ -345,6 +356,11 @@ public sealed class MonitorCoordinator : IDisposable
             }
             if (Volatile.Read(ref stopping) != 0) break;
             if (Volatile.Read(ref paused) != 0) { if (cycle.IsFaulted) { var observed = cycle.Exception; } continue; }
+            if (Volatile.Read(ref preferencesRevision) != cyclePreferencesRevision)
+            {
+                if (cycle.IsFaulted) { var observed = cycle.Exception; }
+                continue;
+            }
 
             if (cycle.IsFaulted)
             {
@@ -367,7 +383,7 @@ public sealed class MonitorCoordinator : IDisposable
         Publish(MonitorSnapshot.CreateState(MonitorRunState.Stopped, "已退出", DateTime.UtcNow, DateTime.MaxValue), false);
     }
 
-    private void RunCandidateLatencyRanking(UserPreferences current)
+    private void RunCandidateLatencyRanking(UserPreferences current, int cyclePreferencesRevision)
     {
         var latencyRunner = runner as ICandidateLatencyRunner;
         if (latencyRunner == null) return;
@@ -388,6 +404,11 @@ public sealed class MonitorCoordinator : IDisposable
                     !WaitWithoutThrowing(task, TimeSpan.FromMilliseconds(100))) { }
             }
             if (Volatile.Read(ref stopping) != 0) return;
+            if (Volatile.Read(ref preferencesRevision) != cyclePreferencesRevision)
+            {
+                if (task.IsFaulted) { var observed = task.Exception; }
+                return;
+            }
             if (task.IsFaulted)
             {
                 var observed = task.Exception;
