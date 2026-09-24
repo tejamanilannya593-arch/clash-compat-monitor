@@ -83,7 +83,7 @@ public static class StartupRecovery
     public static ServiceKind[] FastProbeServices(System.Collections.Generic.IEnumerable<ServiceKind> required,
         ServiceKind failedService)
     {
-        return new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.SteamApi,
+        return new[] { ServiceKind.ChatGPT, ServiceKind.SteamApi,
                 ServiceKind.Google, ServiceKind.GitHub }
             .Concat(new[] { failedService }).Distinct().ToArray();
     }
@@ -120,7 +120,7 @@ public static class StartupRecovery
     public static bool IsEligibleQuickScan(CandidateScanResult scan, ServiceKind failedService)
     {
         return scan != null && CoreWebsitePolicy.AllReachable(scan) &&
-            AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) &&
+            AiRegionPolicy.SupportsChatGpt(scan.ExitCountryCode) &&
             ServiceEvidencePolicy.CanFastFailoverTarget(scan, failedService);
     }
 

@@ -24,7 +24,6 @@ public sealed class TrayHost : ApplicationContext
         menu.Items.Add("打开详情", null, delegate { ShowDetails(); });
         menu.Items.Add("立即复检", null, delegate { coordinator.RequestCheck(); });
         menu.Items.Add("当前节点 ChatGPT 不可用", null, delegate { ReportCurrentFailure(ServiceKind.ChatGPT); });
-        menu.Items.Add("当前节点 Gemini 不可用", null, delegate { ReportCurrentFailure(ServiceKind.Gemini); });
         menu.Items.Add("暂停自动优化", null, delegate { coordinator.SetPaused(true); });
         menu.Items.Add("恢复自动优化", null, delegate { coordinator.SetPaused(false); });
         menu.Items.Add(new ToolStripSeparator());

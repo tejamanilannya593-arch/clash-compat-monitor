@@ -41,7 +41,7 @@ public sealed class RegionEligibilityCache
             .OrderByDescending(x => x.CheckedUtc)
             .FirstOrDefault();
         countryCode = item == null ? "" : item.CountryCode;
-        supported = item != null && AiRegionPolicy.SupportsBoth(item.CountryCode);
+        supported = item != null && AiRegionPolicy.SupportsChatGpt(item.CountryCode);
         return item != null;
     }
 
@@ -58,7 +58,7 @@ public sealed class RegionEligibilityCache
                 x.PolicyVersion == AiRegionPolicy.SnapshotDate && x.CheckedUtc > now.AddHours(-24))
             .OrderByDescending(x => x.CheckedUtc).FirstOrDefault();
         countryCode = item == null ? "" : item.CountryCode;
-        supported = item != null && AiRegionPolicy.SupportsBoth(item.CountryCode);
+        supported = item != null && AiRegionPolicy.SupportsChatGpt(item.CountryCode);
         return item != null;
     }
 

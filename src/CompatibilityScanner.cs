@@ -99,7 +99,9 @@ public sealed class CompatibilityScanner
             {
                 if (!identity.Known)
                     result = ProbeResult.Unverified("无法确认实际出口，不能验证 AI 官方支持地区", result.ElapsedMilliseconds);
-                else if (!AiRegionPolicy.SupportsBoth(identity.CountryCode))
+                else if (service == ServiceKind.ChatGPT && !AiRegionPolicy.SupportsChatGpt(identity.CountryCode))
+                    result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 官方支持地区", result.ElapsedMilliseconds);
+                else if (service == ServiceKind.Gemini && !AiRegionPolicy.SupportsBoth(identity.CountryCode))
                     result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 与 Gemini 官方支持地区交集中", result.ElapsedMilliseconds);
             }
             measurements[service] = result;

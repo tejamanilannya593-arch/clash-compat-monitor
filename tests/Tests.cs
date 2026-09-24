@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.18", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.19", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -790,6 +790,11 @@ internal static class Tests
         Equal(true, AiRegionPolicy.SupportsBoth("SG"), "Singapore is in the ChatGPT and Gemini intersection");
         Equal(true, AiRegionPolicy.SupportsBoth("TW"), "Taiwan is in the ChatGPT and Gemini intersection");
         Equal(false, AiRegionPolicy.SupportsBoth("AF"), "Afghanistan is excluded because Gemini web does not support it");
+        Equal(true, AiRegionPolicy.SupportsChatGpt("AF"),
+            "ChatGPT-supported exits are not rejected by the old Gemini intersection");
+        Equal(true, AiRegionPolicy.SupportsChatGpt("SG"), "Singapore actual exit is eligible for ChatGPT");
+        Equal(false, AiRegionPolicy.SupportsChatGpt("HK"), "Hong Kong remains outside ChatGPT support");
+        Equal(false, AiRegionPolicy.SupportsChatGpt(""), "unknown actual exit remains ineligible");
         Equal(false, AiRegionPolicy.SupportsBoth("HK"), "Hong Kong is excluded because ChatGPT does not officially support it");
         Equal(false, AiRegionPolicy.SupportsBoth("CN"), "mainland China is excluded from the shared consumer-web intersection");
         Equal(false, AiRegionPolicy.SupportsBoth(""), "unknown exit is never assumed supported");
@@ -2130,15 +2135,15 @@ internal static class Tests
         ServiceKind[] criticalServices = StartupRecovery.FastProbeServices(
             new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google, ServiceKind.GitHub,
                 ServiceKind.SteamStore, ServiceKind.SteamCommunity, ServiceKind.SteamApi }, ServiceKind.SteamApi);
-        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", criticalServices),
+        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", criticalServices),
             "fast comparison skips duplicate Steam endpoints but keeps the failed service");
         ServiceKind[] fixedCriticalServices = StartupRecovery.FastProbeServices(
             new[] { ServiceKind.Discord, ServiceKind.ZLibraryWeb }, ServiceKind.GitHub);
-        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", fixedCriticalServices),
+        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", fixedCriticalServices),
             "fast comparison always checks the AI, Steam, Google and GitHub services");
         ServiceKind[] fullFailoverServices = StartupRecovery.FullFailoverProbeServices(
             new[] { ServiceKind.Discord, ServiceKind.ZLibraryWeb }, ServiceKind.GitHub);
-        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub,Discord,ZLibraryWeb", String.Join(",", fullFailoverServices),
+        Equal("ChatGPT,SteamApi,Google,GitHub,Discord,ZLibraryWeb", String.Join(",", fullFailoverServices),
             "full failover validation retains every selected service after the critical gate");
         var fasterTarget = new CandidateScanResult("fast", CandidateHealth.BasicCompatible, null, "ok", 800, 2,
             new Dictionary<ServiceKind, ProbeResult>
@@ -2294,17 +2299,17 @@ internal static class Tests
             Equal(10, table.Rows.Count, "candidate latency table always presents at least ten rows");
             Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "ChatGPT"),
                 "candidate latency table has a ChatGPT website column");
-            Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
-                "candidate latency table has a Gemini website column");
-            Equal("service_ChatGPT,service_Gemini,service_SteamApi,service_Google",
+            Equal(false, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
+                "candidate latency table excludes the retired Gemini column");
+            Equal("service_ChatGPT,service_SteamApi,service_Google",
                 String.Join(",", table.Columns.Cast<DataGridViewColumn>()
                     .Where(x => x.Name.StartsWith("service_", StringComparison.Ordinal))
                     .Select(x => x.Name).Take(4)),
                 "candidate latency table shows primary AI then secondary Steam and Google");
             Equal("入口可达 · 120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
                 "candidate latency table shows partial website latency without claiming full verification");
-            Equal("不可用", table.Rows[0].Cells["service_Gemini"].Value,
-                "candidate latency table distinguishes failure from latency");
+            Equal(false, table.Columns.Contains("service_Gemini"),
+                "candidate latency table ignores old cached Gemini measurements");
             Equal("待测", table.Rows[9].Cells["node"].Value,
                 "unmeasured ranking slots remain explicit");
         }
@@ -2360,8 +2365,10 @@ internal static class Tests
                 "candidate ranking exposes per-website measured latency");
             Equal(true, ranking.All(x =>
                 x.Services.Any(service => service.Service == ServiceKind.ChatGPT) &&
-                x.Services.Any(service => service.Service == ServiceKind.Gemini)),
-                "every candidate row includes the mandatory AI websites");
+                x.Services.Any(service => service.Service == ServiceKind.SteamApi) &&
+                x.Services.Any(service => service.Service == ServiceKind.Google) &&
+                !x.Services.Any(service => service.Service == ServiceKind.Gemini)),
+                "every candidate row measures the three core websites without Gemini");
             ((ICandidateLatencyRunner)worker).InvalidateCandidateLatencies();
             Equal(0, worker.RunOnce(false, UserPreferences.Defaults()).CandidateLatencies.Count,
                 "invalidated candidate ranking cannot reappear after a normal monitor cycle");
@@ -2908,8 +2915,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "ranked selector checks website order and stops after the first eligible target");
         Equal(2, selected.Rechecked, "ranked selector reports its full recheck count");
         Equal(2, selected.Rank, "ranked selector reports the displayed one-based rank");
-        Equal(220d, selected.ResponseMilliseconds,
-            "ranked selector retains full selected-service response, not quick ranking latency");
+        Equal(200d, selected.ResponseMilliseconds,
+            "ranked selector reports the fully rechecked ChatGPT response");
 
         checkedNodes.Clear();
         RankedOpportunitySelection none = RankedOpportunitySelector.Select(ranking, 130, required, node => {
@@ -2924,6 +2931,28 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
     private static void WebsitePrioritySelectionBehavior()
     {
         DateTime now = new DateTime(2026, 9, 24, 0, 0, 0, DateTimeKind.Utc);
+        var singaporeM2 = new CandidateScanResult("SG 新加坡 M2", CandidateHealth.BasicCompatible,
+            null, "ok", 0, 3, new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Partial("entry", 516) },
+                { ServiceKind.SteamApi, ProbeResult.Success(300) },
+                { ServiceKind.Google, ProbeResult.Success(350) }
+            }, null, "SG");
+        Equal(true, StartupRecovery.IsEligibleQuickScan(singaporeM2, ServiceKind.ChatGPT),
+            "Singapore M2 is eligible when ChatGPT, Steam and Google work without Gemini");
+        var gptUnavailable = new CandidateLatencyMeasurement("gpt-unavailable", "SG", 20, new[] {
+            new ServiceMeasurement(ServiceKind.ChatGPT, false, 0, "blocked", ProbeFailureKind.Service),
+            new ServiceMeasurement(ServiceKind.SteamApi, true, 50, "ok"),
+            new ServiceMeasurement(ServiceKind.Google, true, 50, "ok") }, now);
+        var m2Measured = new CandidateLatencyMeasurement("SG 新加坡 M2", "SG", 50, new[] {
+            new ServiceMeasurement(ServiceKind.ChatGPT, true, 516, "entry", ProbeFailureKind.Partial),
+            new ServiceMeasurement(ServiceKind.SteamApi, true, 300, "ok"),
+            new ServiceMeasurement(ServiceKind.Google, true, 350, "ok") }, now);
+        Equal(true, WebsitePriorityLatency.Primary(m2Measured) < WebsitePriorityLatency.Primary(gptUnavailable),
+            "ChatGPT-reachable M2 outranks nodes whose ChatGPT is unavailable");
+        Equal("SG 新加坡 M2", StartupRecovery.RankVerifiedFastTargets(
+            new[] { singaporeM2 }, new Dictionary<string, int> { { "SG 新加坡 M2", 50 } },
+            ServiceKind.ChatGPT).FirstOrDefault(),
+            "quick recovery can select Singapore M2 without a Gemini result");
         var aiFast = new CandidateLatencyMeasurement("ai-fast", "JP", 900, new[] {
             new ServiceMeasurement(ServiceKind.ChatGPT, true, 180, "ok"),
             new ServiceMeasurement(ServiceKind.Gemini, true, 200, "ok"),
@@ -3466,7 +3495,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
             Equal("current", mihomo.GetSelected("shared"),
                 "three-node service consensus keeps the current node instead of switching");
-            Equal(true, snapshot.Decision.Contains("继续寻找四站可连接的节点"),
+            Equal(true, snapshot.Decision.Contains("继续寻找三站可连接的节点"),
                 "shared core-service failure does not falsely claim that recovery search stopped");
             Equal(ProbeFailureKind.Service,
                 snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT).Evidence,
@@ -4453,13 +4482,16 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
     private static void UserPreferenceBehavior()
     {
+        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",",
+            UserPreferencePolicy.NormalizeServices(new[] { ServiceKind.Gemini, ServiceKind.GitHub })),
+            "legacy Gemini preference is removed while the other fixed websites remain");
         Equal(false, Enum.GetNames(typeof(ServiceKind)).Contains("JMComicWeb"), "jmcomic service removed");
         string root = Path.Combine(Path.GetTempPath(), "monitor-prefs-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(root, "preferences.state");
         var store = new UserPreferenceStore(path);
         UserPreferences defaults = store.Load();
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.ChatGPT), "default includes ChatGPT");
-        Equal(true, defaults.RequiredServices.Contains(ServiceKind.Gemini), "default includes Gemini");
+        Equal(false, defaults.RequiredServices.Contains(ServiceKind.Gemini), "default excludes Gemini");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
@@ -4472,15 +4504,15 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
-        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", loaded.RequiredServices),
-            "saving old preferences retains the fixed four-website core");
+        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", loaded.RequiredServices),
+            "saving old preferences retains the fixed three-website core");
         Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
         Equal(false, loaded.BrowserConversationVerification, "removed browser consent is not persisted");
         Equal(true, File.ReadAllText(path).Contains("version=3"), "preference schema upgraded");
         Equal(true, File.ReadAllText(path).Contains("version=3"), "browser-free preference schema is version 3");
         Equal(false, File.ReadAllText(path).Contains("browserConversation"), "saved preferences contain no browser consent");
         File.WriteAllText(path, "broken", Encoding.UTF8);
-        Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
+        Equal(false, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
 
         string migrationRoot = Path.Combine(Path.GetTempPath(), "monitor-prefs-migration-" + Guid.NewGuid().ToString("N"));
@@ -4490,8 +4522,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "version=1\r\nfirstRun=True\r\nautomatic=True\r\nservices=ChatGPT,JMComicWeb,GitHub\r\n", Encoding.UTF8);
         var migrationStore = new UserPreferenceStore(migrationPath);
         UserPreferences migrated = migrationStore.Load();
-        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", migrated.RequiredServices),
-            "legacy preferences migrate to the fixed four-website core");
+        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", migrated.RequiredServices),
+            "legacy preferences migrate to the fixed three-website core");
         Equal(false, migrated.AutomaticOptimization, "v1 optimization migrates to conservative mode");
         Equal(false, migrated.BrowserConversationVerification, "v1 browser proof requires consent");
         Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
@@ -4502,14 +4534,14 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "version=2\r\nfirstRun=True\r\nautomatic=True\r\nbrowserConversation=True\r\nservices=GitHub\r\n", Encoding.UTF8);
         UserPreferences browserLegacy = migrationStore.Load();
         Equal(true, browserLegacy.AutomaticOptimization, "version 2 browser consent is ignored without corrupting preferences");
-        Equal("ChatGPT,Gemini,SteamApi,Google,GitHub", String.Join(",", browserLegacy.RequiredServices),
-            "version 2 services migrate to the fixed four-website core");
+        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", browserLegacy.RequiredServices),
+            "version 2 services migrate to the fixed three-website core");
 
         using (var form = new DetailsForm(new UserPreferences {
             RequiredServices = new List<ServiceKind> { ServiceKind.Gemini, ServiceKind.GitHub }
         }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }))
         {
-            CheckBox core = FindCheckBox(form, "ChatGPT、Gemini、Steam API 与 Google（固定核心）");
+            CheckBox core = FindCheckBox(form, "ChatGPT、Steam API 与 Google（固定核心）");
             Equal(true, core != null && core.Checked && !core.Enabled,
                 "settings display all four websites as one always-enabled core");
             Equal(null, FindCheckBox(form, "ChatGPT"), "settings cannot disable ChatGPT independently");
@@ -5042,12 +5074,12 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.18"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.19"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
-        Equal(true, report.Contains("AI 地区规则：ChatGPT ∩ Gemini 官方支持地区（快照 2026-09-17）"),
-            "status identifies the dated shared AI region policy");
+        Equal(true, report.Contains("AI 地区规则：ChatGPT 官方支持地区（快照 2026-09-17）"),
+            "status identifies the dated ChatGPT region policy");
         Equal(false, report.Contains("secret"), "status omits credentials");
         Equal(true, StatusReport.Format(now, "日本 J1", CandidateHealth.Compatible, 88,
             "保持当前节点", "ok").Contains("检测状态：登录链路及后台服务探测通过"),

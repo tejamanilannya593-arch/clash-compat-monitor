@@ -710,7 +710,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
                             if (!observing) controller.Decide(true, false, current, null);
                             serviceIncidentDecision = MonitorPresentation.ServiceLabel(failedService) +
                                 (CoreWebsitePolicy.Required.Contains(failedService)
-                                    ? " 已在当前节点和两个备用节点出现同类异常，暂停节点归因，继续寻找四站可连接的节点"
+                                    ? " 已在当前节点和两个备用节点出现同类异常，暂停节点归因，继续寻找三站可连接的节点"
                                     : " 已在当前节点和两个备用节点出现同类异常，暂停归因和切换 10 分钟");
                             logger.Write("service circuit opened service=" + failedService + " kind=" + kind +
                                 " confirmations=3 duration_minutes=10");
@@ -1587,7 +1587,7 @@ public sealed class MonitorWorker : IRestorableCycleRunner, IProgressCycleRunner
             CheckStop();
             CandidateNode candidate = alternatives.First(x => x.Name == name);
             CandidateScanResult scan = scanner.ScanSelected(candidate, requiredServices
-                .Concat(new[] { ServiceKind.ChatGPT, ServiceKind.Gemini,
+                .Concat(new[] { ServiceKind.ChatGPT,
                     ServiceKind.SteamApi, ServiceKind.Google }).Distinct().ToArray(),
                 TimeSpan.FromSeconds(2));
             int mihomoDelay;

@@ -18,7 +18,6 @@ public sealed class UserPreferences
             BrowserConversationVerification = false,
             RequiredServices = new List<ServiceKind> {
                 ServiceKind.ChatGPT,
-                ServiceKind.Gemini,
                 ServiceKind.Google,
                 ServiceKind.GitHub,
                 ServiceKind.SteamStore,

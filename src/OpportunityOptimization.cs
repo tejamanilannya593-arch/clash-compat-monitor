@@ -30,7 +30,7 @@ public static class OpportunityOptimizationPolicy
     public static bool IsPerformanceComparable(CandidateScanResult scan,
         IEnumerable<ServiceKind> requiredServices)
     {
-        if (scan == null || !AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) ||
+        if (scan == null || !AiRegionPolicy.SupportsChatGpt(scan.ExitCountryCode) ||
             !ServiceEvidencePolicy.CanHold(scan) || !QualityPolicy.ServicesWithinLimit(scan)) return false;
         var required = (requiredServices ?? Enumerable.Empty<ServiceKind>()).Distinct().ToList();
         if (required.Count == 0 || required.Any(service => !scan.ServiceResults.ContainsKey(service))) return false;

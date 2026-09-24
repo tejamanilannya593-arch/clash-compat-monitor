@@ -6,8 +6,7 @@ internal static class WebsitePriorityLatency
 {
     public static double Primary(CandidateScanResult scan)
     {
-        return scan == null ? Double.MaxValue : Pair(
-            scan.ServiceResults, ServiceKind.ChatGPT, ServiceKind.Gemini);
+        return scan == null ? Double.MaxValue : Single(scan.ServiceResults, ServiceKind.ChatGPT);
     }
 
     public static double Secondary(CandidateScanResult scan)
@@ -18,8 +17,7 @@ internal static class WebsitePriorityLatency
 
     public static double Primary(CandidateLatencyMeasurement candidate)
     {
-        return candidate == null ? Double.MaxValue : Pair(
-            candidate.Services, ServiceKind.ChatGPT, ServiceKind.Gemini);
+        return candidate == null ? Double.MaxValue : Single(candidate.Services, ServiceKind.ChatGPT);
     }
 
     public static double Secondary(CandidateLatencyMeasurement candidate)
@@ -38,6 +36,21 @@ internal static class WebsitePriorityLatency
             !left.Passed || !right.Passed || left.ElapsedMilliseconds <= 0 ||
             right.ElapsedMilliseconds <= 0) return Double.MaxValue;
         return Math.Max(left.ElapsedMilliseconds, right.ElapsedMilliseconds);
+    }
+
+    private static double Single(IDictionary<ServiceKind, ProbeResult> results, ServiceKind service)
+    {
+        ProbeResult result;
+        return results != null && results.TryGetValue(service, out result) && result != null &&
+            result.Passed && result.ElapsedMilliseconds > 0
+            ? result.ElapsedMilliseconds : Double.MaxValue;
+    }
+
+    private static double Single(IEnumerable<ServiceMeasurement> services, ServiceKind service)
+    {
+        ServiceMeasurement result = services == null ? null : services.FirstOrDefault(x => x.Service == service);
+        return result != null && result.Available && result.Milliseconds > 0
+            ? result.Milliseconds : Double.MaxValue;
     }
 
     private static double Pair(IEnumerable<ServiceMeasurement> services,
