@@ -62,7 +62,7 @@ internal static class Tests
     public static int Main()
     {
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.19", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.27", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
@@ -78,6 +78,7 @@ internal static class Tests
         BoundedPipeBehavior();
         MihomoPipeIntegration();
         CompatibilityScanning();
+        CandidateDelayMeasurementBehavior();
         FastFailoverWorkerOrchestration();
         CandidateLatencyRankingBehavior();
         AutomaticRankedSelectionBehavior();
@@ -674,6 +675,10 @@ internal static class Tests
             var services = (ListView)typeof(DetailsForm).GetField("serviceList", fields).GetValue(form);
             Equal(true, FindButton(form, "候选网站延迟排行") != null,
                 "details window exposes the candidate website latency table");
+            Equal(true, FindButton(form, "立即复检当前节点") != null,
+                "details window distinguishes a current-node recheck");
+            Equal(true, FindButton(form, "立即寻优并切换") != null,
+                "details window exposes an explicit immediate optimization action");
             Equal("Segoe UI", times.Font.Name, "timestamps use compact Latin digits");
             Equal("Segoe UI", services.Font.Name, "service latency uses compact Latin digits");
             form.Show();
@@ -2087,6 +2092,8 @@ internal static class Tests
             "background maintenance does not hide completed basic reachability");
         Equal(true, StartupRecovery.NeedsImmediateConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "definite startup failure gets immediate confirmation");
         Equal(true, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.GitHub, "timeout")), "ordinary timeout is quickly confirmed once");
+        Equal(false, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.Transient, ServiceKind.ChatGPT, "timeout")),
+            "ChatGPT outage starts immediate recovery without a second current-node wait");
         Equal(false, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.RegionBlocked, ServiceKind.ChatGPT, "unsupported country")), "explicit region rejection switches without retesting current node");
         Equal(false, StartupRecovery.RequiresRepeatConfirmation(new CandidateScanResult("x", CandidateHealth.ServiceFailed, ServiceKind.Gemini, "http rejection")), "explicit service rejection switches without retesting current node");
         var severeLatency = new CandidateScanResult("x", CandidateHealth.Compatible, null, "slow", 2300, 2,
@@ -2263,10 +2270,16 @@ internal static class Tests
             RunUnhelpfulSevereLatencyOrchestration();
             RunBudgetedSevereLatencyOrchestration();
             RunEligibleFastFailoverOrchestration();
+            RunImmediateChatGptRecoveryAcrossAllLiveCandidates();
+            RunImmediateChatGptRecoveryRetriesWithoutWaiting();
+            RunImmediateChatGptRecoveryContinuesAcrossBatches();
+            RunImmediateChatGptRecoveryCompletesFullPassAcrossBatches();
             RunEightCandidateFastFailoverBound();
             RunCoreFourRecovery();
             RunLocalLinkFailurePausesSearch();
             RunAutomaticOpportunityOrchestration();
+            RunStableHoldMandatoryOpportunityOrchestration();
+            RunManualOpportunityBypassesStableHold();
             RunRecentSwitchOpportunityHysteresisOrchestration();
             RunBudgetedOpportunityConfirmationOrchestration();
             RunActiveCircuitAutomaticFailover();
@@ -2282,13 +2295,30 @@ internal static class Tests
     private static void CandidateLatencyTableBehavior()
     {
         DateTime now = new DateTime(2026, 9, 23, 6, 0, 0, DateTimeKind.Utc);
-        MonitorSnapshot snapshot = MonitorSnapshot.CreateState(MonitorRunState.Running, "ok", now, now)
+        var currentScan = new CandidateScanResult("current", CandidateHealth.Compatible,
+            null, "ok", 0, 3, new Dictionary<ServiceKind, ProbeResult> {
+                { ServiceKind.ChatGPT, ProbeResult.Success(596) },
+                { ServiceKind.SteamApi, ProbeResult.Success(229) },
+                { ServiceKind.Google, ProbeResult.Success(66) }
+            }, null, "SG");
+        MonitorSnapshot snapshot = MonitorSnapshot.CreateRunning("current", currentScan,
+            null, "ok", now, now)
             .WithCandidateLatencies(new[] {
                 new CandidateLatencyMeasurement("node-a", "JP", 42, new[] {
-                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 120, "entry reachable", ProbeFailureKind.Partial),
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 588, "entry reachable", ProbeFailureKind.Partial),
                     new ServiceMeasurement(ServiceKind.Gemini, false, 900, "blocked", ProbeFailureKind.Service),
                     new ServiceMeasurement(ServiceKind.SteamApi, true, 150, "ok"),
                     new ServiceMeasurement(ServiceKind.Google, true, 160, "ok")
+                }, now),
+                new CandidateLatencyMeasurement("node-mandatory", "JP", 40, new[] {
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 296, "ok"),
+                    new ServiceMeasurement(ServiceKind.SteamApi, true, 140, "ok"),
+                    new ServiceMeasurement(ServiceKind.Google, true, 150, "ok")
+                }, now),
+                new CandidateLatencyMeasurement("node-steam-failed", "SG", 45, new[] {
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 110, "ok", ProbeFailureKind.Partial),
+                    new ServiceMeasurement(ServiceKind.SteamApi, false, 0, "blocked", ProbeFailureKind.Service),
+                    new ServiceMeasurement(ServiceKind.Google, true, 140, "ok")
                 }, now)
             });
         using (var form = new CandidateLatencyForm(snapshot, delegate { }))
@@ -2306,12 +2336,31 @@ internal static class Tests
                     .Where(x => x.Name.StartsWith("service_", StringComparison.Ordinal))
                     .Select(x => x.Name).Take(4)),
                 "candidate latency table shows primary AI then secondary Steam and Google");
-            Equal("入口可达 · 120 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
+            Equal("入口可达 · 588 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
                 "candidate latency table shows partial website latency without claiming full verification");
             Equal(false, table.Columns.Contains("service_Gemini"),
                 "candidate latency table ignores old cached Gemini measurements");
+            Equal(true, table.Columns.Contains("decision"),
+                "candidate latency table exposes why a measured row was not selected");
+            if (table.Columns.Contains("decision"))
+            {
+                Equal(2, table.Columns["decision"].DisplayIndex,
+                    "candidate rejection reason is visible beside the node without horizontal scrolling");
+                Equal(true, table.Columns["decision"].Frozen,
+                    "candidate rejection reason stays visible while website columns scroll");
+                Equal("仅快 8 ms，未达 200 ms 强制线；点击立即寻优可复检",
+                    table.Rows[0].Cells["decision"].Value,
+                    "candidate row quantifies a small improvement against the current node");
+                Equal("快 300 ms，已达 200 ms 强制线；点击立即寻优进行完整复检",
+                    table.Rows[1].Cells["decision"].Value,
+                    "candidate row makes a mandatory improvement explicit before full validation");
+                Equal("Steam API 未通过", table.Rows[2].Cells["decision"].Value,
+                    "failed fixed website is named in the rejection reason");
+            }
             Equal("待测", table.Rows[9].Cells["node"].Value,
                 "unmeasured ranking slots remain explicit");
+            Equal(true, FindButton(form, "立即寻优并切换") != null,
+                "candidate ranking offers an explicit full-validation switch action");
         }
     }
 
@@ -2433,7 +2482,8 @@ internal static class Tests
                 new BoundedLogger(Path.Combine(fastRoot, "logs", "monitor.log"), 1024 * 1024),
                 new FakeClock { UtcNow = new DateTime(2026, 9, 23, 9, 10, 0, DateTimeKind.Utc) },
                 new OrchestratedExitIdentityProbe(mihomo, false), null,
-                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
 
             MonitorSnapshot result = worker.Run(preferences);
             Equal("current", mihomo.GetSelected("shared"),
@@ -2557,6 +2607,52 @@ internal static class Tests
         finally { DeleteDirectoryEventually(preferencesRoot); }
     }
 
+    private static void CandidateDelayMeasurementBehavior()
+    {
+        var malformed = new DelayMeasurementMihomo("bad");
+        Dictionary<string, int> malformedResult = CandidateDelayMeasurement.Measure(
+            malformed,
+            new[] { new CandidateNode("good", null), new CandidateNode("bad", null) },
+            "https://chatgpt.com/", 1500, 4);
+        Equal(25, malformedResult["good"],
+            "candidate delay measurement keeps valid results when one response is malformed");
+        Equal(Int32.MaxValue, malformedResult["bad"],
+            "candidate delay measurement degrades a malformed response to unknown");
+
+        var blocked = new DelayMeasurementMihomo(null, true, "blocked-40");
+        CandidateNode[] candidates = Enumerable.Range(1, 40)
+            .Select(x => new CandidateNode("blocked-" + x, null)).ToArray();
+        Task unblock = Task.Factory.StartNew(() => {
+            Thread.Sleep(100);
+            blocked.Release();
+        });
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        Dictionary<string, int> boundedResult = CandidateDelayMeasurement.Measure(
+            blocked, candidates, "https://chatgpt.com/", 1500, 8);
+        timer.Stop();
+        Equal(true, timer.Elapsed < TimeSpan.FromSeconds(2),
+            "candidate delay batches advance promptly after slow calls finish");
+        Equal(true, blocked.MaximumConcurrentCalls <= 8,
+            "candidate delay round respects its fixed concurrency bound");
+        Equal(40, blocked.DelayCalls().Distinct(StringComparer.Ordinal).Count(),
+            "bounded delay batches still attempt every candidate");
+        Equal(5, boundedResult["blocked-40"],
+            "a fast tail candidate keeps its measured latency after earlier batches stall");
+        Equal(true, boundedResult.Where(x => x.Key != "blocked-40").All(x => x.Value == 25),
+            "bounded delay batches retain every completed result");
+        unblock.Wait();
+        Equal(true, SpinWait.SpinUntil(() => blocked.ActiveCalls == 0, TimeSpan.FromSeconds(1)),
+            "bounded delay workers finish without lingering calls");
+    }
+
+    private static string StringProperty(object value, string name)
+    {
+        if (value == null) return "";
+        PropertyInfo property = value.GetType().GetProperty(name,
+            BindingFlags.Instance | BindingFlags.Public);
+        return property == null ? "" : (property.GetValue(value, null) as string ?? "");
+    }
+
     private static void RunRecoveredSevereLatencyOrchestration()
     {
         string root = Path.Combine(Path.GetTempPath(), "monitor-latency-recovery-" + Guid.NewGuid().ToString("N"));
@@ -2665,7 +2761,8 @@ internal static class Tests
                 new OpportunityServiceProbe(mihomo),
                 new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024), clock,
                 new OrchestratedExitIdentityProbe(mihomo, false), null,
-                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
 
             MonitorSnapshot discovery = worker.Run(preferences);
 
@@ -2688,6 +2785,10 @@ internal static class Tests
                 "ranked selection trace records the bounded scan and switch");
             Equal(false, trace.Contains("node-06") || trace.Contains("node-07"),
                 "opportunity trace never exposes raw node names");
+            CandidateLatencyMeasurement selectedRow = discovery.CandidateLatencies
+                .First(x => x.Node == "node-01");
+            Equal("已切换到此节点", StringProperty(selectedRow, "DecisionDetail"),
+                "candidate ranking records the final selected outcome");
 
             int delayCount = mihomo.DelayNodes(2500).Count;
             clock.UtcNow = now.AddSeconds(30);
@@ -2706,6 +2807,171 @@ internal static class Tests
                 "ranked selection has no pending optimization");
             Equal(TimeSpan.FromSeconds(30), confirmation.NextCheckUtc - confirmation.CheckedUtc,
                 "ranked switch keeps the observation interval");
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunManualOpportunityBypassesStableHold()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-manual-opportunity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 20, 12, 30, 0, DateTimeKind.Utc);
+            string[] alternatives = Enumerable.Range(1, 3).Select(x => "node-" + x.ToString("D2")).ToArray();
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            var assurance = new ConnectionAssurance {
+                Scope = scope,
+                HoldUntilUtc = now.AddMinutes(30),
+                LastOpportunityScanUtc = now,
+                Standbys = new List<StandbyNode>(),
+                AutomaticSwitches = Enumerable.Range(1, 4).Select(x => new AutomaticSwitchRecord {
+                    Utc = now.AddMinutes(-x), From = "old-" + x, To = "current", Reason = "automatic"
+                }).ToList()
+            };
+            var persisted = new ExperienceData {
+                ActiveScope = scope,
+                ActiveServicesKey = servicesKey,
+                ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                LastNode = "current",
+                Assurance = assurance,
+                Nodes = new List<NodeExperience> {
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, delays);
+            var clock = new FakeClock { UtcNow = now };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OpportunityServiceProbe(mihomo),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024), clock,
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
+
+            MonitorSnapshot scheduled = worker.Run(preferences, MonitorCycleTrigger.Scheduled);
+            Equal("current", mihomo.GetSelected("shared"),
+                "scheduled optimization respects the post-switch stable hold");
+            Equal(0, mihomo.DelayNodes(2500).Count,
+                "scheduled optimization does not scan alternatives during the stable hold");
+            Equal(true, scheduled.Decision.Contains("稳定期") && scheduled.Decision.Contains("立即寻优并切换"),
+                "scheduled status explains the stable hold and the explicit override action");
+
+            MonitorCycleTrigger manual;
+            bool parsed = Enum.TryParse("ManualOptimization", out manual);
+            Equal(true, parsed, "manual optimization has a dedicated coordinator trigger");
+            if (parsed)
+            {
+                MonitorSnapshot optimized = worker.Run(preferences, manual);
+                Equal(alternatives.Length, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                    "manual optimization bypasses scan interval and stable hold");
+                Equal("node-01", mihomo.GetSelected("shared"),
+                    "manual optimization bypasses the automatic switch budget after full validation");
+                Equal(true, optimized.Decision.Contains("立即寻优"),
+                    "manual optimization reports its explicit switch result");
+            }
+        }
+        finally
+        {
+            DeleteDirectoryEventually(root);
+        }
+    }
+
+    private static void RunStableHoldMandatoryOpportunityOrchestration()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-stable-hold-mandatory-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 20, 12, 15, 0, DateTimeKind.Utc);
+            string[] alternatives = Enumerable.Range(1, 3).Select(x => "node-" + x.ToString("D2")).ToArray();
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var preferences = UserPreferences.Defaults();
+            preferences.AutomaticOptimization = true;
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            var persisted = new ExperienceData {
+                ActiveScope = scope,
+                ActiveServicesKey = servicesKey,
+                ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                LastNode = "current",
+                Assurance = new ConnectionAssurance {
+                    Scope = scope,
+                    HoldUntilUtc = now.AddMinutes(30),
+                    LastOpportunityScanUtc = now.Subtract(OpportunityOptimizationPolicy.ScanInterval),
+                    Standbys = new List<StandbyNode>(),
+                    AutomaticSwitches = Enumerable.Range(1, 4).Select(x => new AutomaticSwitchRecord {
+                        Utc = now.AddMinutes(-x), From = "old-" + x, To = "current", Reason = "automatic"
+                    }).ToList()
+                },
+                Nodes = new List<NodeExperience> {
+                    new NodeExperience { Scope = scope, Node = "current", FirstUtc = now.AddMinutes(-5),
+                        LastUtc = now.AddMinutes(-1), Samples = 5, Success = 1, LastPassed = true,
+                        RecentResponseMilliseconds = new List<double> { 1000, 1000, 1000, 1000, 1000 } }
+                }
+            };
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(persisted, now);
+            var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, delays);
+            var clock = new FakeClock { UtcNow = now };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OpportunityServiceProbe(mihomo, 1000, 801),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                clock, new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
+
+            MonitorSnapshot belowThreshold = worker.Run(preferences, MonitorCycleTrigger.Scheduled);
+
+            Equal(alternatives.Length, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                "stable hold still scans alternatives when the scheduled interval is due");
+            Equal("current", mihomo.GetSelected("shared"),
+                "one-hundred-ninety-nine millisecond improvement cannot break the stable hold");
+            Equal(true, belowThreshold.Decision.Contains("200 ms") && belowThreshold.Decision.Contains("保持当前节点"),
+                "stable-hold status explains why the measured faster node was retained");
+
+            var store = new ExperienceStore(Path.Combine(root, "state", "experience.json"));
+            ExperienceData stabilization = store.Load();
+            stabilization.Assurance.HoldUntilUtc = DateTime.MinValue;
+            stabilization.Assurance.Decision = new AutomaticDecisionTransaction {
+                State = AutomaticDecisionState.Stabilization,
+                Current = "current",
+                StartedUtc = now,
+                ExpiresUtc = now.AddMinutes(30),
+                Reason = "automatic switch budget exhausted",
+                Revision = 10
+            };
+            store.Save(stabilization, now);
+
+            int firstDelayRound = mihomo.DelayNodes(2500).Count;
+            clock.UtcNow = now.Add(OpportunityOptimizationPolicy.ScanInterval);
+            worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OpportunityServiceProbe(mihomo, 1000, 800),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                clock, new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
+
+            MonitorSnapshot optimized = worker.Run(preferences, MonitorCycleTrigger.Scheduled);
+
+            Equal(firstDelayRound + alternatives.Length, mihomo.DelayNodes(2500).Count,
+                "budget stabilization starts another candidate round at the next scheduled interval");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "two-hundred-millisecond improvement bypasses budget stabilization");
+            Equal(true, optimized.Decision.Contains("已按网站延迟排行切换"),
+                "mandatory stable-hold optimization reports the automatic switch");
         }
         finally
         {
@@ -2817,17 +3083,23 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 new OpportunityServiceProbe(mihomo),
                 new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
                 new FakeClock { UtcNow = now }, new OrchestratedExitIdentityProbe(mihomo, false), null,
-                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false),
+                trafficMeter: new FixedTrafficMeter());
 
-            worker.Run(preferences);
+            MonitorSnapshot budgeted = worker.Run(preferences);
 
             ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
-            Equal("current", mihomo.GetSelected("shared"),
-                "optimization confirmation respects the automatic switch budget");
-            Equal(AutomaticDecisionState.Stabilization, after.Assurance.Decision.State,
-                "budgeted optimization enters stabilization");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "two-hundred-millisecond improvement bypasses the automatic switch budget");
+            Equal(AutomaticDecisionState.Observing, after.Assurance.Decision.State,
+                "mandatory performance improvement enters normal switch observation");
             Equal<PendingOptimization>(null, after.Assurance.PendingOptimization,
                 "budgeted optimization clears its pending target");
+            CandidateLatencyMeasurement budgetedRow = budgeted.CandidateLatencies
+                .FirstOrDefault(x => x.Node == "node-01");
+            Equal(true, budgetedRow != null &&
+                StringProperty(budgetedRow, "DecisionDetail").Contains("已切换"),
+                "fully rechecked mandatory improvement records the selected outcome");
         }
         finally
         {
@@ -2917,6 +3189,23 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal(2, selected.Rank, "ranked selector reports the displayed one-based rank");
         Equal(200d, selected.ResponseMilliseconds,
             "ranked selector reports the fully rechecked ChatGPT response");
+
+        checkedNodes.Clear();
+        RankedOpportunitySelection mandatory = RankedOpportunitySelector.Select(ranking, 900, required, node => {
+            checkedNodes.Add(node);
+            long response = node == "first" ? 701 : 650;
+            return new CandidateScanResult(node, CandidateHealth.Compatible, null, "ok", response, 2,
+                new Dictionary<ServiceKind, ProbeResult> {
+                    { ServiceKind.ChatGPT, ProbeResult.Success(response) },
+                    { ServiceKind.Gemini, ProbeResult.Success(response + 20) }
+                }, null, "JP");
+        }, 200);
+        Equal("second", mandatory.Node,
+            "stable-hold selector skips a leading sub-threshold candidate for a mandatory candidate");
+        Equal("first,second", String.Join(",", checkedNodes),
+            "stable-hold selector continues after a full recheck improves by only 199 milliseconds");
+        Equal(true, mandatory.Diagnostics["first"].Contains("不足 200 ms"),
+            "stable-hold selector explains the rejected sub-threshold candidate");
 
         checkedNodes.Clear();
         RankedOpportunitySelection none = RankedOpportunitySelector.Select(ranking, 130, required, node => {
@@ -3070,11 +3359,11 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
             worker.RunOnce(false, UserPreferences.Defaults());
 
-            Equal("current", mihomo.GetSelected("shared"),
-                "switch budget blocks severe degradation churn");
+            Equal("node-01", mihomo.GetSelected("shared"),
+                "two-hundred-millisecond severe improvement bypasses the switch budget");
             ExperienceData after = new ExperienceStore(Path.Combine(root, "state", "experience.json")).Load();
-            Equal(AutomaticDecisionState.Stabilization, after.Assurance.Decision.State,
-                "exhausted switch budget enters stabilization");
+            Equal(AutomaticDecisionState.Observing, after.Assurance.Decision.State,
+                "mandatory severe improvement enters normal switch observation");
         }
         finally
         {
@@ -3130,10 +3419,14 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
         Equal(false, MaterialImprovementPolicy.Evaluate(200, 150, false).Accepted,
             "small absolute gain cannot switch despite relative gain");
+        Equal(false, MaterialImprovementPolicy.Evaluate(3000, 2801, true).Accepted,
+            "one-hundred-ninety-nine millisecond gain remains below the mandatory threshold");
+        Equal(true, MaterialImprovementPolicy.Evaluate(3000, 2800, true).Accepted,
+            "exactly two hundred milliseconds is a mandatory improvement despite a small percentage");
         Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, false).Accepted,
-            "normal improvement requires twenty percent and two hundred milliseconds");
-        Equal(false, MaterialImprovementPolicy.Evaluate(1200, 850, true).Accepted,
-            "recent switch raises relative requirement to thirty percent");
+            "large absolute improvement remains accepted");
+        Equal(true, MaterialImprovementPolicy.Evaluate(1200, 850, true).Accepted,
+            "three-hundred-fifty millisecond gain is mandatory despite recent-switch hysteresis");
         Equal(true, MaterialImprovementPolicy.Evaluate(1200, 800, true).Accepted,
             "recent switch accepts a thirty-percent material improvement");
     }
@@ -3271,16 +3564,36 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 .Select(x => "node-" + x.ToString("D2")).ToArray();
             var delays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
                 .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
-            var mihomo = new OrchestratedMihomo("current",
-                new[] { "current" }.Concat(alternatives.Reverse()), delays);
+            string[] choices = new[] { "current" }.Concat(alternatives.Reverse()).ToArray();
+            DateTime now = new DateTime(2026, 9, 19, 8, 0, 0, DateTimeKind.Utc);
+            var preferences = UserPreferences.Defaults();
+            string servicesKey = String.Join(",", preferences.RequiredServices.Distinct().OrderBy(x => x));
+            string scope = WorkerScope(choices, servicesKey);
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(
+                new ExperienceData {
+                    ActiveScope = scope,
+                    ActiveServicesKey = servicesKey,
+                    ActiveCandidateNames = choices.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                    LastNode = "current",
+                    Assurance = new ConnectionAssurance {
+                        Scope = scope,
+                        AutomaticSwitches = new List<AutomaticSwitchRecord> {
+                            new AutomaticSwitchRecord { Utc = now.AddMinutes(-29), From = "a", To = "b" },
+                            new AutomaticSwitchRecord { Utc = now.AddMinutes(-20), From = "b", To = "c" },
+                            new AutomaticSwitchRecord { Utc = now.AddMinutes(-9), From = "c", To = "d" },
+                            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "d", To = "current" }
+                        }
+                    }
+                }, now);
+            var mihomo = new OrchestratedMihomo("current", choices, delays);
             var probe = new OrchestratedServiceProbe(mihomo, true);
             var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo, probe,
                 new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
-                new FakeClock { UtcNow = new DateTime(2026, 9, 19, 8, 0, 0, DateTimeKind.Utc) },
+                new FakeClock { UtcNow = now },
                 new OrchestratedExitIdentityProbe(mihomo, false), null,
                 () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
 
-            worker.RunOnce(false, UserPreferences.Defaults());
+            worker.RunOnce(false, preferences);
 
             Equal(10, mihomo.DelayNodes(2500).Count,
                 "fast failover measures every alternative leaf with the 2500 ms delay budget");
@@ -3290,16 +3603,18 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "successful fast failover performs no second delay round with another timeout");
             Equal(10, mihomo.MaximumConcurrentDelayCalls,
                 "all alternative Mihomo delay checks run in the same concurrent round");
-            Equal("node-01,node-02,node-03",
+            Equal(10, mihomo.ChatGptDelayNodes().Distinct(StringComparer.Ordinal).Count(),
+                "hard ChatGPT failure measures ChatGPT delay on every live Clash candidate");
+            Equal("node-01,node-02",
                 String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
-                "quick scans follow current live delay order and stop at three eligible candidates");
-            Equal("current,node-01,node-02",
+                "immediate recovery advances in ChatGPT latency order until one full check passes");
+            Equal("current",
                 String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(5))),
-                "winner full verification failure advances to the second ranked candidate");
+                "immediate recovery does not repeat a successful two-second full check");
             Equal("node-02", mihomo.GetSelected("shared"),
-                "second ranked candidate is switched only after its full verification passes");
+                "confirmed hard failure bypasses the exhausted optimization switch budget");
             string log = File.ReadAllText(Path.Combine(root, "logs", "monitor.log"));
-            Equal(true, log.Contains("fast selection delay_ms=") && log.Contains("checked=3 eligible=3"),
+            Equal(true, log.Contains("fast selection delay_ms=") && log.Contains("checked=2 eligible=1"),
                 "fast selection orchestration records checked and eligible counts");
         }
         finally
@@ -3328,21 +3643,17 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 new OrchestratedExitIdentityProbe(mihomo, true), null,
                 () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
 
-            worker.RunOnce(false, UserPreferences.Defaults());
+            MonitorSnapshot result = worker.RunOnce(false, UserPreferences.Defaults());
 
             Equal(10, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
                 "unsupported exits still receive one concurrent all-node delay round");
-            Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08",
+            Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08,node-09,node-10",
                 String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
-                "fast failover checks at most eight low-delay candidates when none is region eligible");
+                "immediate ChatGPT recovery checks every live low-delay candidate when none is region eligible");
             Equal("current", mihomo.GetSelected("shared"),
                 "zero eligible quick scans never switch the shared group");
-            clock.UtcNow = clock.UtcNow.AddSeconds(30);
-            mihomo.ResetDelayRound();
-            worker.RunOnce(false, UserPreferences.Defaults());
-            Equal("node-09,node-10", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))
-                .Skip(8).Take(2)),
-                "the next recovery cycle reaches candidates beyond the first eight");
+            Equal(TimeSpan.FromSeconds(3), result.NextCheckUtc - result.CheckedUtc,
+                "unsupported exits trigger another complete recovery pass after three seconds");
         }
         finally
         {
@@ -3378,6 +3689,176 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "automatic recovery skips a Steam failure and switches only after all four websites connect");
             Equal(true, result.Services.Any(x => x.Service == ServiceKind.SteamApi && x.Available),
                 "selected-node snapshot includes the mandatory Steam result");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
+    private static void RunImmediateChatGptRecoveryAcrossAllLiveCandidates()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-immediate-gpt-recovery-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 10)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var clashDelays = alternatives.Select((node, index) => new { node, delay = (index + 1) * 10 })
+                .ToDictionary(x => x.node, x => x.delay, StringComparer.Ordinal);
+            var chatGptDelays = alternatives.ToDictionary(x => x, x => Int32.MaxValue,
+                StringComparer.Ordinal);
+            chatGptDelays["node-09"] = 180;
+            chatGptDelays["node-10"] = 70;
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var failures = choices.Take(9).ToDictionary(x => x, x => ServiceKind.ChatGPT,
+                StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, clashDelays, chatGptDelays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 24, 8, 0, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot result = worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal(10, mihomo.DelayNodes(2500).Distinct(StringComparer.Ordinal).Count(),
+                "ChatGPT outage measures Clash delay for every alternative concurrently");
+            Equal(10, mihomo.ChatGptDelayNodes().Distinct(StringComparer.Ordinal).Count(),
+                "ChatGPT outage quickly rechecks ChatGPT on every live Clash candidate");
+            Equal("node-10", mihomo.GetSelected("shared"),
+                "majority ChatGPT outage selects the reachable candidate with the lowest ChatGPT latency");
+            Equal("node-10", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "immediate ChatGPT recovery fully validates only the best reachable target before switching");
+            Equal(TimeSpan.FromSeconds(30), result.NextCheckUtc - result.CheckedUtc,
+                "successful immediate ChatGPT recovery enters switch observation");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
+    private static void RunImmediateChatGptRecoveryRetriesWithoutWaiting()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-immediate-gpt-retry-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 10)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var clashDelays = alternatives.ToDictionary(x => x, x => 50, StringComparer.Ordinal);
+            var chatGptDelays = alternatives.ToDictionary(x => x, x => Int32.MaxValue,
+                StringComparer.Ordinal);
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var failures = choices.ToDictionary(x => x, x => ServiceKind.ChatGPT,
+                StringComparer.Ordinal);
+            var mihomo = new OrchestratedMihomo("current", choices, clashDelays, chatGptDelays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 24, 8, 5, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot result = worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal("current", mihomo.GetSelected("shared"),
+                "an all-node ChatGPT outage does not switch to an unreachable target");
+            Equal(10, mihomo.ChatGptDelayNodes().Distinct(StringComparer.Ordinal).Count(),
+                "an all-node outage still checks every live Clash candidate");
+            Equal(10, mihomo.ScanNodes(TimeSpan.FromSeconds(2)).Distinct(StringComparer.Ordinal).Count(),
+                "an all-node quick-delay failure still performs a bounded real ChatGPT recheck on every candidate");
+            Equal(TimeSpan.FromSeconds(3), result.NextCheckUtc - result.CheckedUtc,
+                "an unresolved ChatGPT outage retries after three seconds instead of waiting thirty seconds");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
+    private static void RunImmediateChatGptRecoveryContinuesAcrossBatches()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-immediate-gpt-cursor-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 20)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var clashDelays = alternatives.ToDictionary(x => x, x => 50, StringComparer.Ordinal);
+            var chatGptDelays = alternatives.ToDictionary(x => x, x => Int32.MaxValue,
+                StringComparer.Ordinal);
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var failures = alternatives.Take(19)
+                .ToDictionary(x => x, x => ServiceKind.Google, StringComparer.Ordinal);
+            failures["current"] = ServiceKind.ChatGPT;
+            var mihomo = new OrchestratedMihomo("current", choices, clashDelays, chatGptDelays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 24, 8, 10, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot first = worker.RunOnce(false, UserPreferences.Defaults());
+            Equal("node-01,node-02,node-03,node-04,node-05,node-06,node-07,node-08,node-09,node-10,node-11,node-12",
+                String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "first urgent ChatGPT batch is bounded without repeating a candidate");
+            Equal(TimeSpan.FromMilliseconds(100), first.NextCheckUtc - first.CheckedUtc,
+                "unfinished urgent ChatGPT batch continues without the three-second full-pass wait");
+            ConnectionAssurance savedAssurance = new ExperienceStore(
+                Path.Combine(root, "state", "experience.json")).Load().Assurance;
+            Equal("node-13,node-14,node-15,node-16,node-17,node-18,node-19,node-20",
+                String.Join(",", savedAssurance.UrgentChatGptRemaining),
+                "urgent ChatGPT progress persists remaining node identities instead of a sorted index");
+
+            mihomo.ResetDelayRound();
+            MonitorSnapshot second = worker.RunOnce(false, UserPreferences.Defaults());
+            Equal("node-13,node-14,node-15,node-16,node-17,node-18,node-19,node-20",
+                String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2)).Skip(12)),
+                "next urgent ChatGPT batch continues from the saved cursor");
+            Equal("node-20", mihomo.GetSelected("shared"),
+                "later urgent ChatGPT batch reaches and switches to the tail recovery node");
+            Equal(TimeSpan.FromSeconds(30), second.NextCheckUtc - second.CheckedUtc,
+                "successful continued recovery enters normal switch observation");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
+    private static void RunImmediateChatGptRecoveryCompletesFullPassAcrossBatches()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-immediate-gpt-full-pass-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] alternatives = Enumerable.Range(1, 20)
+                .Select(x => "node-" + x.ToString("D2")).ToArray();
+            var clashDelays = alternatives.ToDictionary(x => x, x => 50, StringComparer.Ordinal);
+            var chatGptDelays = alternatives.ToDictionary(x => x, x => Int32.MaxValue,
+                StringComparer.Ordinal);
+            string[] choices = new[] { "current" }.Concat(alternatives).ToArray();
+            var failures = alternatives.ToDictionary(x => x, x => ServiceKind.Google,
+                StringComparer.Ordinal);
+            failures["current"] = ServiceKind.ChatGPT;
+            var mihomo = new OrchestratedMihomo("current", choices, clashDelays, chatGptDelays);
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = new DateTime(2026, 9, 24, 8, 15, 0, DateTimeKind.Utc) },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            MonitorSnapshot first = worker.RunOnce(false, UserPreferences.Defaults());
+            Equal(TimeSpan.FromMilliseconds(100), first.NextCheckUtc - first.CheckedUtc,
+                "incomplete all-failure pass immediately continues its remaining nodes");
+            mihomo.ResetDelayRound();
+            MonitorSnapshot second = worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal(20, mihomo.ScanNodes(TimeSpan.FromSeconds(2)).Count,
+                "complete all-failure pass checks every candidate exactly once across batches");
+            Equal(20, mihomo.ScanNodes(TimeSpan.FromSeconds(2)).Distinct(StringComparer.Ordinal).Count(),
+                "complete all-failure pass does not reappend already checked candidates");
+            Equal(TimeSpan.FromSeconds(3), second.NextCheckUtc - second.CheckedUtc,
+                "complete all-failure pass waits three seconds before starting a fresh pass");
+            ConnectionAssurance savedAssurance = new ExperienceStore(
+                Path.Combine(root, "state", "experience.json")).Load().Assurance;
+            Equal(0, savedAssurance.UrgentChatGptRemaining.Count,
+                "complete all-failure pass clears the remaining identity queue");
+            Equal(0, savedAssurance.UrgentChatGptPassNodes.Count,
+                "complete all-failure pass closes its seen-node set before retry");
         }
         finally { DeleteDirectoryEventually(root); }
     }
@@ -3495,7 +3976,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
             Equal("current", mihomo.GetSelected("shared"),
                 "three-node service consensus keeps the current node instead of switching");
-            Equal(true, snapshot.Decision.Contains("继续寻找三站可连接的节点"),
+            Equal(true, snapshot.Decision.Contains("3 秒后重新开始快速恢复"),
                 "shared core-service failure does not falsely claim that recovery search stopped");
             Equal(ProbeFailureKind.Service,
                 snapshot.Services.First(x => x.Service == ServiceKind.ChatGPT).Evidence,
@@ -3628,13 +4109,17 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         private int activeDelayCalls;
         private int maximumConcurrentDelayCalls;
 
+        private readonly Dictionary<string, int> chatGptDelays;
+        private readonly List<string> chatGptDelayCalls = new List<string>();
+
         public OrchestratedMihomo(string selected, IEnumerable<string> choices,
-            Dictionary<string, int> delays)
+            Dictionary<string, int> delays, Dictionary<string, int> chatGptDelays = null)
         {
             shared = selected;
             general = selected;
             this.choices = choices.ToArray();
             this.delays = delays;
+            this.chatGptDelays = chatGptDelays;
             delayEntries = new CountdownEvent(delays.Count);
         }
 
@@ -3673,6 +4158,17 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
         public int GetDelay(string proxyName, string url, int timeoutMilliseconds)
         {
+            bool chatGptCheck = String.Equals(url,
+                HttpServiceProbe.Endpoint(ServiceKind.ChatGPT).AbsoluteUri,
+                StringComparison.OrdinalIgnoreCase);
+            if (chatGptCheck)
+            {
+                lock (gate) chatGptDelayCalls.Add(proxyName);
+                int chatGptDelay;
+                if (chatGptDelays != null && chatGptDelays.TryGetValue(proxyName, out chatGptDelay))
+                    return chatGptDelay;
+                return delays.TryGetValue(proxyName, out chatGptDelay) ? chatGptDelay : Int32.MaxValue;
+            }
             bool concurrentRound = timeoutMilliseconds == 2500;
             if (concurrentRound)
             {
@@ -3709,6 +4205,11 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             lock (gate) return delayCalls.Select(x => x.Key).ToList();
         }
 
+        public List<string> ChatGptDelayNodes()
+        {
+            lock (gate) return chatGptDelayCalls.ToList();
+        }
+
         public List<string> ScanNodes(TimeSpan timeout)
         {
             lock (gate) return scans.Where(x => x.Timeout == timeout).Select(x => x.Node).ToList();
@@ -3722,6 +4223,59 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 return scan == null ? new ServiceKind[0] : scan.Services();
             }
         }
+    }
+
+    private sealed class DelayMeasurementMihomo : IMihomoClient
+    {
+        private readonly string malformedNode;
+        private readonly bool block;
+        private readonly string fastNode;
+        private readonly ManualResetEventSlim released = new ManualResetEventSlim(false);
+        private readonly object gate = new object();
+        private readonly List<string> delayCalls = new List<string>();
+        private int activeCalls;
+        private int maximumConcurrentCalls;
+
+        public DelayMeasurementMihomo(string malformedNode, bool block = false, string fastNode = null)
+        {
+            this.malformedNode = malformedNode;
+            this.block = block;
+            this.fastNode = fastNode;
+        }
+
+        public int ActiveCalls { get { return Interlocked.CompareExchange(ref activeCalls, 0, 0); } }
+        public int MaximumConcurrentCalls { get { return Interlocked.CompareExchange(ref maximumConcurrentCalls, 0, 0); } }
+
+        public string[] GetChoices(string groupName) { return new string[0]; }
+        public string GetSelected(string groupName) { return ""; }
+        public void Select(string groupName, string proxyName) { }
+        public bool IsRuntimeIpv6Enabled() { return false; }
+        public bool IsAvailable() { return true; }
+
+        public int GetDelay(string proxyName, string url, int timeoutMilliseconds)
+        {
+            lock (gate) delayCalls.Add(proxyName);
+            int active = Interlocked.Increment(ref activeCalls);
+            int observed;
+            do
+            {
+                observed = Interlocked.CompareExchange(ref maximumConcurrentCalls, 0, 0);
+                if (observed >= active) break;
+            }
+            while (Interlocked.CompareExchange(ref maximumConcurrentCalls, active, observed) != observed);
+            try
+            {
+                if (String.Equals(proxyName, malformedNode, StringComparison.Ordinal))
+                    throw new FormatException("malformed Mihomo delay");
+                if (block && !String.Equals(proxyName, fastNode, StringComparison.Ordinal))
+                    released.Wait(TimeSpan.FromSeconds(2));
+                return String.Equals(proxyName, fastNode, StringComparison.Ordinal) ? 5 : 25;
+            }
+            finally { Interlocked.Decrement(ref activeCalls); }
+        }
+
+        public void Release() { released.Set(); }
+        public string[] DelayCalls() { lock (gate) return delayCalls.ToArray(); }
     }
 
     private sealed class OrchestratedServiceProbe : IServiceProbe
@@ -3741,7 +4295,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             scan.ObserveService(service);
             if (scan.Node == "current" && service == ServiceKind.ChatGPT)
                 return ProbeResult.ServiceFailure("current failed", 900);
-            if (failFirstFullWinner && scan.Node == "node-01" && scan.Visit == 2 &&
+            if (failFirstFullWinner && scan.Node == "node-01" &&
                 service == ServiceKind.GitHub)
                 return ProbeResult.ServiceFailure("winner full verification failed", 100);
             int number;
@@ -4456,6 +5010,18 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal(true, options.Once, "once parsed");
         Equal(false, options.SelfTest, "self test absent");
         Equal(true, MonitorOptions.Parse(new[] { "--self-test" }).SelfTest, "self test parsed");
+        var startupOptions = MonitorOptions.Parse(new[] { "--startup-supervisor" });
+        var startupSupervisor = typeof(MonitorOptions).GetProperty("StartupSupervisor");
+        Equal(true, startupSupervisor != null && (bool)startupSupervisor.GetValue(startupOptions, null),
+            "startup supervisor option is parsed");
+        Type supervision = typeof(Program).Assembly.GetType("StartupSupervision");
+        var shouldRestart = supervision == null ? null : supervision.GetMethod("ShouldRestart");
+        Equal(true, shouldRestart != null && (bool)shouldRestart.Invoke(null, new object[] { 1, 1 }),
+            "startup supervisor retries an abnormal first exit");
+        Equal(false, shouldRestart != null && (bool)shouldRestart.Invoke(null, new object[] { 0, 1 }),
+            "startup supervisor preserves an intentional exit");
+        Equal(false, shouldRestart != null && (bool)shouldRestart.Invoke(null, new object[] { 1, 3 }),
+            "startup supervisor stops after three abnormal exits");
         string name = "ClashCompatibilityMonitor.Test." + Guid.NewGuid().ToString("N");
         using (var first = SingleInstanceLease.TryAcquire(name))
         using (var second = SingleInstanceLease.TryAcquire(name))
@@ -4551,6 +5117,27 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
     private static void MonitorCoordinatorBehavior()
     {
+        using (var isolated = new MonitorCoordinator(new DegradedCycleRunner(),
+            TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            bool survivingHandlerCalled = false;
+            isolated.SnapshotChanged += delegate { throw new InvalidOperationException("ui handler failed"); };
+            isolated.SnapshotChanged += delegate { survivingHandlerCalled = true; };
+            bool publishCompleted = true;
+            try
+            {
+                typeof(MonitorCoordinator).GetMethod("Publish",
+                    BindingFlags.Instance | BindingFlags.NonPublic).Invoke(isolated,
+                    new object[] { MonitorSnapshot.CreateState(MonitorRunState.Running,
+                        "event isolation", DateTime.UtcNow, DateTime.UtcNow), false });
+            }
+            catch (TargetInvocationException) { publishCompleted = false; }
+            Equal(true, publishCompleted,
+                "snapshot subscriber failure cannot terminate the coordinator thread");
+            Equal(true, survivingHandlerCalled,
+                "snapshot subscriber failure does not block remaining subscribers");
+        }
+
         var runner = new BlockingCycleRunner();
         using (var coordinator = new MonitorCoordinator(runner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
         {
@@ -4630,6 +5217,34 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             Equal(true, triggeredRunner.WaitForRunCount(3, 1000), "trigger runner receives scheduled cycle");
             Equal("Startup,Requested,Scheduled", String.Join(",", triggeredRunner.Triggers()),
                 "coordinator distinguishes startup, requested, and scheduled diagnostics");
+        }
+
+        var manualRunner = new TriggeredCycleRunner();
+        using (var coordinator = new MonitorCoordinator(manualRunner, TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, manualRunner.WaitForRunCount(1, 1000),
+                "manual optimization waits for the startup cycle");
+            MethodInfo requestOptimization = typeof(MonitorCoordinator).GetMethod("RequestOptimization");
+            Equal(true, requestOptimization != null,
+                "coordinator exposes an explicit manual optimization request");
+            if (requestOptimization != null)
+            {
+                requestOptimization.Invoke(coordinator, null);
+                Equal(true, manualRunner.WaitForRunCount(2, 1000),
+                    "manual optimization starts a dedicated decision cycle");
+                Equal("Startup,ManualOptimization", String.Join(",", manualRunner.Triggers().Take(2)),
+                    "coordinator preserves the manual optimization trigger");
+            }
+        }
+
+        var pastDueRunner = new PastDueCycleRunner();
+        using (var coordinator = new MonitorCoordinator(pastDueRunner,
+            TimeSpan.FromHours(1), TimeSpan.FromSeconds(2)))
+        {
+            coordinator.Start();
+            Equal(true, pastDueRunner.WaitForRunCount(2, 1000),
+                "coordinator runs an already-due continuation immediately instead of using the default interval");
         }
 
         var rankingRunner = new TriggeredCycleRunner();
@@ -4922,6 +5537,22 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         }
     }
 
+    private sealed class PastDueCycleRunner : IMonitorCycleRunner
+    {
+        private int runCount;
+        public MonitorSnapshot Run(UserPreferences preferences)
+        {
+            int count = Interlocked.Increment(ref runCount);
+            DateTime now = DateTime.UtcNow;
+            return MonitorSnapshot.CreateState(MonitorRunState.Running, "due continuation", now,
+                count == 1 ? now.AddMilliseconds(-1) : now.AddHours(1));
+        }
+        public bool WaitForRunCount(int expected, int milliseconds)
+        {
+            return SpinWait.SpinUntil(() => Volatile.Read(ref runCount) >= expected, milliseconds);
+        }
+    }
+
     private sealed class ThrowingCandidateLatencyRunner : IMonitorCycleRunner, ICandidateLatencyRunner, IProgressCycleRunner
     {
         private int runCount;
@@ -5074,7 +5705,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.19"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.27"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");
@@ -5100,5 +5731,37 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         Equal("候选节点存在超过 1500 ms 的服务响应", StatusReport.DecisionText("target service response exceeds limit"), "status explains per-service latency gate");
         Equal("候选节点尚未完成所选 AI 服务的真实对话验证，不进行性能切换", StatusReport.DecisionText("target requires account verification"), "status explains account proof gate");
         Equal("当前节点故障，临时切换到网络链路已通过但尚未完成真实对话验证的节点", StatusReport.DecisionText("provisional emergency failover"), "status explains provisional emergency target");
+
+        string root = Path.Combine(Path.GetTempPath(), "monitor-status-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string path = Path.Combine(root, "current-status.txt");
+            File.WriteAllText(path, "旧状态");
+            Exception writeError;
+            using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                Equal(false, StatusReport.TryWriteLatest(path, "新状态", out writeError),
+                    "status keeps the old file intact when a reader blocks atomic replacement");
+            Equal(true, writeError is IOException || writeError is UnauthorizedAccessException,
+                "deferred status publication retains bounded diagnostic evidence");
+            Equal("旧状态", File.ReadAllText(path), "failed atomic replacement never truncates the old status");
+            Equal("新状态", File.ReadAllText(path + ".tmp"),
+                "failed atomic replacement retains the complete newest status for retry");
+            Equal(true, StatusReport.TryWriteLatest(path, "重试后的新状态", out writeError),
+                "status publication retries after the reader releases the file");
+            Equal<Exception>(null, writeError, "successful status retry reports no error");
+            Equal("重试后的新状态", File.ReadAllText(path), "status retry publishes the newest cycle atomically");
+            Equal(false, File.Exists(path + ".tmp"), "successful status retry consumes the temporary file");
+
+            using (var exclusiveReader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+                Equal(false, StatusReport.TryWriteLatest(path, "暂不可写", out writeError),
+                    "a fully locked status file never aborts the monitor cycle");
+            Equal(true, writeError is IOException || writeError is UnauthorizedAccessException,
+                "a skipped status update retains bounded diagnostic evidence");
+            Equal("重试后的新状态", File.ReadAllText(path), "a fully locked status file remains intact");
+            Equal("暂不可写", File.ReadAllText(path + ".tmp"),
+                "a fully locked target retains the complete pending status");
+        }
+        finally { DeleteDirectoryEventually(root); }
     }
 }

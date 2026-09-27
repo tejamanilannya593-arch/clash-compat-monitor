@@ -22,7 +22,8 @@ public sealed class TrayHost : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("打开详情", null, delegate { ShowDetails(); });
-        menu.Items.Add("立即复检", null, delegate { coordinator.RequestCheck(); });
+        menu.Items.Add("立即复检当前节点", null, delegate { coordinator.RequestCheck(); });
+        menu.Items.Add("立即寻优并切换", null, delegate { coordinator.RequestOptimization(); });
         menu.Items.Add("当前节点 ChatGPT 不可用", null, delegate { ReportCurrentFailure(ServiceKind.ChatGPT); });
         menu.Items.Add("暂停自动优化", null, delegate { coordinator.SetPaused(true); });
         menu.Items.Add("恢复自动优化", null, delegate { coordinator.SetPaused(false); });
@@ -47,8 +48,9 @@ public sealed class TrayHost : ApplicationContext
 
     public void ShowDetailsFromAnyThread()
     {
-        if (dispatcher.IsDisposed) return;
-        dispatcher.BeginInvoke((Action)ShowDetails);
+        if (dispatcher.IsDisposed || !dispatcher.IsHandleCreated) return;
+        try { dispatcher.BeginInvoke((Action)ShowDetails); }
+        catch (InvalidOperationException) { }
     }
 
     private void ShowDetails()
@@ -58,7 +60,7 @@ public sealed class TrayHost : ApplicationContext
             details = new DetailsForm(preferences, SavePreferences, coordinator.RequestCheck,
                 coordinator.SetPaused, coordinator.RequestRestorePrevious,
                 delegate { }, coordinator.ReportServiceFailure, ExitThread,
-                coordinator.RequestCandidateRanking);
+                coordinator.RequestCandidateRanking, coordinator.RequestOptimization);
             details.FormClosed += delegate { details = null; MemoryTrimmer.TrimIdleWorkingSet(); };
         }
         details.UpdateSnapshot(coordinator.Latest);

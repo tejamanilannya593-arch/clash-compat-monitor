@@ -28,6 +28,27 @@ public static class StatusReport
         else File.Move(temporary, path);
     }
 
+    public static bool TryWriteLatest(string path, string content, out Exception error)
+    {
+        try
+        {
+            WriteAtomic(path, content);
+            error = null;
+            return true;
+        }
+        catch (IOException)
+        {
+            try { WriteAtomic(path, content); error = null; return true; }
+            catch (IOException ex) { error = ex; return false; }
+            catch (UnauthorizedAccessException ex) { error = ex; return false; }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            error = ex;
+            return false;
+        }
+    }
+
     private static string HealthText(CandidateHealth health)
     {
         switch (health)

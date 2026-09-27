@@ -45,6 +45,7 @@ public sealed class DetailsForm : Form
     private readonly Action<string, ServiceKind, DateTime> reportServiceFailure;
     private readonly Action exitApplication;
     private readonly Action requestCandidateRanking;
+    private readonly Action requestOptimization;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
     private readonly List<ServiceChoice> choices = new List<ServiceChoice>();
@@ -65,7 +66,7 @@ public sealed class DetailsForm : Form
         Action requestCheck, Action<bool> setPaused, Action restorePrevious,
         Action startBrowserVerification,
         Action<string, ServiceKind, DateTime> reportServiceFailure, Action exitApplication,
-        Action requestCandidateRanking = null)
+        Action requestCandidateRanking = null, Action requestOptimization = null)
     {
         this.savePreferences = savePreferences;
         this.requestCheck = requestCheck;
@@ -74,6 +75,7 @@ public sealed class DetailsForm : Form
         this.reportServiceFailure = reportServiceFailure;
         this.exitApplication = exitApplication;
         this.requestCandidateRanking = requestCandidateRanking ?? delegate { };
+        this.requestOptimization = requestOptimization ?? delegate { };
 
         Text = "节点守护";
         Icon = AppIcon.Current;
@@ -208,7 +210,8 @@ public sealed class DetailsForm : Form
         layout.Controls.Add(serviceList);
 
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
-        buttons.Controls.Add(ActionButton("立即复检", delegate { requestCheck(); }));
+        buttons.Controls.Add(ActionButton("立即复检当前节点", delegate { requestCheck(); }));
+        buttons.Controls.Add(ActionButton("立即寻优并切换", delegate { requestOptimization(); }));
         pauseButton.Text = "暂停节点守护";
         pauseButton.AutoSize = true;
         pauseButton.Click += delegate {
@@ -270,7 +273,8 @@ public sealed class DetailsForm : Form
     {
         if (candidateLatencyForm == null || candidateLatencyForm.IsDisposed)
         {
-            candidateLatencyForm = new CandidateLatencyForm(latestSnapshot, requestCandidateRanking);
+            candidateLatencyForm = new CandidateLatencyForm(latestSnapshot, requestCandidateRanking,
+                requestOptimization);
             candidateLatencyForm.FormClosed += delegate { candidateLatencyForm = null; };
         }
         candidateLatencyForm.UpdateSnapshot(latestSnapshot);

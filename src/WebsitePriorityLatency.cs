@@ -20,6 +20,11 @@ internal static class WebsitePriorityLatency
         return candidate == null ? Double.MaxValue : Single(candidate.Services, ServiceKind.ChatGPT);
     }
 
+    public static double Primary(IEnumerable<ServiceMeasurement> services)
+    {
+        return Single(services, ServiceKind.ChatGPT);
+    }
+
     public static double Secondary(CandidateLatencyMeasurement candidate)
     {
         return candidate == null ? Double.MaxValue : Pair(

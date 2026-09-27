@@ -1,12 +1,14 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 public static class MonitorIdentity
 {
     public const string Name = "ClashCompatibilityMonitor";
-    public const string Version = "0.7.0-preview.19";
+    public const string Version = "0.7.0-preview.27";
 }
 
 public static class Program
@@ -16,12 +18,32 @@ public static class Program
     {
         MonitorOptions options = MonitorOptions.Parse(args);
         MonitorConfiguration config = MonitorConfiguration.CreateDefault();
-        byte[] identityKey = ExitIdentityKey.LoadOrCreate(config.IdentityKeyPath);
-        var nodeIdentities = new ClashNodeIdentitySource(
-            config.ClashConfigPath, config.ClashProfilesPath, identityKey);
         var logger = new BoundedLogger(config.LogPath, 1024 * 1024);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs error) {
+            LogFailure(logger, "ui-thread", error.Exception);
+        };
+        AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs error) {
+            LogFailure(logger, error.IsTerminating ? "appdomain-terminating" : "appdomain",
+                error.ExceptionObject as Exception);
+        };
+        TaskScheduler.UnobservedTaskException += delegate(object sender, UnobservedTaskExceptionEventArgs error) {
+            LogFailure(logger, "unobserved-task", error.Exception);
+            error.SetObserved();
+        };
+        logger.TryWrite("process started version=" + MonitorIdentity.Version);
         try
         {
+            if (options.StartupSupervisor)
+            {
+                Environment.ExitCode = StartupSupervision.Run(
+                    Application.ExecutablePath, AppDomain.CurrentDomain.BaseDirectory, logger);
+                return;
+            }
+
+            byte[] identityKey = ExitIdentityKey.LoadOrCreate(config.IdentityKeyPath);
+            var nodeIdentities = new ClashNodeIdentitySource(
+                config.ClashConfigPath, config.ClashProfilesPath, identityKey);
             if (options.SelfTest)
             {
                 var client = MihomoPipeClient.FromConfig(config.ClashConfigPath);
@@ -50,7 +72,8 @@ public static class Program
                 return;
             }
 
-            using (var activation = InstanceActivation.TryOwn(@"Local\ClashCompatibilityMonitor"))
+            using (var activation = InstanceActivation.TryOwn(@"Local\ClashCompatibilityMonitor",
+                ex => LogFailure(logger, "activation-callback", ex)))
             {
                 if (!activation.IsOwner) { Environment.ExitCode = 0; return; }
                 var client = MihomoPipeClient.FromConfig(config.ClashConfigPath);
@@ -64,7 +87,9 @@ public static class Program
                         config.ProbeProxy, identityKey, config.ExitNetworkEvidencePath);
                     var worker = new MonitorWorker(config, client, probe, logger, new SystemClock(), exitProbe,
                         new ProxyPathHealthChecker(config.ProbeProxy, "http://127.0.0.1:7897"), nodeIdentities);
-                    using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval, config.CycleWatchdog, true))
+                    using (var coordinator = new MonitorCoordinator(worker, config.CycleInterval,
+                        config.CycleWatchdog, true, errorReporter: ex =>
+                            LogFailure(logger, "coordinator", ex)))
                     using (var tray = new TrayHost(coordinator, preferenceStore, preferences))
                     {
                         activation.Activated += tray.ShowDetailsFromAnyThread;
@@ -79,9 +104,19 @@ public static class Program
         }
         catch (Exception ex)
         {
-            logger.Write("fatal " + ex.GetType().Name + ": " + ex.Message);
+            LogFailure(logger, "main-fatal", ex);
             Environment.ExitCode = 1;
         }
+        finally
+        {
+            logger.TryWrite("process stopped exit_code=" + Environment.ExitCode);
+        }
+    }
+
+    private static void LogFailure(BoundedLogger logger, string source, Exception error)
+    {
+        string detail = error == null ? "unknown exception" : error.ToString();
+        logger.TryWrite("failure source=" + source + " " + detail);
     }
 }
 
@@ -90,6 +125,7 @@ public sealed class MonitorOptions
     public bool DryRun { get; private set; }
     public bool Once { get; private set; }
     public bool SelfTest { get; private set; }
+    public bool StartupSupervisor { get; private set; }
     public static MonitorOptions Parse(string[] args)
     {
         var result = new MonitorOptions();
@@ -98,8 +134,45 @@ public sealed class MonitorOptions
             if (arg == "--dry-run") result.DryRun = true;
             else if (arg == "--once") result.Once = true;
             else if (arg == "--self-test") { result.SelfTest = true; result.Once = true; }
+            else if (arg == "--startup-supervisor") result.StartupSupervisor = true;
         }
         return result;
+    }
+}
+
+public static class StartupSupervision
+{
+    public static bool ShouldRestart(int exitCode, int abnormalExitCount)
+    {
+        return exitCode != 0 && abnormalExitCount < 3;
+    }
+
+    public static int Run(string executablePath, string workingDirectory, BoundedLogger logger)
+    {
+        int abnormalExitCount = 0;
+        while (true)
+        {
+            var start = new ProcessStartInfo {
+                FileName = executablePath,
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            int exitCode;
+            using (Process child = Process.Start(start))
+            {
+                if (child == null) throw new InvalidOperationException("Unable to start the monitor process.");
+                child.WaitForExit();
+                exitCode = child.ExitCode;
+            }
+            if (exitCode == 0) return 0;
+            abnormalExitCount++;
+            logger.TryWrite("startup supervisor observed exit_code=" + exitCode +
+                " abnormal_exit_count=" + abnormalExitCount);
+            if (!ShouldRestart(exitCode, abnormalExitCount)) return exitCode;
+            Thread.Sleep(5000);
+        }
     }
 }
 

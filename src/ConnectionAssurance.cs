@@ -29,6 +29,8 @@ public sealed class ConnectionAssurance
     public DateTime RefreshUtc { get; set; }
     public int StableCycles { get; set; }
     public int RecoveryCursor { get; set; }
+    public List<string> UrgentChatGptRemaining { get; set; }
+    public List<string> UrgentChatGptPassNodes { get; set; }
     public PendingOptimization PendingOptimization { get; set; }
     public DateTime LastOpportunityScanUtc { get; set; }
     public AutomaticDecisionTransaction Decision { get; set; }
@@ -36,6 +38,8 @@ public sealed class ConnectionAssurance
     public ConnectionAssurance()
     {
         Standbys = new List<StandbyNode>();
+        UrgentChatGptRemaining = new List<string>();
+        UrgentChatGptPassNodes = new List<string>();
         AutomaticSwitches = new List<AutomaticSwitchRecord>();
         Decision = new AutomaticDecisionTransaction { State = AutomaticDecisionState.Healthy };
     }
@@ -47,6 +51,8 @@ public sealed class ConnectionAssurance
         Scope = scope; Standbys.Clear(); Target = null; TargetNodeId = null; Previous = null;
         PreviousNodeId = null; CurrentNodeId = null; StartedUtc = DateTime.MinValue; StableCycles = 0;
         RecoveryCursor = 0;
+        UrgentChatGptRemaining = new List<string>();
+        UrgentChatGptPassNodes = new List<string>();
         RefreshUtc = DateTime.MinValue; PendingOptimization = null; LastOpportunityScanUtc = DateTime.MinValue;
         Decision = new AutomaticDecisionTransaction {
             State = AutomaticDecisionState.Healthy, Scope = scope, Revision = 1

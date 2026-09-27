@@ -180,7 +180,10 @@ public sealed class MihomoPipeClient : IMihomoClient
         {
             string path = "/proxies/" + Uri.EscapeDataString(proxyName) + "/delay?timeout=" +
                 timeoutMilliseconds.ToString(CultureInfo.InvariantCulture) + "&url=" + Uri.EscapeDataString(url);
-            PipeHttpResponse response = Request("GET", path, null);
+            PipeHttpResponse response = Request("GET", path, null,
+                Math.Min(1000, Math.Max(250, timeoutMilliseconds)),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromMilliseconds(Math.Max(1000, timeoutMilliseconds + 500)));
             if (response.StatusCode < 200 || response.StatusCode >= 300) return Int32.MaxValue;
             var value = json.DeserializeObject(response.Body) as Dictionary<string, object>;
             object delay;
@@ -189,6 +192,9 @@ public sealed class MihomoPipeClient : IMihomoClient
         }
         catch (IOException) { return Int32.MaxValue; }
         catch (TimeoutException) { return Int32.MaxValue; }
+        catch (FormatException) { return Int32.MaxValue; }
+        catch (InvalidCastException) { return Int32.MaxValue; }
+        catch (OverflowException) { return Int32.MaxValue; }
     }
 
     public bool IsRuntimeIpv6Enabled()
@@ -226,6 +232,12 @@ public sealed class MihomoPipeClient : IMihomoClient
 
     private PipeHttpResponse Request(string method, string path, string body)
     {
+        return Request(method, path, body, 3000, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(10));
+    }
+
+    private PipeHttpResponse Request(string method, string path, string body,
+        int connectTimeoutMilliseconds, TimeSpan writeTimeout, TimeSpan readTimeout)
+    {
         byte[] bodyBytes = body == null ? new byte[0] : Encoding.UTF8.GetBytes(body);
         var request = new StringBuilder();
         request.Append(method).Append(' ').Append(path).Append(" HTTP/1.1\r\nHost: mihomo\r\nConnection: close\r\n");
@@ -236,9 +248,9 @@ public sealed class MihomoPipeClient : IMihomoClient
 
         using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
         {
-            pipe.Connect(3000);
-            BoundedPipeIo.WriteAll(pipe, headerBytes, bodyBytes, TimeSpan.FromSeconds(3));
-            return PipeHttpCodec.Decode(BoundedPipeIo.ReadAll(pipe, TimeSpan.FromSeconds(10), 1024 * 1024));
+            pipe.Connect(connectTimeoutMilliseconds);
+            BoundedPipeIo.WriteAll(pipe, headerBytes, bodyBytes, writeTimeout);
+            return PipeHttpCodec.Decode(BoundedPipeIo.ReadAll(pipe, readTimeout, 1024 * 1024));
         }
     }
 }

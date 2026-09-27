@@ -7,12 +7,15 @@ using System.Windows.Forms;
 public sealed class CandidateLatencyForm : Form
 {
     private readonly Action requestRefresh;
+    private readonly Action requestOptimization;
     private readonly Label statusLabel = new Label();
     private readonly DataGridView latencyTable = new DataGridView();
 
-    public CandidateLatencyForm(MonitorSnapshot snapshot, Action requestRefresh)
+    public CandidateLatencyForm(MonitorSnapshot snapshot, Action requestRefresh,
+        Action requestOptimization = null)
     {
         this.requestRefresh = requestRefresh ?? delegate { };
+        this.requestOptimization = requestOptimization ?? delegate { };
         Text = "候选节点网站延迟排行";
         Icon = AppIcon.Current;
         StartPosition = FormStartPosition.CenterParent;
@@ -60,7 +63,13 @@ public sealed class CandidateLatencyForm : Form
             this.requestRefresh();
         };
         buttons.Controls.Add(refresh);
-        buttons.Controls.Add(new Label { Text = "网站探测并发执行；候选节点逐个验证，不影响当前节点选择。",
+        var optimize = new Button { Text = "立即寻优并切换", AutoSize = true };
+        optimize.Click += delegate {
+            statusLabel.Text = "正在完整复检候选；找到实测更快且全部服务通过的节点后立即切换。";
+            this.requestOptimization();
+        };
+        buttons.Controls.Add(optimize);
+        buttons.Controls.Add(new Label { Text = "重新实测仅刷新表格；立即寻优会完整复检后切换。",
             AutoSize = true, ForeColor = Color.FromArgb(88, 101, 122), Margin = new Padding(12, 7, 0, 0) });
         layout.Controls.Add(buttons);
         Controls.Add(layout);
@@ -83,6 +92,7 @@ public sealed class CandidateLatencyForm : Form
         latencyTable.Rows.Clear();
         AddColumn("rank", "排名", 54, true);
         AddColumn("node", "候选节点", 230, true);
+        AddColumn("decision", "未入选原因", 360, true);
         AddColumn("country", "出口", 60, true);
         AddColumn("mihomo", "Clash 延迟（初筛）", 120, true);
         foreach (ServiceKind service in services)
@@ -107,6 +117,8 @@ public sealed class CandidateLatencyForm : Form
                 ? row.MihomoMilliseconds + " ms" : "超时";
             foreach (ServiceMeasurement service in row.Services.Where(x => x.Service != ServiceKind.Gemini))
                 gridRow.Cells["service_" + service.Service].Value = WebsiteLatencyText(service);
+            gridRow.Cells["decision"].Value = String.IsNullOrWhiteSpace(row.DecisionDetail)
+                ? CandidateDecisionText.Initial(row, snapshot.Services) : row.DecisionDetail;
         }
         DateTime checkedUtc = rows.Select(x => x.CheckedUtc).DefaultIfEmpty(DateTime.MinValue).Max();
         statusLabel.Text = rows.Count == 0 ? "尚未实测。点击下方按钮开始测量。" :

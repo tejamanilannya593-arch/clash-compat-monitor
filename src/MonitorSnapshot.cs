@@ -56,13 +56,14 @@ public sealed class ServiceMeasurement
 public sealed class CandidateLatencyMeasurement
 {
     public CandidateLatencyMeasurement(string node, string exitCountryCode, int mihomoMilliseconds,
-        IEnumerable<ServiceMeasurement> services, DateTime checkedUtc)
+        IEnumerable<ServiceMeasurement> services, DateTime checkedUtc, string decisionDetail = "")
     {
         Node = node ?? "";
         ExitCountryCode = exitCountryCode ?? "";
         MihomoMilliseconds = mihomoMilliseconds;
         Services = (services ?? Enumerable.Empty<ServiceMeasurement>()).ToList().AsReadOnly();
         CheckedUtc = checkedUtc;
+        DecisionDetail = decisionDetail ?? "";
     }
 
     public string Node { get; private set; }
@@ -70,6 +71,75 @@ public sealed class CandidateLatencyMeasurement
     public int MihomoMilliseconds { get; private set; }
     public IList<ServiceMeasurement> Services { get; private set; }
     public DateTime CheckedUtc { get; private set; }
+    public string DecisionDetail { get; private set; }
+
+    public CandidateLatencyMeasurement WithDecisionDetail(string value)
+    {
+        return new CandidateLatencyMeasurement(Node, ExitCountryCode, MihomoMilliseconds,
+            Services, CheckedUtc, value);
+    }
+}
+
+internal static class CandidateDecisionText
+{
+    public static string Initial(CandidateLatencyMeasurement candidate)
+    {
+        return Initial(candidate, null);
+    }
+
+    public static string Initial(CandidateLatencyMeasurement candidate,
+        IEnumerable<ServiceMeasurement> currentServices)
+    {
+        if (candidate == null) return "等待实测";
+        string failed = FailedService(candidate.Services);
+        if (failed.Length != 0) return failed + " 未通过";
+        double baseline = WebsitePriorityLatency.Primary(currentServices);
+        double target = WebsitePriorityLatency.Primary(candidate);
+        if (baseline == Double.MaxValue || target == Double.MaxValue)
+            return "等待完整复检";
+        long improvement = (long)Math.Round(baseline - target);
+        if (improvement >= MaterialImprovementPolicy.AbsoluteImprovementMilliseconds)
+            return "快 " + improvement + " ms，已达 200 ms 强制线；点击立即寻优进行完整复检";
+        if (improvement > 0)
+            return "仅快 " + improvement + " ms，未达 200 ms 强制线；点击立即寻优可复检";
+        if (improvement == 0) return "与当前节点实测相同；无需切换";
+        return "比当前慢 " + (-improvement) + " ms；无需切换";
+    }
+
+    public static string FullRecheck(CandidateScanResult scan,
+        IEnumerable<ServiceKind> requiredServices)
+    {
+        if (scan == null) return "完整复检未完成";
+        if (!AiRegionPolicy.SupportsChatGpt(scan.ExitCountryCode))
+            return "出口地区不符合 ChatGPT 要求";
+        var required = (requiredServices ?? Enumerable.Empty<ServiceKind>())
+            .Concat(new[] { ServiceKind.ChatGPT, ServiceKind.SteamApi, ServiceKind.Google })
+            .Distinct().ToList();
+        foreach (ServiceKind service in required)
+        {
+            ProbeResult result;
+            if (!scan.ServiceResults.TryGetValue(service, out result) || result == null)
+                return MonitorPresentation.ServiceLabel(service) + " 未完成复检";
+            if (!result.Passed && result.FailureKind != ProbeFailureKind.Partial)
+                return MonitorPresentation.ServiceLabel(service) + " 完整复检未通过";
+        }
+        return "完整复检未达到切换条件";
+    }
+
+    private static string FailedService(IEnumerable<ServiceMeasurement> services)
+    {
+        IList<ServiceMeasurement> values = (services ?? Enumerable.Empty<ServiceMeasurement>()).ToList();
+        IEnumerable<ServiceKind> ordered = new[] {
+            ServiceKind.ChatGPT, ServiceKind.SteamApi, ServiceKind.Google
+        }.Concat(values.Select(x => x.Service).Where(x => x != ServiceKind.Gemini).OrderBy(x => x)).Distinct();
+        foreach (ServiceKind service in ordered)
+        {
+            ServiceMeasurement measurement = values.FirstOrDefault(x => x.Service == service);
+            if (measurement == null || !measurement.Available)
+                return MonitorPresentation.ServiceLabel(service);
+        }
+        return "";
+    }
 }
 
 public sealed class MonitorSnapshot

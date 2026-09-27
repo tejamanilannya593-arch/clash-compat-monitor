@@ -36,6 +36,7 @@ public static class DecisionEvidencePolicy
 public sealed class MaterialImprovementDecision
 {
     public bool Accepted { get; set; }
+    public bool MandatorySwitch { get; set; }
     public double RelativeImprovement { get; set; }
     public double AbsoluteImprovementMilliseconds { get; set; }
     public double RequiredRelativeImprovement { get; set; }
@@ -66,12 +67,11 @@ public static class MaterialImprovementPolicy
         }
         decision.AbsoluteImprovementMilliseconds = baseline - target;
         decision.RelativeImprovement = decision.AbsoluteImprovementMilliseconds / baseline;
-        bool relativePassed = decision.RelativeImprovement >= requiredRelative;
         bool absolutePassed = decision.AbsoluteImprovementMilliseconds >= AbsoluteImprovementMilliseconds;
-        decision.Accepted = relativePassed && absolutePassed;
-        decision.Reason = decision.Accepted ? "material improvement confirmed" :
-            !relativePassed ? "relative improvement below threshold" :
-            "absolute improvement below threshold";
+        decision.MandatorySwitch = absolutePassed;
+        decision.Accepted = absolutePassed;
+        decision.Reason = absolutePassed ? "mandatory absolute improvement confirmed" :
+            "absolute improvement below mandatory threshold";
         return decision;
     }
 }
