@@ -28,7 +28,7 @@ public sealed partial class MonitorWorker
         string fingerprint = "";
         string original = "";
         RecoveryCheck display = null;
-        string decision = "全节点寻优未找到符合核心服务和地区要求的节点";
+        string decision = "全节点寻优未找到延迟和地区均合格的节点";
         try
         {
             cycleTimeBudget = TimeSpan.FromMinutes(7.5);
@@ -64,12 +64,12 @@ public sealed partial class MonitorWorker
                     Report("正在复检当前节点是否达到 800 ms 标准", null);
                     Dictionary<string, int> currentDelays = MeasureLiveDelays(new[] { current });
                     currentDelays.TryGetValue(original, out currentDelay);
-                    display = CheckRecoveryNode(current, CoreWebsitePolicy.Required,
-                        currentDelay, TimeSpan.FromSeconds(3), true);
+                    display = CheckWebsiteLatencyNode(current, currentDelay,
+                        MeasureSingleWebsiteDelay(current, ServiceKind.ChatGPT),
+                        MeasureSingleWebsiteDelay(current, ServiceKind.Gemini));
                     observations.Add(display);
                     if (IsPreferredCoreNode(display))
                     {
-                        SaveRecoveryObservations(observations, scope, candidates, fingerprint);
                         SaveExperience(clock.UtcNow);
                         return ContinuousOptimizationSnapshot(display,
                             "当前节点双核心延迟均不超过 800 ms，保持连接并暂停全节点寻优", preferences);
@@ -104,20 +104,19 @@ public sealed partial class MonitorWorker
                 int measuredDelay;
                 delays.TryGetValue(node.Name, out measuredDelay);
                 RecoveryCheck check = !forced && node.Name == original && display != null ? display :
-                    CheckRecoveryNode(node, CoreWebsitePolicy.Required,
-                        measuredDelay, TimeSpan.FromSeconds(3), true);
+                    CheckWebsiteLatencyNode(node, measuredDelay,
+                        chatGptDelays[node.Name], geminiDelays[node.Name]);
                 if (check != display) observations.Add(check);
                 if (String.Equals(node.Name, original, StringComparison.Ordinal)) display = check;
-                if (check.Healthy && AiRegionPolicy.SupportsBoth(check.Scan.ExitCountryCode))
+                if (IsLatencyEligible(check))
                 {
                     eligible.Add(check);
-                    diagnostics[node.Name] = "核心检测和共同地区要求通过";
+                    diagnostics[node.Name] = "双核心网站延迟与地区要求通过（未验证登录）";
                     if (!forced && IsPreferredCoreNode(check))
                     {
                         if (node.Name == original)
                         {
                             PublishContinuousOptimizationDiagnostics(ordered, delays, observations, diagnostics, eligible);
-                            SaveRecoveryObservations(observations, scope, candidates, fingerprint);
                             SaveExperience(clock.UtcNow);
                             return ContinuousOptimizationSnapshot(check,
                                 "当前节点双核心延迟均不超过 800 ms，保持连接并暂停全节点寻优", preferences);
@@ -133,7 +132,6 @@ public sealed partial class MonitorWorker
                             transactionCompleted = true;
                             PublishContinuousOptimizationDiagnostics(ordered, delays, observations,
                                 diagnostics, eligible);
-                            SaveRecoveryObservations(observations, scope, candidates, fingerprint);
                             SaveExperience(clock.UtcNow);
                             return ContinuousOptimizationSnapshot(verified,
                                 "已切换至双核心延迟均不超过 800 ms 的节点，暂停后续寻优", preferences);
@@ -144,9 +142,10 @@ public sealed partial class MonitorWorker
                 }
                 else
                 {
-                    diagnostics[node.Name] = "淘汰：" + (!AiRegionPolicy.SupportsBoth(check.Scan.ExitCountryCode)
-                        ? "实际出口不符合 ChatGPT/Gemini 共同地区要求"
-                        : check.RejectionReason);
+                    diagnostics[node.Name] = "淘汰：" +
+                        (!AiRegionPolicy.SupportsBoth(check.Scan.ExitCountryCode)
+                            ? "实际出口不符合 ChatGPT/Gemini 共同地区要求或无法确认"
+                            : "基础、ChatGPT 或 Gemini 网站延迟不可测");
                     logger.Write("continuous optimization rejected node=" + SafeName(node.Name) +
                         " reason=" + diagnostics[node.Name]);
                 }
@@ -160,7 +159,6 @@ public sealed partial class MonitorWorker
             PublishContinuousOptimizationDiagnostics(ordered, delays, observations, diagnostics, ranking);
             if (ranking.Count == 0)
             {
-                SaveRecoveryObservations(observations, scope, candidates, fingerprint);
                 SaveExperience(clock.UtcNow);
                 return ContinuousOptimizationSnapshot(display, decision, preferences);
             }
@@ -210,12 +208,12 @@ public sealed partial class MonitorWorker
                     continue;
                 }
                 expected = target.Name;
-                RecoveryCheck verified = CheckRecoveryNode(target, CoreWebsitePolicy.Required);
+                RecoveryCheck verified = RecheckWebsiteLatencyNode(target);
                 observations.Add(verified);
                 if (ReadCurrentSelection() != expected)
                     return ContinuousOptimizationSnapshot(display,
                         "用户已更改节点，取消本轮自动写入", preferences);
-                if (!verified.Healthy || !AiRegionPolicy.SupportsBoth(verified.Scan.ExitCountryCode))
+                if (!IsLatencyEligible(verified))
                 {
                     logger.Write("continuous optimization post-switch verification failed node=" +
                         SafeName(expected) + " " + verified.RejectionReason);
@@ -241,7 +239,6 @@ public sealed partial class MonitorWorker
             }
 
             if (!transactionCompleted) RollbackRecovery(recovery);
-            SaveRecoveryObservations(observations, scope, candidates, fingerprint);
             SaveExperience(clock.UtcNow);
             return ContinuousOptimizationSnapshot(display, decision, preferences);
         }
@@ -264,9 +261,69 @@ public sealed partial class MonitorWorker
 
     private static bool IsPreferredCoreNode(RecoveryCheck check)
     {
-        return check != null && check.Healthy && check.Scan != null &&
-            AiRegionPolicy.SupportsBoth(check.Scan.ExitCountryCode) &&
+        return IsLatencyEligible(check) &&
             CoreMaximumMilliseconds(check) <= PreferredCoreLatencyMilliseconds;
+    }
+
+    private static bool IsLatencyEligible(RecoveryCheck check)
+    {
+        return check != null && check.Basic == RecoveryEvidence.Healthy && check.Scan != null &&
+            AiRegionPolicy.SupportsBoth(check.Scan.ExitCountryCode) &&
+            CoreMaximumMilliseconds(check) < Double.MaxValue;
+    }
+
+    private int MeasureSingleWebsiteDelay(CandidateNode node, ServiceKind service)
+    {
+        Dictionary<string, int> values = MeasureUrlDelays(new[] { node },
+            HttpServiceProbe.Endpoint(service).AbsoluteUri, 1800);
+        int value;
+        return values.TryGetValue(node.Name, out value) ? value : Int32.MaxValue;
+    }
+
+    private RecoveryCheck RecheckWebsiteLatencyNode(CandidateNode node)
+    {
+        Dictionary<string, int> basics = MeasureLiveDelays(new[] { node });
+        int basic;
+        return CheckWebsiteLatencyNode(node, basics.TryGetValue(node.Name, out basic) ? basic : Int32.MaxValue,
+            MeasureSingleWebsiteDelay(node, ServiceKind.ChatGPT),
+            MeasureSingleWebsiteDelay(node, ServiceKind.Gemini));
+    }
+
+    private RecoveryCheck CheckWebsiteLatencyNode(CandidateNode node, int basic, int chatGpt, int gemini)
+    {
+        CheckStop();
+        bool basicReady = basic > 0 && basic < Int32.MaxValue;
+        bool chatReady = chatGpt > 0 && chatGpt < Int32.MaxValue;
+        bool geminiReady = gemini > 0 && gemini < Int32.MaxValue;
+        var sites = new Dictionary<ServiceKind, ProbeResult> {
+            { ServiceKind.ChatGPT, chatReady ? ProbeResult.Partial("仅网站延迟，未验证登录或对话", chatGpt)
+                : ProbeResult.Unverified("网站延迟不可测") },
+            { ServiceKind.Gemini, geminiReady ? ProbeResult.Partial("仅网站延迟，未验证登录或对话", gemini)
+                : ProbeResult.Unverified("网站延迟不可测") }
+        };
+        CandidateScanResult identity = null;
+        if (basicReady && chatReady && geminiReady)
+        {
+            try { identity = scanner.ScanSelected(node, new ServiceKind[0], TimeSpan.FromSeconds(3)); }
+            catch (Exception ex)
+            {
+                if (!(ex is IOException || ex is TimeoutException || ex is InvalidOperationException ||
+                    ex is KeyNotFoundException)) throw;
+                logger.Write("latency region probe unavailable node=" + SafeName(node.Name) +
+                    " error=" + ex.GetType().Name);
+            }
+        }
+        string country = identity == null ? "" : identity.ExitCountryCode;
+        CandidateHealth health = !basicReady || !chatReady || !geminiReady ? CandidateHealth.Unknown :
+            AiRegionPolicy.SupportsBoth(country) ? CandidateHealth.BasicCompatible :
+                String.IsNullOrWhiteSpace(country) ? CandidateHealth.Unknown : CandidateHealth.RegionBlocked;
+        return new RecoveryCheck { Basic = basicReady ? RecoveryEvidence.Healthy : RecoveryEvidence.Unknown,
+            BasicMilliseconds = basicReady ? basic : 0,
+            Scan = new CandidateScanResult(node.Name, health, null,
+                "仅依据网站延迟和实际出口地区；未验证登录或对话",
+                (long)(chatReady ? chatGpt : 0) + (geminiReady ? gemini : 0), 2, sites,
+                identity == null ? "" : identity.ExitFingerprint, country,
+                null, identity == null ? null : identity.ExitAsn) };
     }
 
     private static long CoreWebsiteDelayMaximum(string name, IDictionary<string, int> chatGpt,
@@ -323,7 +380,7 @@ public sealed partial class MonitorWorker
             SaveExperience(clock.UtcNow);
             return FastSwitchResult.Rejected;
         }
-        verified = CheckRecoveryNode(target, CoreWebsitePolicy.Required);
+        verified = RecheckWebsiteLatencyNode(target);
         observations.Add(verified);
         if (ReadCurrentSelection() != target.Name) return FastSwitchResult.ExternalChange;
         if (!IsPreferredCoreNode(verified))
@@ -362,7 +419,8 @@ public sealed partial class MonitorWorker
     {
         ProbeResult result;
         return check != null && check.Scan != null && check.Scan.ServiceResults.TryGetValue(service, out result) &&
-            result != null && result.Passed && result.FailureKind == ProbeFailureKind.None
+            result != null && result.Passed &&
+            (result.FailureKind == ProbeFailureKind.None || result.FailureKind == ProbeFailureKind.Partial)
             ? result.ElapsedMilliseconds : Double.MaxValue;
     }
 
@@ -372,7 +430,7 @@ public sealed partial class MonitorWorker
         string actual = ReadCurrentSelection();
         CandidateScanResult scan = check == null || check.Scan == null || check.Scan.Name != actual
             ? new CandidateScanResult(actual, CandidateHealth.Unknown, null, decision)
-            : check.DisplayScan();
+            : check.Scan;
         Exception error;
         if (!StatusReport.TryWriteLatest(Path.Combine(config.RootPath, "current-status.txt"),
             StatusReport.Format(clock.UtcNow, actual, scan.Health, null, decision, scan.Detail), out error))
@@ -403,7 +461,7 @@ public sealed partial class MonitorWorker
             string detail;
             latest.TryGetValue(node.Name, out check);
             if (!delays.TryGetValue(node.Name, out delay)) delay = Int32.MaxValue;
-            if (ranks.ContainsKey(node.Name)) detail = "双核心服务排名第 " + ranks[node.Name];
+            if (ranks.ContainsKey(node.Name)) detail = "网站延迟排名第 " + ranks[node.Name] + "（未验证登录）";
             else if (!diagnostics.TryGetValue(node.Name, out detail)) detail = "实测未完成";
             rows.Add(new CandidateLatencyMeasurement(node.Name,
                 check == null ? "" : check.Scan.ExitCountryCode, delay,

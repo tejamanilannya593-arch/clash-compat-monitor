@@ -74,7 +74,7 @@ internal static partial class Tests
     {
         RecoveryOnlyRegression();
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.35", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.36", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
         Equal(true, MonitorConfiguration.CreateDefault().ContinuousOptimization,
             "production defaults to continuous all-node optimization");
@@ -5262,7 +5262,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             RequiredServices = new List<ServiceKind> { ServiceKind.Gemini, ServiceKind.GitHub }
         }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }))
         {
-            CheckBox core = FindCheckBox(form, "ChatGPT 与 Gemini（固定核心检测）");
+            CheckBox core = FindCheckBox(form, "ChatGPT 与 Gemini（固定网站延迟检测）");
             Equal(true, core != null && core.Checked && !core.Enabled,
                 "settings display both AI services as one always-enabled core");
             Equal(null, FindCheckBox(form, "ChatGPT"), "settings cannot disable ChatGPT independently");
@@ -5860,7 +5860,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.35"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.36"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

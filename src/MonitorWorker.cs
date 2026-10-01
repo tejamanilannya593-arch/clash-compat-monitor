@@ -242,7 +242,7 @@ public sealed partial class MonitorWorker : IRestorableCycleRunner, IProgressCyc
             if (String.IsNullOrWhiteSpace(target) || target == current ||
                 !mihomo.GetChoices(config.SharedGroup).Contains(target)) return false;
             var node = new CandidateNode(target, null);
-            if (!CheckRecoveryNode(node, CoreWebsitePolicy.Required).Healthy) return false;
+            if (!IsLatencyEligible(RecheckWebsiteLatencyNode(node))) return false;
             CheckStop();
             if (ReadCurrentSelection() != current) return false;
             recovery.PendingOriginal = current; recovery.PendingWritten = target;
@@ -253,7 +253,7 @@ public sealed partial class MonitorWorker : IRestorableCycleRunner, IProgressCyc
             { recovery.ClearTransaction(); return false; }
             WriteSelectedNode(current, target);
             if (ReadCurrentSelection() != target ||
-                !CheckRecoveryNode(node, CoreWebsitePolicy.Required).Healthy ||
+                !IsLatencyEligible(RecheckWebsiteLatencyNode(node)) ||
                 ReadCurrentSelection() != target) return false;
             recovery.ClearTransaction();
             recovery.ResetCounts(target, experience.ActiveScope);

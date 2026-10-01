@@ -8,13 +8,13 @@
 
 [Download the latest release](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest) · [中文](README.md)
 
-Clash Compatibility Monitor rechecks the current node every 60 seconds by default. When both ChatGPT and Gemini pass and their slower response is at most 800 ms, it keeps that node. Otherwise, it searches candidates in Clash-delay order.
+Clash Compatibility Monitor rechecks the current node every 60 seconds by default. When basic, ChatGPT, and Gemini website delays are measurable, the actual exit region is eligible, and both core-site delays are at most 800 ms, it keeps that node. Website timing does not verify login or conversation functions.
 
 ## Continuous optimization behavior
 
 - Rechecks the current node every 60 seconds by default. A qualified node at or below 800 ms stays selected without a full sweep.
-- When the current node is slow or unavailable, measures Clash delay for every node, then probes nodes in that order for basic connectivity, ChatGPT, Gemini, and actual-exit region eligibility.
-- Requires both core services and basic connectivity to pass. The actual exit must meet the shared ChatGPT and Gemini region policy.
+- When the current node is slow or website latency is unavailable, measures basic, ChatGPT, and Gemini website delays for every node, sorts by the slower core-site delay, then checks actual-exit region eligibility.
+- Requires all three delays to be measurable. The actual exit must meet the shared ChatGPT and Gemini region policy. Login-chain evidence is not an automatic-switch gate.
 - Selects the first eligible candidate with `max(ChatGPT latency, Gemini latency) ≤ 800 ms`, then verifies it. A failed verification rolls back and resumes the search.
 - When no candidate meets 800 ms, it ranks all eligible nodes by the slower core response, then by total core latency, Clash delay, and node name. Explicit force optimization always scans the full set.
 - External manual selection during a sweep cancels automatic writing. Detection and switching remain serialized.
@@ -54,7 +54,7 @@ The optional enhancement preserves ordinary group types, candidates, providers, 
 
 ## Evidence boundaries
 
-The monitor separates entry reachability from login-chain network evidence. For ChatGPT it checks the application entry and official authentication infrastructure; a challenge page alone is not full compatibility. It does not operate your browser account and cannot prove actual model generation or an ongoing conversation.
+Automatic optimization uses website latency and actual exit region only. Manual candidate diagnostics can still show application-entry and authentication evidence, but a challenge page alone is not full compatibility. The monitor does not operate your browser account and cannot prove actual model generation or an ongoing conversation.
 
 Anonymous probes and displayed HTTP latency cannot measure model-generation latency or guarantee future account behavior. Browser proof concerns websites, not API-key calls. Sign-in prompts and challenges alone are incomplete evidence. Existing account-verification and quality history is retained for diagnostics and does not influence the fresh all-node ranking.
 

@@ -423,6 +423,17 @@ internal static partial class Tests
     {
         using (var f = new RecoveryFixture(true))
         {
+            f.Client.Choices = new[] { "current", "node-01" };
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 200 : 100;
+            f.Probe.Result = (node, service, visit) => ProbeResult.ServiceFailure("login blocked");
+            f.Run(MonitorCycleTrigger.Scheduled);
+            Equal("current", f.Client.Current,
+                "latency-qualified current node stays despite a separate login failure");
+            Equal(0, f.Probe.Timeouts.Count,
+                "latency-only automatic decision does not run login-chain probes");
+        }
+        using (var f = new RecoveryFixture(true))
+        {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.WebsiteDelay = (node, url) =>
                 url.Contains("chatgpt.com") ? (node == "node-01" ? 700 : node == "node-02" ? 120 : 300) :
@@ -444,15 +455,15 @@ internal static partial class Tests
             var scanned = new List<string>();
             f.Client.OnScan = node => scanned.Add(node);
             f.Run(MonitorCycleTrigger.ManualOptimization);
-            Equal(3, scanned.Count, "failed website delay does not discard candidates before full verification");
+            Equal(0, scanned.Count, "unmeasurable core website latency cannot qualify a node");
         }
         using (var f = new RecoveryFixture(true))
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(800);
             f.Run(MonitorCycleTrigger.Scheduled);
-            Equal("current", String.Join(",", f.Client.Delays),
-                "healthy current at 800 ms measures only its own Clash delay");
+            Equal("current,current,current", String.Join(",", f.Client.Delays),
+                "healthy current measures its three website delays only");
             Equal(0, f.Client.Writes.Count,
                 "healthy current at 800 ms remains selected");
         }
@@ -460,6 +471,8 @@ internal static partial class Tests
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.Delay = node => node == "node-01" ? 10 : node == "node-02" ? 20 : 30;
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" ? 100 : 200;
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(
                 node == "current" ? 900 : node == "node-01" ? 800 : 100);
             f.Run(MonitorCycleTrigger.Scheduled);
@@ -469,7 +482,7 @@ internal static partial class Tests
                 "automatic scan stops after the first verified 800 ms candidate");
             int afterSwitch = f.Client.Delays.Count;
             f.Run(MonitorCycleTrigger.Scheduled);
-            Equal(afterSwitch + 1, f.Client.Delays.Count,
+            Equal(afterSwitch + 3, f.Client.Delays.Count,
                 "scheduled checks hold the selected 800 ms node without restarting all-node discovery");
             f.Run(MonitorCycleTrigger.ManualOptimization);
             Equal(true, f.Client.Visits.ContainsKey("node-02"),
@@ -483,8 +496,8 @@ internal static partial class Tests
             f.Run(MonitorCycleTrigger.ManualOptimization);
             Equal(0, f.Client.ConnectivityCalls,
                 "continuous scan reuses successful Clash delays for basic reachability");
-            Equal(true, f.Probe.Timeouts.Take(6).All(x => x <= TimeSpan.FromSeconds(3)),
-                "continuous first-pass core probes have a short per-node deadline");
+            Equal(0, f.Probe.Timeouts.Count,
+                "continuous latency scan does not request login-chain probes");
         }
         using (var f = new RecoveryFixture(true))
         {
@@ -493,8 +506,8 @@ internal static partial class Tests
             f.Client.Basic = node => node == "node-01" ? RecoveryEvidence.Failed : RecoveryEvidence.Healthy;
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(900);
             f.Run(MonitorCycleTrigger.ManualOptimization);
-            Equal(1, f.Client.ConnectivityCalls,
-                "failed Clash delay gets one short independent basic fallback");
+            Equal(0, f.Client.ConnectivityCalls,
+                "latency-only scan does not run a separate connectivity probe");
             Equal(false, f.Client.Visits.ContainsKey("node-01"),
                 "failed basic fallback skips expensive core probes for an ineligible node");
         }
@@ -502,23 +515,30 @@ internal static partial class Tests
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.Delay = node => node == "node-01" ? 20 : node == "current" ? 30 : 40;
+            f.Client.WebsiteDelay = (node, url) => url.Contains("chatgpt.com") ?
+                node == "node-01" ? 100 : node == "node-02" ? 450 : 600 :
+                url.Contains("gemini.google.com") ?
+                node == "node-01" ? 700 : node == "node-02" ? 450 : 600 :
+                f.Client.Delay(node);
             var scanned = new List<string>();
             f.Client.OnScan = node => scanned.Add(node);
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(
                 node == "current" ? 600 : node == "node-01"
                     ? (service == ServiceKind.ChatGPT ? 100 : 700) : 450);
             f.Run(MonitorCycleTrigger.ManualOptimization);
-            Equal("node-01,current,node-02", String.Join(",", scanned.Take(3)),
-                "continuous optimization probes every node in Clash delay order");
+            Equal("node-02,current,node-01", String.Join(",", scanned.Take(3)),
+                "continuous optimization checks exit region in core website latency order");
             Equal("node-02", f.Client.Current,
                 "continuous optimization ranks by the slower of ChatGPT and Gemini");
-            Equal(true, File.ReadAllText(Path.Combine(f.Root, "current-status.txt")).Contains("0.7.0-preview.35"),
+            Equal(true, File.ReadAllText(Path.Combine(f.Root, "current-status.txt")).Contains("0.7.0-preview.36"),
                 "continuous optimization publishes the latest status file");
         }
         using (var f = new RecoveryFixture(true))
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.Delay = node => node == "node-01" ? 20 : node == "node-02" ? 30 : 40;
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" ? 50 : 120;
             f.ExitProbe.Country = node => node == "node-01" ? "HK" : "JP";
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(
                 node == "node-01" ? 50 : node == "node-02" ? 120 : 900);
@@ -546,6 +566,9 @@ internal static partial class Tests
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.Delay = node => node == "node-01" ? 10 : node == "node-02" ? 20 : 30;
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" && f.Client.Current == "node-01" ? Int32.MaxValue :
+                node == "node-01" ? 50 : 100;
             f.Probe.Result = (node, service, visit) => node == "node-01" && visit > 1 &&
                 service == ServiceKind.ChatGPT ? ProbeResult.ServiceFailure("changed after switch", 100) :
                 ProbeResult.Success(node == "node-01" ? 50 : node == "node-02" ? 100 : 900);
@@ -559,6 +582,9 @@ internal static partial class Tests
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.Delay = node => node == "node-01" ? 10 : node == "node-02" ? 20 : 30;
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" && f.Client.Current == "node-01" ? 801 :
+                node == "node-01" ? 700 : 750;
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(
                 node == "current" ? 900 : node == "node-01" && visit > 1 ? 801 :
                 node == "node-01" ? 700 : 500);
@@ -572,6 +598,8 @@ internal static partial class Tests
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02", "manual" };
             f.Client.Delay = node => node == "node-01" ? 10 : node == "node-02" ? 20 : 30;
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" ? 100 : 200;
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(node == "current" ? 900 : 100);
             f.Client.OnScan = node => { if (node == "node-01") f.Client.Current = "manual"; };
             f.Run(MonitorCycleTrigger.Scheduled);

@@ -117,7 +117,7 @@ public sealed class DetailsForm : Form
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown,
             WrapContents = false, AutoScroll = true };
         layout.Controls.Add(Heading("持续全节点寻优设置"));
-        layout.Controls.Add(TextLabel("每轮先复检当前节点；ChatGPT 与 Gemini 均不超过 800 ms 时保持节点，超过后再寻优。"));
+        layout.Controls.Add(TextLabel("每轮先测当前节点的网站延迟与实际出口；ChatGPT、Gemini 均不超过 800 ms 时保持节点。"));
         automaticRecovery.Text = "超出 800 ms 时自动寻优（固定启用）";
         automaticRecovery.AutoSize = true;
         automaticRecovery.Checked = true;
@@ -125,12 +125,12 @@ public sealed class DetailsForm : Form
         automaticRecovery.Margin = new Padding(0, 12, 0, 0);
         layout.Controls.Add(automaticRecovery);
 
-        AddChoice(layout, "ChatGPT 与 Gemini（固定核心检测）",
+        AddChoice(layout, "ChatGPT 与 Gemini（固定网站延迟检测）",
             CoreWebsitePolicy.Required, preferences, false);
         AddNumberSetting(layout, "检测间隔（秒）", checkInterval, 15, 3600, preferences.CheckIntervalSeconds);
         failureThreshold.Value = preferences.FailureThreshold;
         recoveryCooldown.Value = preferences.RecoveryCooldownMinutes;
-        layout.Controls.Add(TextLabel("先按 ChatGPT、Gemini 网站延迟预排序，再实测核心服务与地区；首个双核心均不超过 800 ms 的合格节点可切换，强制寻优仍扫描全部节点。"));
+        layout.Controls.Add(TextLabel("按 ChatGPT、Gemini 网站延迟和实际出口地区选节点；首个双核心均不超过 800 ms 的合格节点可切换，强制寻优仍扫描全部节点。网站延迟不代表登录或对话可用。"));
         layout.Controls.Add(Heading("其他服务诊断"));
         layout.Controls.Add(TextLabel("以下服务仅采集与展示，不作为自动切换门槛。已有历史数据继续保留。"));
         AddChoice(layout, "Google", new[] { ServiceKind.Google }, preferences);

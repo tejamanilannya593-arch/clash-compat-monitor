@@ -71,7 +71,8 @@ public sealed class CompatibilityScanner
         mihomo.Select(probeGroup, candidate.Name);
         ExitIdentity identity = new ExitIdentity("", "", "exit identity probe not configured");
         Task<ExitIdentity> identityTask = null;
-        if (exitIdentityProbe != null && services.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini))
+        if (exitIdentityProbe != null && (services.Count == 0 ||
+            services.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini)))
             identityTask = Task.Factory.StartNew(() => exitIdentityProbe.Probe(probeTimeout));
         var probeTasks = new Dictionary<ServiceKind, Task<ProbeResult>>();
         foreach (ServiceKind service in services)
