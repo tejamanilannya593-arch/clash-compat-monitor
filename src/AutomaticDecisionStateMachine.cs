@@ -378,6 +378,7 @@ public sealed class AutomaticSwitchRecord
     public string From { get; set; }
     public string To { get; set; }
     public string Reason { get; set; }
+    public ServiceKind? FailureService { get; set; }
 }
 
 public sealed class SwitchBudgetDecision

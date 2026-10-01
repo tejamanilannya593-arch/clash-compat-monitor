@@ -46,10 +46,14 @@ public sealed class DetailsForm : Form
     private readonly Action exitApplication;
     private readonly Action requestCandidateRanking;
     private readonly Action requestOptimization;
+    private readonly bool legacyAutomaticOptimization;
     private readonly Panel settingsPanel = new Panel();
     private readonly Panel statusPanel = new Panel();
     private readonly List<ServiceChoice> choices = new List<ServiceChoice>();
-    private readonly CheckBox performanceOptimization = new CheckBox();
+    private readonly CheckBox automaticRecovery = new CheckBox();
+    private readonly NumericUpDown checkInterval = new NumericUpDown();
+    private readonly NumericUpDown failureThreshold = new NumericUpDown();
+    private readonly NumericUpDown recoveryCooldown = new NumericUpDown();
     private readonly Label stateLabel = HeadingLabel();
     private readonly Label nodeLabel = new Label();
     private readonly Label decisionLabel = new Label();
@@ -76,6 +80,7 @@ public sealed class DetailsForm : Form
         this.exitApplication = exitApplication;
         this.requestCandidateRanking = requestCandidateRanking ?? delegate { };
         this.requestOptimization = requestOptimization ?? delegate { };
+        legacyAutomaticOptimization = preferences.AutomaticOptimization;
 
         Text = "节点守护";
         Icon = AppIcon.Current;
@@ -106,26 +111,36 @@ public sealed class DetailsForm : Form
     private void BuildSettings(UserPreferences preferences)
     {
         preferences.RequiredServices = UserPreferencePolicy.NormalizeServices(preferences.RequiredServices);
+        UserPreferencePolicy.NormalizeRecoverySettings(preferences);
         settingsPanel.Dock = DockStyle.Fill;
         settingsPanel.Padding = new Padding(28);
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown,
             WrapContents = false, AutoScroll = true };
-        layout.Controls.Add(Heading("选择你长期需要使用的服务"));
-        layout.Controls.Add(TextLabel("只需设置一次。程序会寻找同时兼容这些服务、长期稳定且综合体验更好的节点。"));
+        layout.Controls.Add(Heading("持续全节点寻优设置"));
+        layout.Controls.Add(TextLabel("每轮先复检当前节点；ChatGPT 与 Gemini 均不超过 800 ms 时保持节点，超过后再寻优。"));
+        automaticRecovery.Text = "超出 800 ms 时自动寻优（固定启用）";
+        automaticRecovery.AutoSize = true;
+        automaticRecovery.Checked = true;
+        automaticRecovery.Enabled = false;
+        automaticRecovery.Margin = new Padding(0, 12, 0, 0);
+        layout.Controls.Add(automaticRecovery);
 
-        AddChoice(layout, "ChatGPT、Steam API 与 Google（固定核心）",
+        AddChoice(layout, "ChatGPT 与 Gemini（固定核心检测）",
             CoreWebsitePolicy.Required, preferences, false);
+        AddNumberSetting(layout, "检测间隔（秒）", checkInterval, 15, 3600, preferences.CheckIntervalSeconds);
+        failureThreshold.Value = preferences.FailureThreshold;
+        recoveryCooldown.Value = preferences.RecoveryCooldownMinutes;
+        layout.Controls.Add(TextLabel("先按 ChatGPT、Gemini 网站延迟预排序，再实测核心服务与地区；首个双核心均不超过 800 ms 的合格节点可切换，强制寻优仍扫描全部节点。"));
+        layout.Controls.Add(Heading("其他服务诊断"));
+        layout.Controls.Add(TextLabel("以下服务仅采集与展示，不作为自动切换门槛。已有历史数据继续保留。"));
+        AddChoice(layout, "Google", new[] { ServiceKind.Google }, preferences);
+        AddChoice(layout, "Steam API", new[] { ServiceKind.SteamApi }, preferences);
         AddChoice(layout, "GitHub", new[] { ServiceKind.GitHub }, preferences);
         AddChoice(layout, "Steam 商店与社区", new[] { ServiceKind.SteamStore, ServiceKind.SteamCommunity }, preferences);
         AddChoice(layout, "Discord", new[] { ServiceKind.Discord }, preferences);
         AddChoice(layout, "Spotify", new[] { ServiceKind.Spotify }, preferences);
         AddChoice(layout, "Epic", new[] { ServiceKind.Epic }, preferences);
         AddChoice(layout, "Z-Library 网页", new[] { ServiceKind.ZLibraryWeb }, preferences);
-        performanceOptimization.Text = "当前节点可用时允许性能寻优（高级）";
-        performanceOptimization.AutoSize = true;
-        performanceOptimization.Checked = preferences.AutomaticOptimization;
-        performanceOptimization.Margin = new Padding(0, 12, 0, 0);
-        layout.Controls.Add(performanceOptimization);
         var save = new Button { Text = "保存设置并开始守护", AutoSize = true, Height = 38,
             Padding = new Padding(14, 4, 14, 4), BackColor = Color.FromArgb(45, 120, 240), ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 16, 0, 0) };
@@ -134,6 +149,18 @@ public sealed class DetailsForm : Form
         layout.Controls.Add(save);
         layout.Controls.Add(TextLabel("Steam 游戏与下载仍按 Clash 原有规则直连；这里显示的是服务端点响应时间。"));
         settingsPanel.Controls.Add(layout);
+    }
+
+    private void AddNumberSetting(Control parent, string text, NumericUpDown input, int minimum, int maximum, int value)
+    {
+        var row = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 7, 0, 0) };
+        row.Controls.Add(new Label { Text = text, AutoSize = true, Padding = new Padding(0, 4, 8, 0) });
+        input.Minimum = minimum;
+        input.Maximum = maximum;
+        input.Value = value;
+        input.Width = 90;
+        row.Controls.Add(input);
+        parent.Controls.Add(row);
     }
 
     private void AddChoice(Control parent, string text, ServiceKind[] services, UserPreferences preferences,
@@ -155,7 +182,11 @@ public sealed class DetailsForm : Form
             return;
         }
         savePreferences(new UserPreferences { FirstRunComplete = true,
-            AutomaticOptimization = performanceOptimization.Checked,
+            AutomaticOptimization = legacyAutomaticOptimization,
+            AutomaticRecovery = true,
+            CheckIntervalSeconds = (int)checkInterval.Value,
+            FailureThreshold = (int)failureThreshold.Value,
+            RecoveryCooldownMinutes = (int)recoveryCooldown.Value,
             RequiredServices = selected });
         ShowSettings(false);
     }
@@ -211,7 +242,6 @@ public sealed class DetailsForm : Form
 
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
         buttons.Controls.Add(ActionButton("立即复检当前节点", delegate { requestCheck(); }));
-        buttons.Controls.Add(ActionButton("立即寻优并切换", delegate { requestOptimization(); }));
         pauseButton.Text = "暂停节点守护";
         pauseButton.AutoSize = true;
         pauseButton.Click += delegate {
@@ -222,10 +252,11 @@ public sealed class DetailsForm : Form
         buttons.Controls.Add(pauseButton);
         buttons.Controls.Add(ActionButton("恢复上一个节点", delegate { restorePrevious(); }));
         buttons.Controls.Add(ActionButton("当前节点 ChatGPT 不可用", delegate { ReportCurrentFailure(ServiceKind.ChatGPT); }));
-        buttons.Controls.Add(ActionButton("修改常用服务", delegate { ShowSettings(true); }));
+        buttons.Controls.Add(ActionButton("故障恢复设置", delegate { ShowSettings(true); }));
         buttons.Controls.Add(ActionButton("切换记录与推荐", delegate { using (var window = new ExperienceForm()) window.ShowDialog(this); }));
         buttons.Controls.Add(ActionButton("运行统计", delegate { using (var window = new StatisticsForm()) window.ShowDialog(this); }));
         buttons.Controls.Add(ActionButton("候选网站延迟排行", delegate { ShowCandidateLatencyRanking(); }));
+        buttons.Controls.Add(ActionButton("立即开始一轮全节点寻优", delegate { requestOptimization(); }));
         layout.Controls.Add(buttons);
         layout.Controls.Add(TextLabel("响应时间来自轻量 HTTP 探测，不代表网页渲染、AI 生成或游戏服务器延迟。"));
         layout.Controls.Add(ActionButton("退出节点守护", delegate { exitApplication(); }));

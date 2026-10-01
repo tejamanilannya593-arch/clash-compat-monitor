@@ -78,6 +78,21 @@ public static class StartupRecovery
             .Select(x => x.Name).ToArray();
     }
 
+    public static string[] PreferFreshRecoveryTargets(IEnumerable<string> rankedTargets,
+        IEnumerable<AutomaticSwitchRecord> switches, ServiceKind failedService, DateTime nowUtc)
+    {
+        var recentlyFailed = new HashSet<string>((switches ?? Enumerable.Empty<AutomaticSwitchRecord>())
+            .Where(x => x != null && x.FailureService == failedService &&
+                x.Utc <= nowUtc && x.Utc > nowUtc.AddMinutes(-10) &&
+                !String.IsNullOrWhiteSpace(x.From))
+            .Select(x => x.From), StringComparer.Ordinal);
+        return (rankedTargets ?? Enumerable.Empty<string>())
+            .Where(x => !String.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => recentlyFailed.Contains(x) ? 1 : 0)
+            .ToArray();
+    }
+
     public static double ChatGptResponseMilliseconds(CandidateScanResult scan, double fallback)
     {
         ProbeResult result;

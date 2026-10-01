@@ -5,13 +5,12 @@ using System.Linq;
 internal static class CoreWebsitePolicy
 {
     public static readonly ServiceKind[] Required = {
-        ServiceKind.ChatGPT, ServiceKind.SteamApi, ServiceKind.Google
+        ServiceKind.ChatGPT, ServiceKind.Gemini
     };
 
     public static List<ServiceKind> Normalize(IEnumerable<ServiceKind> selected)
     {
-        return Required.Concat((selected ?? Enumerable.Empty<ServiceKind>())
-                .Where(service => service != ServiceKind.Gemini))
+        return Required.Concat(selected ?? Enumerable.Empty<ServiceKind>())
             .Distinct().ToList();
     }
 

@@ -23,10 +23,9 @@ public sealed class TrayHost : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add("打开详情", null, delegate { ShowDetails(); });
         menu.Items.Add("立即复检当前节点", null, delegate { coordinator.RequestCheck(); });
-        menu.Items.Add("立即寻优并切换", null, delegate { coordinator.RequestOptimization(); });
         menu.Items.Add("当前节点 ChatGPT 不可用", null, delegate { ReportCurrentFailure(ServiceKind.ChatGPT); });
-        menu.Items.Add("暂停自动优化", null, delegate { coordinator.SetPaused(true); });
-        menu.Items.Add("恢复自动优化", null, delegate { coordinator.SetPaused(false); });
+        menu.Items.Add("暂停节点守护", null, delegate { coordinator.SetPaused(true); });
+        menu.Items.Add("恢复节点守护", null, delegate { coordinator.SetPaused(false); });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, delegate { ExitThread(); });
 
@@ -96,7 +95,7 @@ public sealed class TrayHost : ApplicationContext
             tray.Text = text.Length > 63 ? text.Substring(0, 63) : text;
             if (!String.IsNullOrWhiteSpace(lastNode) && !String.IsNullOrWhiteSpace(snapshot.ActualNode) &&
                 !String.Equals(lastNode, snapshot.ActualNode, StringComparison.Ordinal))
-                tray.ShowBalloonTip(4000, "节点守护已自动切换", snapshot.ActualNode, ToolTipIcon.Info);
+                tray.ShowBalloonTip(4000, "当前节点已变更", snapshot.ActualNode, ToolTipIcon.Info);
             if (!String.IsNullOrWhiteSpace(snapshot.ActualNode)) lastNode = snapshot.ActualNode;
             if (details != null && !details.IsDisposed) details.UpdateSnapshot(snapshot);
         });

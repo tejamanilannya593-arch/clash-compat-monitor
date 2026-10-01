@@ -63,13 +63,13 @@ public sealed class CandidateLatencyForm : Form
             this.requestRefresh();
         };
         buttons.Controls.Add(refresh);
-        var optimize = new Button { Text = "立即寻优并切换", AutoSize = true };
+        var optimize = new Button { Text = "立即开始一轮全节点寻优", AutoSize = true };
         optimize.Click += delegate {
-            statusLabel.Text = "正在完整复检候选；找到实测更快且全部服务通过的节点后立即切换。";
+            statusLabel.Text = "正在按 ChatGPT、Gemini 网站延迟预排序，实测全部节点。";
             this.requestOptimization();
         };
         buttons.Controls.Add(optimize);
-        buttons.Controls.Add(new Label { Text = "重新实测仅刷新表格；立即寻优会完整复检后切换。",
+        buttons.Controls.Add(new Label { Text = "当前节点双核心延迟超过 800 ms 时自动寻找；此按钮可强制扫描全部节点。",
             AutoSize = true, ForeColor = Color.FromArgb(88, 101, 122), Margin = new Padding(12, 7, 0, 0) });
         layout.Controls.Add(buttons);
         Controls.Add(layout);
@@ -82,9 +82,8 @@ public sealed class CandidateLatencyForm : Form
         IList<CandidateLatencyMeasurement> rows = snapshot.CandidateLatencies ??
             new List<CandidateLatencyMeasurement>().AsReadOnly();
         ServiceKind[] services = rows.SelectMany(x => x.Services).Select(x => x.Service)
-            .Where(x => x != ServiceKind.Gemini)
             .Distinct().OrderBy(x => x == ServiceKind.ChatGPT ? 0 :
-                x == ServiceKind.SteamApi ? 1 : x == ServiceKind.Google ? 2 : 3)
+                x == ServiceKind.Gemini ? 1 : 2)
             .ThenBy(x => x).ToArray();
 
         latencyTable.SuspendLayout();
@@ -115,14 +114,14 @@ public sealed class CandidateLatencyForm : Form
             gridRow.Cells["country"].Value = String.IsNullOrWhiteSpace(row.ExitCountryCode) ? "未知" : row.ExitCountryCode;
             gridRow.Cells["mihomo"].Value = row.MihomoMilliseconds > 0 && row.MihomoMilliseconds < Int32.MaxValue
                 ? row.MihomoMilliseconds + " ms" : "超时";
-            foreach (ServiceMeasurement service in row.Services.Where(x => x.Service != ServiceKind.Gemini))
+            foreach (ServiceMeasurement service in row.Services)
                 gridRow.Cells["service_" + service.Service].Value = WebsiteLatencyText(service);
             gridRow.Cells["decision"].Value = String.IsNullOrWhiteSpace(row.DecisionDetail)
                 ? CandidateDecisionText.Initial(row, snapshot.Services) : row.DecisionDetail;
         }
         DateTime checkedUtc = rows.Select(x => x.CheckedUtc).DefaultIfEmpty(DateTime.MinValue).Max();
         statusLabel.Text = rows.Count == 0 ? "尚未实测。点击下方按钮开始测量。" :
-            "先按 ChatGPT，次按 Steam/Google 实测延迟排序 · Clash 延迟仅用于初筛 · 最近实测：" +
+            "只读诊断排行 · ChatGPT / Gemini 为核心服务 · 最近实测：" +
             checkedUtc.ToLocalTime().ToString("MM-dd HH:mm:ss");
         latencyTable.ResumeLayout();
     }

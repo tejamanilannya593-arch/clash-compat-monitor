@@ -98,10 +98,8 @@ internal static class CandidateDecisionText
         if (baseline == Double.MaxValue || target == Double.MaxValue)
             return "等待完整复检";
         long improvement = (long)Math.Round(baseline - target);
-        if (improvement >= MaterialImprovementPolicy.AbsoluteImprovementMilliseconds)
-            return "快 " + improvement + " ms，已达 200 ms 强制线；点击立即寻优进行完整复检";
         if (improvement > 0)
-            return "仅快 " + improvement + " ms，未达 200 ms 强制线；点击立即寻优可复检";
+            return "快 " + improvement + " ms；后台全节点寻优会重新复检";
         if (improvement == 0) return "与当前节点实测相同；无需切换";
         return "比当前慢 " + (-improvement) + " ms；无需切换";
     }
@@ -113,7 +111,7 @@ internal static class CandidateDecisionText
         if (!AiRegionPolicy.SupportsChatGpt(scan.ExitCountryCode))
             return "出口地区不符合 ChatGPT 要求";
         var required = (requiredServices ?? Enumerable.Empty<ServiceKind>())
-            .Concat(new[] { ServiceKind.ChatGPT, ServiceKind.SteamApi, ServiceKind.Google })
+            .Concat(CoreWebsitePolicy.Required)
             .Distinct().ToList();
         foreach (ServiceKind service in required)
         {
@@ -129,13 +127,12 @@ internal static class CandidateDecisionText
     private static string FailedService(IEnumerable<ServiceMeasurement> services)
     {
         IList<ServiceMeasurement> values = (services ?? Enumerable.Empty<ServiceMeasurement>()).ToList();
-        IEnumerable<ServiceKind> ordered = new[] {
-            ServiceKind.ChatGPT, ServiceKind.SteamApi, ServiceKind.Google
-        }.Concat(values.Select(x => x.Service).Where(x => x != ServiceKind.Gemini).OrderBy(x => x)).Distinct();
+        IEnumerable<ServiceKind> ordered = CoreWebsitePolicy.Required;
         foreach (ServiceKind service in ordered)
         {
             ServiceMeasurement measurement = values.FirstOrDefault(x => x.Service == service);
-            if (measurement == null || !measurement.Available)
+            if (measurement == null || !measurement.Available ||
+                measurement.Evidence == ProbeFailureKind.Unverified || measurement.Evidence == ProbeFailureKind.Partial)
                 return MonitorPresentation.ServiceLabel(service);
         }
         return "";
@@ -299,7 +296,7 @@ public sealed class MonitorPresentation
         List<long> measured = measuredServices.Select(x => x.Milliseconds).ToList();
         if (measured.Count == 0) return "综合响应：待测";
         double p75 = QualityMeasurement.Percentile75(measured.Select(x => (double)x), Double.NaN);
-        string label = "综合响应：" + Math.Round(p75).ToString("F0") + " ms · " + QualityPolicy.LatencyBand(p75);
+        string label = "综合响应：" + Math.Round(p75).ToString("F0") + " ms · " + LatencyBand(p75);
         ServiceMeasurement slowest = measuredServices.OrderByDescending(x => x.Milliseconds).First();
         if (slowest.Milliseconds > 2000)
             label += " · " + ServiceLabel(slowest.Service) + " " + slowest.Milliseconds + " ms";
@@ -364,11 +361,20 @@ public sealed class MonitorPresentation
             case MonitorRunState.Running: return "运行正常";
             case MonitorRunState.Checking: return "正在检测";
             case MonitorRunState.Pending: return "部分服务待验证";
-            case MonitorRunState.Paused: return "自动优化已暂停";
+            case MonitorRunState.Paused: return "节点守护已暂停";
             case MonitorRunState.Degraded: return "需要注意";
             case MonitorRunState.Stuck: return "检测超时";
             case MonitorRunState.Stopped: return "已退出";
             default: return "正在启动";
         }
+    }
+
+    private static string LatencyBand(double milliseconds)
+    {
+        if (Double.IsNaN(milliseconds) || Double.IsInfinity(milliseconds) || milliseconds < 0) return "待测";
+        if (milliseconds <= 300) return "优秀";
+        if (milliseconds <= 500) return "良好";
+        if (milliseconds <= 800) return "可用但偏慢";
+        return "较慢";
     }
 }

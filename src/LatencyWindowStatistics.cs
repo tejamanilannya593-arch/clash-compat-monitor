@@ -29,9 +29,9 @@ public static class LatencyWindowStatistics
 
     public static LatencyWindowSummary Summarize(IEnumerable<double> responses)
     {
-        List<double> sorted = (responses ?? Enumerable.Empty<double>())
-            .Where(x => !Double.IsNaN(x) && !Double.IsInfinity(x) && x > 0)
-            .TakeLastCompat(MaximumSamples)
+        List<double> recent = (responses ?? Enumerable.Empty<double>())
+            .Where(x => !Double.IsNaN(x) && !Double.IsInfinity(x) && x > 0).ToList();
+        List<double> sorted = recent.Skip(Math.Max(0, recent.Count - MaximumSamples))
             .OrderBy(x => x)
             .ToList();
         if (sorted.Count == 0) return new LatencyWindowSummary(0, 0, 0, 0, 0);

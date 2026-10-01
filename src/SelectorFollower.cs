@@ -6,12 +6,14 @@ public static class SelectorFollower
     public static bool SynchronizeVerified(IMihomoClient mihomo, string sourceGroup,
         string targetGroup, CandidateScanResult scan)
     {
-        if (!ServiceEvidencePolicy.CanHold(scan) || mihomo == null ||
+        if (scan == null || (scan.Health != CandidateHealth.Compatible &&
+            scan.Health != CandidateHealth.BasicCompatible) || mihomo == null ||
             !String.Equals(scan.Name, mihomo.GetSelected(sourceGroup), StringComparison.Ordinal)) return false;
         return Synchronize(mihomo, sourceGroup, targetGroup);
     }
 
-    public static bool Synchronize(IMihomoClient mihomo, string sourceGroup, string targetGroup)
+    public static bool Synchronize(IMihomoClient mihomo, string sourceGroup, string targetGroup,
+        string expectedTarget = null)
     {
         if (mihomo == null) throw new ArgumentNullException("mihomo");
         if (String.IsNullOrWhiteSpace(sourceGroup) || String.IsNullOrWhiteSpace(targetGroup) ||
@@ -24,6 +26,7 @@ public static class SelectorFollower
         if (!choices.Contains(target, StringComparer.Ordinal)) return false;
         if (String.Equals(mihomo.GetSelected(targetGroup), target, StringComparison.Ordinal)) return false;
         if (!String.Equals(mihomo.GetSelected(sourceGroup), selected, StringComparison.Ordinal)) return false;
+        if (expectedTarget != null && mihomo.GetSelected(targetGroup) != expectedTarget) return false;
 
         mihomo.Select(targetGroup, target);
         if (!String.Equals(mihomo.GetSelected(targetGroup), target, StringComparison.Ordinal))

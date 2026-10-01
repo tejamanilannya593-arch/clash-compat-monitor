@@ -76,14 +76,17 @@ public sealed class CompatibilityScanner
         var probeTasks = new Dictionary<ServiceKind, Task<ProbeResult>>();
         foreach (ServiceKind service in services)
         {
-            if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             ServiceKind scheduled = service;
             probeTasks[scheduled] = Task.Factory.StartNew(() => probe.Probe(scheduled, probeTimeout));
         }
+        // Drain all in-flight probes before releasing the selector to another scan, even on cancellation/error.
+        var inFlight = probeTasks.Values.Cast<Task>().ToList();
+        if (identityTask != null) inFlight.Add(identityTask);
+        Task.WhenAll(inFlight).GetAwaiter().GetResult();
+        if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
         var rawResults = new Dictionary<ServiceKind, ProbeResult>();
         foreach (ServiceKind service in services)
         {
-            if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             rawResults[service] = probeTasks[service].GetAwaiter().GetResult();
         }
         if (identityTask != null) identity = identityTask.GetAwaiter().GetResult();

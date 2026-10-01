@@ -24,8 +24,23 @@ public static class StatusReport
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         string temporary = path + ".tmp";
         File.WriteAllText(temporary, content ?? "", new UTF8Encoding(false));
-        if (File.Exists(path)) File.Replace(temporary, path, null);
-        else File.Move(temporary, path);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+                return;
+            }
+            catch (IOException)
+            {
+                // Windows can report either sharing violations or "unable to remove
+                // replaced file" while an indexer briefly holds the destination.
+                // Retry only while the complete replacement file still exists.
+                if (attempt >= 4 || !File.Exists(temporary)) throw;
+                System.Threading.Thread.Sleep(50 * (attempt + 1));
+            }
+        }
     }
 
     public static bool TryWriteLatest(string path, string content, out Exception error)

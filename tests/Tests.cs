@@ -9,7 +9,7 @@ using System.Threading.Tasks;
 using System.Reflection;
 using System.Windows.Forms;
 
-internal static class Tests
+internal static partial class Tests
 {
     private static int failures;
 
@@ -61,14 +61,31 @@ internal static class Tests
 
     public static int Main()
     {
+        try { return RunAllTests(); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("UNHANDLED " + ex.GetType().FullName + ": " + ex.Message);
+            Console.Error.WriteLine(ex.StackTrace);
+            return 1;
+        }
+    }
+
+    private static int RunAllTests()
+    {
+        RecoveryOnlyRegression();
         Equal("ClashCompatibilityMonitor", MonitorIdentity.Name, "identity");
-        Equal("0.7.0-preview.27", MonitorIdentity.Version, "release version");
+        Equal("0.7.0-preview.35", MonitorIdentity.Version, "release version");
         Equal(TimeSpan.FromMinutes(30), MonitorConfiguration.CreateDefault().ReloadRecoveryFreshness, "reload recovery freshness");
+        Equal(true, MonitorConfiguration.CreateDefault().ContinuousOptimization,
+            "production defaults to continuous all-node optimization");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(false), "IPv4-compatible runtime continues normally");
         Equal<string>(null, RuntimeConfigurationPolicy.Ipv6Action(true),
             "IPv6 flag alone cannot disable monitoring or trigger configuration rewrites");
-        Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().GeneralGroup,
-            "ordinary proxy group follows the stable selector");
+        Equal("🚀 节点选择", MonitorConfiguration.CreateDefault().SharedGroup,
+            "monitor defaults to the existing ordinary selector");
+        Equal("", MonitorConfiguration.CreateDefault().GeneralGroup,
+            "monitor no longer forces a second traffic selector");
+        ExistingSelectorBehavior();
         NodeIdentityBehavior();
         ServiceObservationBehavior();
         ExitNetworkEvidenceBehavior();
@@ -79,9 +96,10 @@ internal static class Tests
         MihomoPipeIntegration();
         CompatibilityScanning();
         CandidateDelayMeasurementBehavior();
-        FastFailoverWorkerOrchestration();
+        RecoveryWorkflowBehavior();
+        ManualOptimizationBehavior();
+        ContinuousOptimizationBehavior();
         CandidateLatencyRankingBehavior();
-        AutomaticRankedSelectionBehavior();
         ZLibraryWebBehavior();
         ZLibraryChoiceBehavior();
         DetailsTypographyBehavior();
@@ -115,6 +133,26 @@ internal static class Tests
         BrowserBridgeBehavior();
         AssuranceBehavior();
         return failures == 0 ? 0 : 1;
+    }
+
+    private static void RecoveryOnlyRegression()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "recovery-only-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var clock = new FakeClock { UtcNow = DateTime.UtcNow };
+            var client = new OrchestratedMihomo("current", new[] { "current", "node-01" },
+                new Dictionary<string, int> { { "current", 100 }, { "node-01", 50 } });
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), client,
+                new OrchestratedServiceProbe(client, false), new BoundedLogger(Path.Combine(root, "monitor.log"), 100000),
+                clock, new OrchestratedExitIdentityProbe(client, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+            worker.Run(UserPreferences.Defaults());
+            Equal("current", client.GetSelected("shared"), "recovery first failure never switches");
+            Equal(false, client.AllDelayNodes().Any(x => x != "current"), "recovery first failure never scans alternatives");
+        }
+        finally { DeleteDirectoryEventually(root); }
     }
 
     private static void NodeIdentityBehavior()
@@ -677,8 +715,10 @@ internal static class Tests
                 "details window exposes the candidate website latency table");
             Equal(true, FindButton(form, "立即复检当前节点") != null,
                 "details window distinguishes a current-node recheck");
-            Equal(true, FindButton(form, "立即寻优并切换") != null,
-                "details window exposes an explicit immediate optimization action");
+            Equal(false, FindButton(form, "立即寻优并切换") != null,
+                "details window removes the old unverified optimization action");
+            Equal(true, FindButton(form, "立即开始一轮全节点寻优") != null,
+                "details window exposes the immediate continuous optimization action");
             Equal("Segoe UI", times.Font.Name, "timestamps use compact Latin digits");
             Equal("Segoe UI", services.Font.Name, "service latency uses compact Latin digits");
             form.Show();
@@ -968,10 +1008,10 @@ internal static class Tests
         int beforeRollbackRecheck = workerProbe.Calls.Count;
         worker.ReportBrowserConversationFailure("node", "fresh-exit", ServiceKind.Gemini,
             BrowserVerificationOutcome.ConversationError, true, now.AddMinutes(2));
-        Equal(true, workerProbe.Calls.Count > beforeRollbackRecheck,
-            "browser failure performs fresh old-node service recheck");
-        Equal("old-node", workerMihomo.GetSelected("shared"),
-            "browser failure rechecks old node before safe rollback");
+        Equal(false, workerProbe.Calls.Count > beforeRollbackRecheck,
+            "browser feedback queues detection without a candidate scan");
+        Equal("node", workerMihomo.GetSelected("shared"),
+            "browser feedback alone never rolls back");
 
         string staleRoot = Path.Combine(Path.GetTempPath(), "browser-stale-" + Guid.NewGuid().ToString("N"));
         var staleData = new ExperienceData { ActiveScope = "scope", Assurance = new ConnectionAssurance { Scope = "scope" } };
@@ -1851,6 +1891,15 @@ internal static class Tests
 
     private static void MihomoPipeIntegration()
     {
+        Equal("verge-mihomo-production-1234", MihomoPipeClient.SelectAvailablePipeName(
+            new[] { "clash-verge-service", "verge-mihomo-production-1234" }, "verge-mihomo"),
+            "renamed production Mihomo pipe is discovered");
+        Equal("verge-mihomo", MihomoPipeClient.SelectAvailablePipeName(
+            new[] { "verge-mihomo", "verge-mihomo-production-1234" }, "verge-mihomo"),
+            "existing Mihomo pipe stays preferred");
+        Equal("verge-mihomo-production-5678", MihomoPipeClient.SelectAvailablePipeName(
+            new[] { "verge-mihomo-production-5678" }, "verge-mihomo-production-1234"),
+            "pipe discovery follows a restarted core");
         string pipeName = "clash-monitor-test-" + Guid.NewGuid().ToString("N");
         var requests = new List<string>();
         Exception serverError = null;
@@ -2187,8 +2236,8 @@ internal static class Tests
                 { ServiceKind.Gemini, ProbeResult.Partial("entry", 100) },
                 { ServiceKind.Google, ProbeResult.Success(100) }
             }, null, "JP");
-        Equal(false, StartupRecovery.IsEligibleQuickScan(missingSteamTarget, ServiceKind.ChatGPT),
-            "recovery never accepts a node without all four core website results");
+        Equal(true, StartupRecovery.IsEligibleQuickScan(missingSteamTarget, ServiceKind.ChatGPT),
+            "optional Steam result is not a core requirement");
         Equal(true, StartupRecovery.ShouldStopAfterEligibleCandidates(3),
             "fast selection stops after three eligible candidates");
         Equal(false, StartupRecovery.ShouldStopAfterEligibleCandidates(2),
@@ -2271,6 +2320,7 @@ internal static class Tests
             RunBudgetedSevereLatencyOrchestration();
             RunEligibleFastFailoverOrchestration();
             RunImmediateChatGptRecoveryAcrossAllLiveCandidates();
+            RunImmediateChatGptRecoveryAvoidsRecentFailedNode();
             RunImmediateChatGptRecoveryRetriesWithoutWaiting();
             RunImmediateChatGptRecoveryContinuesAcrossBatches();
             RunImmediateChatGptRecoveryCompletesFullPassAcrossBatches();
@@ -2312,11 +2362,13 @@ internal static class Tests
                 }, now),
                 new CandidateLatencyMeasurement("node-mandatory", "JP", 40, new[] {
                     new ServiceMeasurement(ServiceKind.ChatGPT, true, 296, "ok"),
+                    new ServiceMeasurement(ServiceKind.Gemini, true, 296, "ok"),
                     new ServiceMeasurement(ServiceKind.SteamApi, true, 140, "ok"),
                     new ServiceMeasurement(ServiceKind.Google, true, 150, "ok")
                 }, now),
                 new CandidateLatencyMeasurement("node-steam-failed", "SG", 45, new[] {
-                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 110, "ok", ProbeFailureKind.Partial),
+                    new ServiceMeasurement(ServiceKind.ChatGPT, true, 110, "ok"),
+                    new ServiceMeasurement(ServiceKind.Gemini, true, 110, "ok"),
                     new ServiceMeasurement(ServiceKind.SteamApi, false, 0, "blocked", ProbeFailureKind.Service),
                     new ServiceMeasurement(ServiceKind.Google, true, 140, "ok")
                 }, now)
@@ -2329,17 +2381,17 @@ internal static class Tests
             Equal(10, table.Rows.Count, "candidate latency table always presents at least ten rows");
             Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "ChatGPT"),
                 "candidate latency table has a ChatGPT website column");
-            Equal(false, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
-                "candidate latency table excludes the retired Gemini column");
-            Equal("service_ChatGPT,service_SteamApi,service_Google",
+            Equal(true, table.Columns.Cast<DataGridViewColumn>().Any(x => x.HeaderText == "Gemini"),
+                "candidate latency table displays Gemini core column");
+            Equal("service_ChatGPT,service_Gemini,service_Google,service_SteamApi",
                 String.Join(",", table.Columns.Cast<DataGridViewColumn>()
                     .Where(x => x.Name.StartsWith("service_", StringComparison.Ordinal))
                     .Select(x => x.Name).Take(4)),
                 "candidate latency table shows primary AI then secondary Steam and Google");
             Equal("入口可达 · 588 ms", table.Rows[0].Cells["service_ChatGPT"].Value,
                 "candidate latency table shows partial website latency without claiming full verification");
-            Equal(false, table.Columns.Contains("service_Gemini"),
-                "candidate latency table ignores old cached Gemini measurements");
+            Equal(true, table.Columns.Contains("service_Gemini"),
+                "candidate latency table retains Gemini measurements");
             Equal(true, table.Columns.Contains("decision"),
                 "candidate latency table exposes why a measured row was not selected");
             if (table.Columns.Contains("decision"))
@@ -2348,19 +2400,19 @@ internal static class Tests
                     "candidate rejection reason is visible beside the node without horizontal scrolling");
                 Equal(true, table.Columns["decision"].Frozen,
                     "candidate rejection reason stays visible while website columns scroll");
-                Equal("仅快 8 ms，未达 200 ms 强制线；点击立即寻优可复检",
+                Equal("ChatGPT 未通过",
                     table.Rows[0].Cells["decision"].Value,
                     "candidate row quantifies a small improvement against the current node");
-                Equal("快 300 ms，已达 200 ms 强制线；点击立即寻优进行完整复检",
+                Equal("快 300 ms；后台全节点寻优会重新复检",
                     table.Rows[1].Cells["decision"].Value,
                     "candidate row makes a mandatory improvement explicit before full validation");
-                Equal("Steam API 未通过", table.Rows[2].Cells["decision"].Value,
-                    "failed fixed website is named in the rejection reason");
+                Equal("快 486 ms；后台全节点寻优会重新复检", table.Rows[2].Cells["decision"].Value,
+                    "optional Steam failure cannot reject a core-compatible diagnostic row");
             }
             Equal("待测", table.Rows[9].Cells["node"].Value,
                 "unmeasured ranking slots remain explicit");
-            Equal(true, FindButton(form, "立即寻优并切换") != null,
-                "candidate ranking offers an explicit full-validation switch action");
+            Equal(false, FindButton(form, "立即寻优并切换") != null,
+                "candidate ranking cannot trigger optimization");
         }
     }
 
@@ -2416,8 +2468,8 @@ internal static class Tests
                 x.Services.Any(service => service.Service == ServiceKind.ChatGPT) &&
                 x.Services.Any(service => service.Service == ServiceKind.SteamApi) &&
                 x.Services.Any(service => service.Service == ServiceKind.Google) &&
-                !x.Services.Any(service => service.Service == ServiceKind.Gemini)),
-                "every candidate row measures the three core websites without Gemini");
+                x.Services.Any(service => service.Service == ServiceKind.Gemini)),
+                "candidate rows include both AI core services and optional diagnostics");
             ((ICandidateLatencyRunner)worker).InvalidateCandidateLatencies();
             Equal(0, worker.RunOnce(false, UserPreferences.Defaults()).CandidateLatencies.Count,
                 "invalidated candidate ranking cannot reappear after a normal monitor cycle");
@@ -3226,8 +3278,8 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 { ServiceKind.SteamApi, ProbeResult.Success(300) },
                 { ServiceKind.Google, ProbeResult.Success(350) }
             }, null, "SG");
-        Equal(true, StartupRecovery.IsEligibleQuickScan(singaporeM2, ServiceKind.ChatGPT),
-            "Singapore M2 is eligible when ChatGPT, Steam and Google work without Gemini");
+        Equal(false, StartupRecovery.IsEligibleQuickScan(singaporeM2, ServiceKind.ChatGPT),
+            "missing Gemini cannot qualify a candidate");
         var gptUnavailable = new CandidateLatencyMeasurement("gpt-unavailable", "SG", 20, new[] {
             new ServiceMeasurement(ServiceKind.ChatGPT, false, 0, "blocked", ProbeFailureKind.Service),
             new ServiceMeasurement(ServiceKind.SteamApi, true, 50, "ok"),
@@ -3238,10 +3290,10 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             new ServiceMeasurement(ServiceKind.Google, true, 350, "ok") }, now);
         Equal(true, WebsitePriorityLatency.Primary(m2Measured) < WebsitePriorityLatency.Primary(gptUnavailable),
             "ChatGPT-reachable M2 outranks nodes whose ChatGPT is unavailable");
-        Equal("SG 新加坡 M2", StartupRecovery.RankVerifiedFastTargets(
+        Equal<string>(null, StartupRecovery.RankVerifiedFastTargets(
             new[] { singaporeM2 }, new Dictionary<string, int> { { "SG 新加坡 M2", 50 } },
             ServiceKind.ChatGPT).FirstOrDefault(),
-            "quick recovery can select Singapore M2 without a Gemini result");
+            "quick recovery cannot select a node without Gemini evidence");
         var aiFast = new CandidateLatencyMeasurement("ai-fast", "JP", 900, new[] {
             new ServiceMeasurement(ServiceKind.ChatGPT, true, 180, "ok"),
             new ServiceMeasurement(ServiceKind.Gemini, true, 200, "ok"),
@@ -3552,6 +3604,25 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "fifth switch inside thirty minutes enters stabilization");
         Equal(true, SwitchBudgetPolicy.CanSwitch(twoRecent, now.AddMinutes(2)).Allowed,
             "budget automatically releases when the rolling slot expires");
+        var recentChatGptFailure = new[] {
+            new AutomaticSwitchRecord { Utc = now.AddMinutes(-1), From = "node-fast", To = "current",
+                FailureService = ServiceKind.ChatGPT }
+        };
+        Equal("node-fresh,node-fast", String.Join(",", StartupRecovery.PreferFreshRecoveryTargets(
+            new[] { "node-fast", "node-fresh" }, recentChatGptFailure,
+            ServiceKind.ChatGPT, now)),
+            "urgent recovery demotes a node that just failed the same service");
+        Equal("node-fast", String.Join(",", StartupRecovery.PreferFreshRecoveryTargets(
+            new[] { "node-fast" }, recentChatGptFailure, ServiceKind.ChatGPT, now)),
+            "a recently failed node remains an immediate last-resort recovery target");
+        Equal("node-fast,node-fresh", String.Join(",", StartupRecovery.PreferFreshRecoveryTargets(
+            new[] { "node-fast", "node-fresh" }, recentChatGptFailure,
+            ServiceKind.ChatGPT, now.AddMinutes(10))),
+            "recovery penalty expires after ten minutes");
+        Equal("node-fast,node-fresh", String.Join(",", StartupRecovery.PreferFreshRecoveryTargets(
+            new[] { "node-fast", "node-fresh" }, recentChatGptFailure,
+            ServiceKind.SteamApi, now)),
+            "a ChatGPT failure does not penalize another service recovery");
     }
 
     private static void RunEligibleFastFailoverOrchestration()
@@ -3726,6 +3797,10 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "ChatGPT outage quickly rechecks ChatGPT on every live Clash candidate");
             Equal("node-10", mihomo.GetSelected("shared"),
                 "majority ChatGPT outage selects the reachable candidate with the lowest ChatGPT latency");
+            AutomaticSwitchRecord recoverySwitch = new ExperienceStore(
+                Path.Combine(root, "state", "experience.json")).Load().Assurance.AutomaticSwitches.Last();
+            Equal(ServiceKind.ChatGPT, recoverySwitch.FailureService.Value,
+                "fast recovery records the failed service for future anti-flap ordering");
             Equal("node-10", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
                 "immediate ChatGPT recovery fully validates only the best reachable target before switching");
             Equal(TimeSpan.FromSeconds(30), result.NextCheckUtc - result.CheckedUtc,
@@ -3766,6 +3841,45 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 "an all-node quick-delay failure still performs a bounded real ChatGPT recheck on every candidate");
             Equal(TimeSpan.FromSeconds(3), result.NextCheckUtc - result.CheckedUtc,
                 "an unresolved ChatGPT outage retries after three seconds instead of waiting thirty seconds");
+        }
+        finally { DeleteDirectoryEventually(root); }
+    }
+
+    private static void RunImmediateChatGptRecoveryAvoidsRecentFailedNode()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "monitor-immediate-gpt-antiflap-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            DateTime now = new DateTime(2026, 9, 24, 8, 3, 0, DateTimeKind.Utc);
+            string[] choices = { "current", "node-recent", "node-fresh" };
+            var clashDelays = new Dictionary<string, int> {
+                { "node-recent", 20 }, { "node-fresh", 30 }
+            };
+            var chatGptDelays = new Dictionary<string, int> {
+                { "node-recent", 70 }, { "node-fresh", 180 }
+            };
+            var mihomo = new OrchestratedMihomo("current", choices, clashDelays, chatGptDelays);
+            var experience = new ExperienceData { Assurance = new ConnectionAssurance() };
+            experience.Assurance.AutomaticSwitches.Add(new AutomaticSwitchRecord {
+                Utc = now.AddSeconds(-45), From = "node-recent", To = "current",
+                Reason = "recovery", FailureService = ServiceKind.ChatGPT
+            });
+            new ExperienceStore(Path.Combine(root, "state", "experience.json")).Save(experience, now);
+            var failures = new Dictionary<string, ServiceKind> { { "current", ServiceKind.ChatGPT } };
+            var worker = new MonitorWorker(FastWorkerConfiguration(root), mihomo,
+                new OrchestratedFailureProbe(mihomo, failures),
+                new BoundedLogger(Path.Combine(root, "logs", "monitor.log"), 1024 * 1024),
+                new FakeClock { UtcNow = now },
+                new OrchestratedExitIdentityProbe(mihomo, false), null,
+                () => new RuntimeSnapshot(true, "", "verge-mihomo", false));
+
+            worker.RunOnce(false, UserPreferences.Defaults());
+
+            Equal("node-fresh", mihomo.GetSelected("shared"),
+                "urgent ChatGPT recovery avoids immediately returning to a recently failed node");
+            Equal("node-fresh", String.Join(",", mihomo.ScanNodes(TimeSpan.FromSeconds(2))),
+                "anti-flap ordering still switches immediately after one complete validation");
         }
         finally { DeleteDirectoryEventually(root); }
     }
@@ -5022,6 +5136,30 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "startup supervisor preserves an intentional exit");
         Equal(false, shouldRestart != null && (bool)shouldRestart.Invoke(null, new object[] { 1, 3 }),
             "startup supervisor stops after three abnormal exits");
+        string heartbeatName = @"Local\ClashCompatibilityMonitor.Test." + Guid.NewGuid().ToString("N");
+        var heartbeatOptions = MonitorOptions.Parse(new[] { "--supervision-heartbeat=" + heartbeatName });
+        Equal(heartbeatName, heartbeatOptions.SupervisionHeartbeatName,
+            "worker parses the supervisor heartbeat channel");
+        Equal(false, StartupSupervision.HeartbeatExpired(TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(3)),
+            "recent worker progress remains healthy");
+        Equal(true, StartupSupervision.HeartbeatExpired(TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(3)),
+            "three minutes without worker progress is treated as stuck");
+        Equal(false, StartupSupervision.CanResetAbnormalExitCount(true, TimeSpan.FromSeconds(30)),
+            "an initialization heartbeat cannot erase the abnormal-exit budget");
+        Equal(true, StartupSupervision.CanResetAbnormalExitCount(true, TimeSpan.FromMinutes(10)),
+            "a sustained healthy worker refreshes the abnormal-exit budget");
+        Equal(false, StartupSupervision.CanResetAbnormalExitCount(false, TimeSpan.FromMinutes(10)),
+            "uptime without a heartbeat cannot refresh the abnormal-exit budget");
+        Equal(TimeSpan.FromSeconds(30), MonitorCoordinator.BoundedLivenessWait(TimeSpan.FromMinutes(4)),
+            "long healthy schedule waits pulse liveness every thirty seconds");
+        Equal(TimeSpan.FromSeconds(10), MonitorCoordinator.BoundedLivenessWait(TimeSpan.FromSeconds(10)),
+            "short healthy schedule waits are not lengthened");
+        using (var receiver = new EventWaitHandle(false, EventResetMode.AutoReset, heartbeatName))
+        using (var sender = SupervisionHeartbeat.Open(heartbeatName))
+        {
+            sender.Pulse();
+            Equal(true, receiver.WaitOne(1000), "worker pulse reaches the startup supervisor");
+        }
         string name = "ClashCompatibilityMonitor.Test." + Guid.NewGuid().ToString("N");
         using (var first = SingleInstanceLease.TryAcquire(name))
         using (var second = SingleInstanceLease.TryAcquire(name))
@@ -5048,16 +5186,16 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
 
     private static void UserPreferenceBehavior()
     {
-        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",",
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",",
             UserPreferencePolicy.NormalizeServices(new[] { ServiceKind.Gemini, ServiceKind.GitHub })),
-            "legacy Gemini preference is removed while the other fixed websites remain");
+            "Gemini is retained as a core service with user diagnostics");
         Equal(false, Enum.GetNames(typeof(ServiceKind)).Contains("JMComicWeb"), "jmcomic service removed");
         string root = Path.Combine(Path.GetTempPath(), "monitor-prefs-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(root, "preferences.state");
         var store = new UserPreferenceStore(path);
         UserPreferences defaults = store.Load();
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.ChatGPT), "default includes ChatGPT");
-        Equal(false, defaults.RequiredServices.Contains(ServiceKind.Gemini), "default excludes Gemini");
+        Equal(true, defaults.RequiredServices.Contains(ServiceKind.Gemini), "default includes Gemini");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.Google), "default includes Google");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.GitHub), "default includes GitHub");
         Equal(true, defaults.RequiredServices.Contains(ServiceKind.SteamStore), "default includes Steam");
@@ -5066,19 +5204,27 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         defaults.FirstRunComplete = true;
         defaults.RequiredServices = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.GitHub };
         defaults.AutomaticOptimization = true;
+        defaults.AutomaticRecovery = false;
+        defaults.CheckIntervalSeconds = 90;
+        defaults.FailureThreshold = 3;
+        defaults.RecoveryCooldownMinutes = 12;
         defaults.BrowserConversationVerification = true;
         store.Save(defaults);
         UserPreferences loaded = store.Load();
         Equal(true, loaded.FirstRunComplete, "first run persisted");
-        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", loaded.RequiredServices),
-            "saving old preferences retains the fixed three-website core");
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",", loaded.RequiredServices),
+            "saving old preferences retains the two AI core services");
         Equal(true, loaded.AutomaticOptimization, "advanced optimization persisted");
+        Equal(false, loaded.AutomaticRecovery, "recovery switch setting persists");
+        Equal(90, loaded.CheckIntervalSeconds, "recovery interval persists");
+        Equal(3, loaded.FailureThreshold, "recovery threshold persists");
+        Equal(12, loaded.RecoveryCooldownMinutes, "recovery cooldown persists");
         Equal(false, loaded.BrowserConversationVerification, "removed browser consent is not persisted");
-        Equal(true, File.ReadAllText(path).Contains("version=3"), "preference schema upgraded");
-        Equal(true, File.ReadAllText(path).Contains("version=3"), "browser-free preference schema is version 3");
+        Equal(true, File.ReadAllText(path).Contains("version=4"), "preference schema upgraded");
+        Equal(true, File.ReadAllText(path).Contains("version=4"), "browser-free preference schema is version 4");
         Equal(false, File.ReadAllText(path).Contains("browserConversation"), "saved preferences contain no browser consent");
         File.WriteAllText(path, "broken", Encoding.UTF8);
-        Equal(false, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
+        Equal(true, store.Load().RequiredServices.Contains(ServiceKind.Gemini), "corrupt preferences use safe defaults");
         Equal(1, Directory.GetFiles(root, "preferences.state.corrupt-*").Length, "corrupt preferences archived");
 
         string migrationRoot = Path.Combine(Path.GetTempPath(), "monitor-prefs-migration-" + Guid.NewGuid().ToString("N"));
@@ -5088,9 +5234,13 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "version=1\r\nfirstRun=True\r\nautomatic=True\r\nservices=ChatGPT,JMComicWeb,GitHub\r\n", Encoding.UTF8);
         var migrationStore = new UserPreferenceStore(migrationPath);
         UserPreferences migrated = migrationStore.Load();
-        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", migrated.RequiredServices),
-            "legacy preferences migrate to the fixed three-website core");
-        Equal(false, migrated.AutomaticOptimization, "v1 optimization migrates to conservative mode");
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",", migrated.RequiredServices),
+            "legacy preferences migrate to the two AI core services");
+        Equal(true, migrated.AutomaticOptimization, "v1 legacy optimization value remains stored but inactive");
+        Equal(true, migrated.AutomaticRecovery, "legacy preferences enable fault recovery");
+        Equal(60, migrated.CheckIntervalSeconds, "legacy preferences default to sixty seconds");
+        Equal(2, migrated.FailureThreshold, "legacy preferences default to two failures");
+        Equal(10, migrated.RecoveryCooldownMinutes, "legacy preferences default to ten minute cooldown");
         Equal(false, migrated.BrowserConversationVerification, "v1 browser proof requires consent");
         Equal(0, Directory.GetFiles(migrationRoot, "preferences.state.corrupt-*").Length,
             "legacy jmcomic preference is migration not corruption");
@@ -5100,16 +5250,21 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
             "version=2\r\nfirstRun=True\r\nautomatic=True\r\nbrowserConversation=True\r\nservices=GitHub\r\n", Encoding.UTF8);
         UserPreferences browserLegacy = migrationStore.Load();
         Equal(true, browserLegacy.AutomaticOptimization, "version 2 browser consent is ignored without corrupting preferences");
-        Equal("ChatGPT,SteamApi,Google,GitHub", String.Join(",", browserLegacy.RequiredServices),
-            "version 2 services migrate to the fixed three-website core");
+        Equal("ChatGPT,Gemini,GitHub", String.Join(",", browserLegacy.RequiredServices),
+            "version 2 services migrate to the two AI core services");
+        File.WriteAllText(migrationPath,
+            "version=3\r\nfirstRun=True\r\nautomatic=True\r\nservices=Google,SteamApi\r\n", Encoding.UTF8);
+        UserPreferences v3 = migrationStore.Load();
+        Equal("ChatGPT,Gemini,Google,SteamApi", String.Join(",", v3.RequiredServices), "v3 keeps optional history service preferences");
+        Equal(60, v3.CheckIntervalSeconds, "v3 recovery defaults migrate");
 
         using (var form = new DetailsForm(new UserPreferences {
             RequiredServices = new List<ServiceKind> { ServiceKind.Gemini, ServiceKind.GitHub }
         }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }, delegate { }))
         {
-            CheckBox core = FindCheckBox(form, "ChatGPT、Steam API 与 Google（固定核心）");
+            CheckBox core = FindCheckBox(form, "ChatGPT 与 Gemini（固定核心检测）");
             Equal(true, core != null && core.Checked && !core.Enabled,
-                "settings display all four websites as one always-enabled core");
+                "settings display both AI services as one always-enabled core");
             Equal(null, FindCheckBox(form, "ChatGPT"), "settings cannot disable ChatGPT independently");
             Equal(null, FindCheckBox(form, "Gemini"), "settings cannot disable Gemini independently");
         }
@@ -5234,7 +5389,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
                 Equal(true, manualRunner.WaitForRunCount(2, 1000),
                     "manual optimization starts a dedicated decision cycle");
                 Equal("Startup,ManualOptimization", String.Join(",", manualRunner.Triggers().Take(2)),
-                    "coordinator preserves the manual optimization trigger");
+                    "manual optimization request starts its dedicated user-authorized cycle");
             }
         }
 
@@ -5705,7 +5860,7 @@ private static void RunBudgetedOpportunityConfirmationOrchestration()
         DateTime now = new DateTime(2026, 9, 7, 8, 0, 0, DateTimeKind.Utc);
         string report = StatusReport.Format(now, "台湾 T1", CandidateHealth.BasicCompatible, 82.3,
             "保持当前节点", "AI 登录待确认");
-        Equal(true, report.Contains("版本：0.7.0-preview.27"), "status shows version");
+        Equal(true, report.Contains("版本：0.7.0-preview.35"), "status shows version");
         Equal(true, report.Contains("实际节点：台湾 T1"), "status shows leaf node");
         Equal(true, report.Contains("综合分：82.3"), "status shows score");
         Equal(true, report.Contains("决定：保持当前节点"), "status shows decision");

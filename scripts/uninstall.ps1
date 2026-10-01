@@ -1,11 +1,14 @@
 $ErrorActionPreference = 'Stop'
-$installRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ClashCompatibilityMonitor'
+$userProfile = [Environment]::GetFolderPath('UserProfile')
+if ([String]::IsNullOrWhiteSpace($userProfile)) { throw 'Cannot resolve the current user profile.' }
+$physicalLocalAppData = Join-Path $userProfile 'AppData\Local'
+$installRoot = Join-Path $physicalLocalAppData 'ClashCompatibilityMonitor'
 $target = Join-Path $installRoot 'ClashCompatibilityMonitor.exe'
 $launcherTarget = Join-Path $installRoot 'launcher.vbs'
 $browserHostTarget = Join-Path $installRoot 'ClashCompatibilityMonitor.BrowserHost.exe'
 $monitorSuffix = '\ClashCompatibilityMonitor\ClashCompatibilityMonitor.exe'
 $browserHostSuffix = '\ClashCompatibilityMonitor\ClashCompatibilityMonitor.BrowserHost.exe'
-$expectedRoot = [IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ClashCompatibilityMonitor'))
+$expectedRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $userProfile 'AppData\Local') 'ClashCompatibilityMonitor'))
 if ([IO.Path]::GetFullPath($installRoot) -ne $expectedRoot) { throw 'Unexpected uninstall target.' }
 function Stop-InstalledLauncher {
     $resolvedLauncher = [IO.Path]::GetFullPath($launcherTarget)

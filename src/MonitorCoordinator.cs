@@ -106,6 +106,7 @@ public sealed class MonitorCoordinator : IDisposable
 
     public event Action<MonitorSnapshot> SnapshotChanged;
     public event Action<MonitorSnapshot> AttentionRequired;
+    public event Action Liveness;
 
     public MonitorSnapshot Latest
     {
@@ -133,6 +134,12 @@ public sealed class MonitorCoordinator : IDisposable
         if (thread != null) return;
         thread = new Thread(LoopSafely) { IsBackground = true, Name = "Clash monitor coordinator" };
         thread.Start();
+    }
+
+    public static TimeSpan BoundedLivenessWait(TimeSpan requested)
+    {
+        TimeSpan maximum = TimeSpan.FromSeconds(30);
+        return requested > maximum ? maximum : requested;
     }
 
     private void LoopSafely()
@@ -319,6 +326,7 @@ public sealed class MonitorCoordinator : IDisposable
                         "浏览器验证记录失败：" + ex.Message, DateTime.MaxValue), true);
                 }
                 wake.WaitOne(TimeSpan.FromSeconds(30));
+                PulseLiveness();
                 continue;
             }
 
@@ -327,7 +335,8 @@ public sealed class MonitorCoordinator : IDisposable
                 Volatile.Read(ref optimizationRequested) == 0 &&
                 Volatile.Read(ref candidateRankingRequested) == 0 && remaining > TimeSpan.Zero)
             {
-                wake.WaitOne(remaining);
+                wake.WaitOne(BoundedLivenessWait(remaining));
+                PulseLiveness();
                 continue;
             }
 
@@ -414,7 +423,7 @@ public sealed class MonitorCoordinator : IDisposable
             if (persistStatistics) RunStatistics.SaveLocal();
             DateTime requested = Latest.NextCheckUtc;
             DateTime scheduleNow = DateTime.UtcNow;
-            if (requested >= scheduleNow.AddSeconds(-5) && requested < scheduleNow.AddMinutes(5))
+            if (requested >= scheduleNow.AddSeconds(-5) && requested <= scheduleNow.AddHours(1))
                 nextRunUtc = requested > scheduleNow ? requested : scheduleNow;
             else nextRunUtc = scheduleNow.Add(interval);
         }
@@ -487,6 +496,7 @@ public sealed class MonitorCoordinator : IDisposable
 
     private void Publish(MonitorSnapshot value, bool attention)
     {
+        PulseLiveness();
         lock (browserStatusGate) value = value.WithBrowserStatus(browserStatus, browserStatusDetail);
         bool emitAttention = false;
         lock (snapshotGate)
@@ -595,6 +605,17 @@ public sealed class MonitorCoordinator : IDisposable
         NotifySafely(changed, value);
     }
 
+    private void PulseLiveness()
+    {
+        Action handlers = Liveness;
+        if (handlers == null) return;
+        foreach (Action handler in handlers.GetInvocationList())
+        {
+            try { handler(); }
+            catch (Exception ex) { ReportError(ex); }
+        }
+    }
+
     private void NotifySafely(Action<MonitorSnapshot> handlers, MonitorSnapshot value)
     {
         if (handlers == null) return;
@@ -649,6 +670,10 @@ public sealed class MonitorCoordinator : IDisposable
         return new UserPreferences {
             FirstRunComplete = value.FirstRunComplete,
             AutomaticOptimization = value.AutomaticOptimization,
+            AutomaticRecovery = value.AutomaticRecovery,
+            CheckIntervalSeconds = value.CheckIntervalSeconds,
+            FailureThreshold = value.FailureThreshold,
+            RecoveryCooldownMinutes = value.RecoveryCooldownMinutes,
             BrowserConversationVerification = value.BrowserConversationVerification,
             RequiredServices = new System.Collections.Generic.List<ServiceKind>(value.RequiredServices)
         };

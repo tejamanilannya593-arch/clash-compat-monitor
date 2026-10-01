@@ -11,6 +11,7 @@ public sealed class StandbyNode
 
 public sealed class ConnectionAssurance
 {
+    public RecoveryState Recovery { get; set; }
     public string Scope { get; set; }
     public List<StandbyNode> Standbys { get; set; }
     public string Previous { get; set; }
@@ -285,10 +286,12 @@ public sealed class ConnectionAssurance
             .Any(x => x != null && x.Utc <= now && x.Utc > now.AddMinutes(-10));
     }
 
-    public void RecordAutomaticSwitch(string from, string to, string reason, DateTime now)
+    public void RecordAutomaticSwitch(string from, string to, string reason, DateTime now,
+        ServiceKind? failureService = null)
     {
         AutomaticSwitches = SwitchBudgetPolicy.Record(AutomaticSwitches,
-            new AutomaticSwitchRecord { Utc = now, From = from, To = to, Reason = reason });
+            new AutomaticSwitchRecord { Utc = now, From = from, To = to, Reason = reason,
+                FailureService = failureService });
     }
     public bool CanUserFeedbackRollback(string current, DateTime now)
     {
