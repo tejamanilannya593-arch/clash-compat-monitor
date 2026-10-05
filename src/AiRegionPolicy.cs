@@ -26,4 +26,12 @@ public static class AiRegionPolicy
         return ChatGpt.Contains(code) && GeminiWeb.Contains(code) &&
             !String.Equals(code, "CN", StringComparison.OrdinalIgnoreCase);
     }
+
+    public static bool SupportsChatGpt(string countryCode)
+    {
+        if (String.IsNullOrWhiteSpace(countryCode)) return false;
+        string code = countryCode.Trim();
+        return ChatGpt.Contains(code) &&
+            !String.Equals(code, "CN", StringComparison.OrdinalIgnoreCase);
+    }
 }

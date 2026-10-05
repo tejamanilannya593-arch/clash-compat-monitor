@@ -9,7 +9,13 @@ public interface IMonitorCycleRunner
     MonitorSnapshot Run(UserPreferences preferences);
 }
 
-public enum MonitorCycleTrigger { Startup, Scheduled, Requested }
+public enum MonitorCycleTrigger { Startup, Scheduled, Requested, ManualOptimization }
+
+public interface ICandidateLatencyRunner
+{
+    IList<CandidateLatencyMeasurement> MeasureCandidateLatencies(UserPreferences preferences);
+    void InvalidateCandidateLatencies();
+}
 
 public interface ITriggeredCycleRunner : IMonitorCycleRunner
 {
@@ -51,15 +57,20 @@ public sealed class MonitorCoordinator : IDisposable
     private readonly BrowserConversationCoordinator browserCoordinator;
     private readonly IClock clock;
     private readonly TimeSpan browserPollWait;
+    private readonly Action<Exception> errorReporter;
     private Thread thread;
     private MonitorSnapshot latest;
     private UserPreferences preferences = UserPreferences.Defaults();
     private string lastAttentionKey;
     private int checkRequested = 1;
+    private int optimizationRequested;
+    private int candidateRankingRequested;
+    private int candidateRankingInProgress;
     private int paused;
     private int restoreRequested;
     private int stopping;
     private int cancelCycle;
+    private int preferencesRevision;
     private readonly bool persistStatistics;
     private BrowserVerificationStatus browserStatus = BrowserVerificationStatus.None;
     private string browserStatusDetail = "";
@@ -68,7 +79,7 @@ public sealed class MonitorCoordinator : IDisposable
 
     public MonitorCoordinator(IMonitorCycleRunner runner, TimeSpan interval, TimeSpan watchdog,
         bool persistStatistics = false, IClock clock = null, IChallengeSource challengeSource = null,
-        TimeSpan? browserPollWait = null)
+        TimeSpan? browserPollWait = null, Action<Exception> errorReporter = null)
     {
         if (runner == null) throw new ArgumentNullException("runner");
         if (interval <= TimeSpan.Zero) throw new ArgumentOutOfRangeException("interval");
@@ -79,6 +90,7 @@ public sealed class MonitorCoordinator : IDisposable
         this.persistStatistics = persistStatistics;
         this.clock = clock ?? new SystemClock();
         this.browserPollWait = browserPollWait ?? TimeSpan.FromSeconds(25);
+        this.errorReporter = errorReporter ?? delegate { };
         if (this.browserPollWait <= TimeSpan.Zero || this.browserPollWait > TimeSpan.FromSeconds(25))
             throw new ArgumentOutOfRangeException("browserPollWait");
         browserCoordinator = new BrowserConversationCoordinator(this.clock,
@@ -94,6 +106,7 @@ public sealed class MonitorCoordinator : IDisposable
 
     public event Action<MonitorSnapshot> SnapshotChanged;
     public event Action<MonitorSnapshot> AttentionRequired;
+    public event Action Liveness;
 
     public MonitorSnapshot Latest
     {
@@ -119,13 +132,47 @@ public sealed class MonitorCoordinator : IDisposable
     public void Start()
     {
         if (thread != null) return;
-        thread = new Thread(Loop) { IsBackground = true, Name = "Clash monitor coordinator" };
+        thread = new Thread(LoopSafely) { IsBackground = true, Name = "Clash monitor coordinator" };
         thread.Start();
+    }
+
+    public static TimeSpan BoundedLivenessWait(TimeSpan requested)
+    {
+        TimeSpan maximum = TimeSpan.FromSeconds(30);
+        return requested > maximum ? maximum : requested;
+    }
+
+    private void LoopSafely()
+    {
+        while (Volatile.Read(ref stopping) == 0)
+        {
+            try { Loop(); return; }
+            catch (Exception ex)
+            {
+                ReportError(ex);
+                Publish(Latest.WithState(MonitorRunState.Degraded,
+                    "守护线程异常，5 秒后自动恢复：" + ex.Message,
+                    DateTime.UtcNow.AddSeconds(5)), true);
+                wake.WaitOne(TimeSpan.FromSeconds(5));
+            }
+        }
     }
 
     public void RequestCheck()
     {
         Interlocked.Exchange(ref checkRequested, 1);
+        wake.Set();
+    }
+
+    public void RequestCandidateRanking()
+    {
+        Interlocked.Exchange(ref candidateRankingRequested, 1);
+        wake.Set();
+    }
+
+    public void RequestOptimization()
+    {
+        Interlocked.Exchange(ref optimizationRequested, 1);
         wake.Set();
     }
 
@@ -243,8 +290,16 @@ public sealed class MonitorCoordinator : IDisposable
     {
         if (value == null || value.RequiredServices == null || value.RequiredServices.Count == 0)
             throw new ArgumentException("At least one required service is needed.", "value");
-        lock (preferencesGate) preferences = Copy(value);
+        Interlocked.Exchange(ref cancelCycle, 1);
+        lock (preferencesGate)
+        {
+            preferences = Copy(value);
+            Interlocked.Increment(ref preferencesRevision);
+        }
         browserCoordinator.SetConsent(value.BrowserConversationVerification);
+        var latencyRunner = runner as ICandidateLatencyRunner;
+        if (latencyRunner != null) latencyRunner.InvalidateCandidateLatencies();
+        Publish(Latest.WithCandidateLatencies(new CandidateLatencyMeasurement[0]), false);
         RequestCheck();
     }
 
@@ -271,24 +326,54 @@ public sealed class MonitorCoordinator : IDisposable
                         "浏览器验证记录失败：" + ex.Message, DateTime.MaxValue), true);
                 }
                 wake.WaitOne(TimeSpan.FromSeconds(30));
+                PulseLiveness();
                 continue;
             }
 
             TimeSpan remaining = nextRunUtc - DateTime.UtcNow;
-            if (Volatile.Read(ref checkRequested) == 0 && remaining > TimeSpan.Zero)
+            if (Volatile.Read(ref checkRequested) == 0 &&
+                Volatile.Read(ref optimizationRequested) == 0 &&
+                Volatile.Read(ref candidateRankingRequested) == 0 && remaining > TimeSpan.Zero)
             {
-                wake.WaitOne(remaining);
+                wake.WaitOne(BoundedLivenessWait(remaining));
+                PulseLiveness();
                 continue;
             }
 
-            bool explicitlyRequested = Interlocked.Exchange(ref checkRequested, 0) != 0;
+            bool optimizationCycle = Interlocked.Exchange(ref optimizationRequested, 0) != 0;
+            if (firstCycle && optimizationCycle)
+            {
+                Interlocked.Exchange(ref optimizationRequested, 1);
+                optimizationCycle = false;
+            }
+            bool rankingRequested = !optimizationCycle &&
+                Interlocked.Exchange(ref candidateRankingRequested, 0) != 0;
+            if (firstCycle && rankingRequested)
+            {
+                Interlocked.Exchange(ref candidateRankingRequested, 1);
+                rankingRequested = false;
+            }
+            bool explicitlyRequested = !rankingRequested && !optimizationCycle &&
+                Interlocked.Exchange(ref checkRequested, 0) != 0;
             MonitorCycleTrigger trigger = firstCycle ? MonitorCycleTrigger.Startup :
+                optimizationCycle ? MonitorCycleTrigger.ManualOptimization :
                 explicitlyRequested ? MonitorCycleTrigger.Requested : MonitorCycleTrigger.Scheduled;
             firstCycle = false;
-            bool restore = Interlocked.Exchange(ref restoreRequested, 0) != 0;
+            bool restore = !rankingRequested && !optimizationCycle &&
+                Interlocked.Exchange(ref restoreRequested, 0) != 0;
             Interlocked.Exchange(ref cancelCycle, 0);
             UserPreferences current;
-            lock (preferencesGate) current = Copy(preferences);
+            int cyclePreferencesRevision;
+            lock (preferencesGate)
+            {
+                current = Copy(preferences);
+                cyclePreferencesRevision = preferencesRevision;
+            }
+            if (rankingRequested)
+            {
+                RunCandidateLatencyRanking(current, cyclePreferencesRevision);
+                continue;
+            }
             Publish(Latest.WithState(MonitorRunState.Checking, "正在检测当前节点及所选服务", DateTime.MaxValue), false);
             Task<MonitorSnapshot> cycle = Task.Factory.StartNew(() => {
                 RunAccountCommands();
@@ -315,6 +400,11 @@ public sealed class MonitorCoordinator : IDisposable
             }
             if (Volatile.Read(ref stopping) != 0) break;
             if (Volatile.Read(ref paused) != 0) { if (cycle.IsFaulted) { var observed = cycle.Exception; } continue; }
+            if (Volatile.Read(ref preferencesRevision) != cyclePreferencesRevision)
+            {
+                if (cycle.IsFaulted) { var observed = cycle.Exception; }
+                continue;
+            }
 
             if (cycle.IsFaulted)
             {
@@ -332,9 +422,53 @@ public sealed class MonitorCoordinator : IDisposable
             RunStatistics.CycleCompleted(Latest.State, elapsed.Elapsed.TotalSeconds);
             if (persistStatistics) RunStatistics.SaveLocal();
             DateTime requested = Latest.NextCheckUtc;
-            nextRunUtc = requested > DateTime.UtcNow && requested < DateTime.UtcNow.AddMinutes(5) ? requested : DateTime.UtcNow.Add(interval);
+            DateTime scheduleNow = DateTime.UtcNow;
+            if (requested >= scheduleNow.AddSeconds(-5) && requested <= scheduleNow.AddHours(1))
+                nextRunUtc = requested > scheduleNow ? requested : scheduleNow;
+            else nextRunUtc = scheduleNow.Add(interval);
         }
         Publish(MonitorSnapshot.CreateState(MonitorRunState.Stopped, "已退出", DateTime.UtcNow, DateTime.MaxValue), false);
+    }
+
+    private void RunCandidateLatencyRanking(UserPreferences current, int cyclePreferencesRevision)
+    {
+        var latencyRunner = runner as ICandidateLatencyRunner;
+        if (latencyRunner == null) return;
+        Interlocked.Exchange(ref candidateRankingInProgress, 1);
+        try
+        {
+            Task<IList<CandidateLatencyMeasurement>> task = Task.Factory.StartNew(
+                () => latencyRunner.MeasureCandidateLatencies(current), CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            bool completed = false;
+            while (Volatile.Read(ref stopping) == 0 && elapsed.Elapsed < watchdog)
+                if (WaitWithoutThrowing(task, TimeSpan.FromMilliseconds(50))) { completed = true; break; }
+            if (!completed)
+            {
+                Interlocked.Exchange(ref cancelCycle, 1);
+                while (Volatile.Read(ref stopping) == 0 &&
+                    !WaitWithoutThrowing(task, TimeSpan.FromMilliseconds(100))) { }
+            }
+            if (Volatile.Read(ref stopping) != 0) return;
+            if (Volatile.Read(ref preferencesRevision) != cyclePreferencesRevision)
+            {
+                if (task.IsFaulted) { var observed = task.Exception; }
+                return;
+            }
+            if (task.IsFaulted)
+            {
+                var observed = task.Exception;
+                Publish(Latest.WithCandidateLatencies(new CandidateLatencyMeasurement[0]), false);
+                return;
+            }
+            if (completed && task.IsCompleted && task.Result != null)
+                Publish(Latest.WithCandidateLatencies(task.Result), false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref candidateRankingInProgress, 0);
+        }
     }
 
     private void RunAccountCommands()
@@ -352,7 +486,8 @@ public sealed class MonitorCoordinator : IDisposable
 
     private void OnProgress(MonitorSnapshot value)
     {
-        if (Volatile.Read(ref stopping) == 0 && Volatile.Read(ref paused) == 0 && Volatile.Read(ref cancelCycle) == 0)
+        if (Volatile.Read(ref stopping) == 0 && Volatile.Read(ref paused) == 0 &&
+            Volatile.Read(ref cancelCycle) == 0 && Volatile.Read(ref candidateRankingInProgress) == 0)
         {
             if (String.IsNullOrEmpty(value.ActualNode)) value = Latest.WithState(value.State, value.Decision, value.NextCheckUtc);
             Publish(value, false);
@@ -361,6 +496,7 @@ public sealed class MonitorCoordinator : IDisposable
 
     private void Publish(MonitorSnapshot value, bool attention)
     {
+        PulseLiveness();
         lock (browserStatusGate) value = value.WithBrowserStatus(browserStatus, browserStatusDetail);
         bool emitAttention = false;
         lock (snapshotGate)
@@ -375,11 +511,11 @@ public sealed class MonitorCoordinator : IDisposable
             else if (value.State == MonitorRunState.Running) lastAttentionKey = null;
         }
         Action<MonitorSnapshot> changed = SnapshotChanged;
-        if (changed != null) changed(value);
+        NotifySafely(changed, value);
         if (emitAttention)
         {
             Action<MonitorSnapshot> required = AttentionRequired;
-            if (required != null) required(value);
+            NotifySafely(required, value);
         }
     }
 
@@ -466,7 +602,34 @@ public sealed class MonitorCoordinator : IDisposable
             }
         }
         Action<MonitorSnapshot> changed = SnapshotChanged;
-        if (changed != null) changed(value);
+        NotifySafely(changed, value);
+    }
+
+    private void PulseLiveness()
+    {
+        Action handlers = Liveness;
+        if (handlers == null) return;
+        foreach (Action handler in handlers.GetInvocationList())
+        {
+            try { handler(); }
+            catch (Exception ex) { ReportError(ex); }
+        }
+    }
+
+    private void NotifySafely(Action<MonitorSnapshot> handlers, MonitorSnapshot value)
+    {
+        if (handlers == null) return;
+        foreach (Action<MonitorSnapshot> handler in handlers.GetInvocationList())
+        {
+            try { handler(value); }
+            catch (Exception ex) { ReportError(ex); }
+        }
+    }
+
+    private void ReportError(Exception error)
+    {
+        try { errorReporter(error); }
+        catch { }
     }
 
     private static BrowserBridgeMessage BrowserTaskResponse(BrowserBridgeMessage request,
@@ -507,6 +670,10 @@ public sealed class MonitorCoordinator : IDisposable
         return new UserPreferences {
             FirstRunComplete = value.FirstRunComplete,
             AutomaticOptimization = value.AutomaticOptimization,
+            AutomaticRecovery = value.AutomaticRecovery,
+            CheckIntervalSeconds = value.CheckIntervalSeconds,
+            FailureThreshold = value.FailureThreshold,
+            RecoveryCooldownMinutes = value.RecoveryCooldownMinutes,
             BrowserConversationVerification = value.BrowserConversationVerification,
             RequiredServices = new System.Collections.Generic.List<ServiceKind>(value.RequiredServices)
         };

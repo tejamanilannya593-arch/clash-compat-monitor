@@ -24,6 +24,7 @@ public sealed class CompatibilityScanner
     private readonly IServiceProbe probe;
     private readonly string probeGroup;
     private readonly IExitIdentityProbe exitIdentityProbe;
+    private readonly IClock clock;
     public Func<bool> ShouldStop { get; set; }
 
     public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup)
@@ -33,11 +34,18 @@ public sealed class CompatibilityScanner
 
     public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup,
         IExitIdentityProbe exitIdentityProbe)
+        : this(mihomo, probe, probeGroup, exitIdentityProbe, new SystemClock())
+    {
+    }
+
+    public CompatibilityScanner(IMihomoClient mihomo, IServiceProbe probe, string probeGroup,
+        IExitIdentityProbe exitIdentityProbe, IClock clock)
     {
         this.mihomo = mihomo;
         this.probe = probe;
         this.probeGroup = probeGroup;
         this.exitIdentityProbe = exitIdentityProbe;
+        this.clock = clock ?? new SystemClock();
     }
 
     public CandidateScanResult Scan(CandidateNode candidate, IEnumerable<ServiceKind> optionalServices)
@@ -63,19 +71,23 @@ public sealed class CompatibilityScanner
         mihomo.Select(probeGroup, candidate.Name);
         ExitIdentity identity = new ExitIdentity("", "", "exit identity probe not configured");
         Task<ExitIdentity> identityTask = null;
-        if (exitIdentityProbe != null && services.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini))
+        if (exitIdentityProbe != null && (services.Count == 0 ||
+            services.Any(x => x == ServiceKind.ChatGPT || x == ServiceKind.Gemini)))
             identityTask = Task.Factory.StartNew(() => exitIdentityProbe.Probe(probeTimeout));
         var probeTasks = new Dictionary<ServiceKind, Task<ProbeResult>>();
         foreach (ServiceKind service in services)
         {
-            if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             ServiceKind scheduled = service;
             probeTasks[scheduled] = Task.Factory.StartNew(() => probe.Probe(scheduled, probeTimeout));
         }
+        // Drain all in-flight probes before releasing the selector to another scan, even on cancellation/error.
+        var inFlight = probeTasks.Values.Cast<Task>().ToList();
+        if (identityTask != null) inFlight.Add(identityTask);
+        Task.WhenAll(inFlight).GetAwaiter().GetResult();
+        if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
         var rawResults = new Dictionary<ServiceKind, ProbeResult>();
         foreach (ServiceKind service in services)
         {
-            if (ShouldStop != null && ShouldStop()) throw new OperationCanceledException("检测已暂停或达到本轮时间预算");
             rawResults[service] = probeTasks[service].GetAwaiter().GetResult();
         }
         if (identityTask != null) identity = identityTask.GetAwaiter().GetResult();
@@ -91,7 +103,9 @@ public sealed class CompatibilityScanner
             {
                 if (!identity.Known)
                     result = ProbeResult.Unverified("无法确认实际出口，不能验证 AI 官方支持地区", result.ElapsedMilliseconds);
-                else if (!AiRegionPolicy.SupportsBoth(identity.CountryCode))
+                else if (service == ServiceKind.ChatGPT && !AiRegionPolicy.SupportsChatGpt(identity.CountryCode))
+                    result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 官方支持地区", result.ElapsedMilliseconds);
+                else if (service == ServiceKind.Gemini && !AiRegionPolicy.SupportsBoth(identity.CountryCode))
                     result = ProbeResult.RegionFailure("实际出口不在 ChatGPT 与 Gemini 官方支持地区交集中", result.ElapsedMilliseconds);
             }
             measurements[service] = result;
@@ -101,20 +115,31 @@ public sealed class CompatibilityScanner
             else if (result.FailureKind == ProbeFailureKind.Unverified) pending.Add(service + ": " + result.Detail);
             else if (!result.Passed && !failedService.HasValue) { failedService = service; failedResult = result; }
         }
+        DateTime observedUtc = clock.UtcNow;
+        var observations = measurements.ToDictionary(x => x.Key, x => ServiceObservation.FromProbe(
+            x.Key, x.Value, observedUtc, identity.Fingerprint, identity.CountryCode, identity.Asn));
         if (failedService.HasValue)
-            return Failure(candidate.Name, failedService.Value, failedResult, totalMilliseconds, probeCount, measurements, identity);
-        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null, String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
-        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null, String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
-        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds, probeCount, measurements, identity.Fingerprint, identity.CountryCode);
+            return Failure(candidate.Name, failedService.Value, failedResult, totalMilliseconds, probeCount,
+                measurements, observations, identity);
+        if (pending.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.Unknown, null,
+            String.Join("; ", pending), totalMilliseconds, probeCount, measurements, identity.Fingerprint,
+            identity.CountryCode, observations, identity.Asn);
+        if (partial.Count > 0) return new CandidateScanResult(candidate.Name, CandidateHealth.BasicCompatible, null,
+            String.Join("; ", partial), totalMilliseconds, probeCount, measurements, identity.Fingerprint,
+            identity.CountryCode, observations, identity.Asn);
+        return new CandidateScanResult(candidate.Name, CandidateHealth.Compatible, null, "ok", totalMilliseconds,
+            probeCount, measurements, identity.Fingerprint, identity.CountryCode, observations, identity.Asn);
     }
 
     private static CandidateScanResult Failure(string name, ServiceKind service, ProbeResult result,
-        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements, ExitIdentity identity)
+        long totalMilliseconds, int probeCount, IDictionary<ServiceKind, ProbeResult> measurements,
+        IDictionary<ServiceKind, ServiceObservation> observations, ExitIdentity identity)
     {
         CandidateHealth health = result.FailureKind == ProbeFailureKind.Region ? CandidateHealth.RegionBlocked :
             result.FailureKind == ProbeFailureKind.Transient ? CandidateHealth.Transient : CandidateHealth.ServiceFailed;
         return new CandidateScanResult(name, health, service, result.Detail, totalMilliseconds, probeCount, measurements,
-            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode);
+            identity == null ? "" : identity.Fingerprint, identity == null ? "" : identity.CountryCode,
+            observations, identity == null ? (long?)null : identity.Asn);
     }
 }
 

@@ -1,5 +1,51 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+internal static class CandidateDelayMeasurement
+{
+    public static Dictionary<string, int> Measure(IMihomoClient mihomo,
+        IEnumerable<CandidateNode> candidates, string url, int timeoutMilliseconds,
+        int maximumConcurrency)
+    {
+        if (mihomo == null) throw new ArgumentNullException("mihomo");
+        if (String.IsNullOrWhiteSpace(url)) throw new ArgumentException("A delay URL is required.", "url");
+        if (timeoutMilliseconds <= 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+        if (maximumConcurrency <= 0) throw new ArgumentOutOfRangeException("maximumConcurrency");
+
+        List<CandidateNode> nodes = (candidates ?? Enumerable.Empty<CandidateNode>())
+            .Where(x => x != null && !String.IsNullOrWhiteSpace(x.Name))
+            .GroupBy(x => x.Name, StringComparer.Ordinal)
+            .Select(x => x.First()).ToList();
+        var values = Enumerable.Repeat(Int32.MaxValue, nodes.Count).ToArray();
+        int nextIndex = -1;
+        int workerCount = Math.Min(maximumConcurrency, nodes.Count);
+        Task[] workers = Enumerable.Range(0, workerCount).Select(worker =>
+            Task.Factory.StartNew(() => {
+                while (true)
+                {
+                    int index = Interlocked.Increment(ref nextIndex);
+                    if (index >= nodes.Count) return;
+                    try
+                    {
+                        int delay = mihomo.GetDelay(nodes[index].Name, url, timeoutMilliseconds);
+                        values[index] = delay > 0 ? delay : Int32.MaxValue;
+                    }
+                    catch (OutOfMemoryException) { throw; }
+                    catch (StackOverflowException) { throw; }
+                    catch (ThreadAbortException) { throw; }
+                    catch (Exception) { values[index] = Int32.MaxValue; }
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning,
+                TaskScheduler.Default)).ToArray();
+        if (workers.Length > 0) Task.WaitAll(workers);
+
+        return nodes.Select((node, index) => new { node.Name, Delay = values[index] })
+            .ToDictionary(x => x.Name, x => x.Delay, StringComparer.Ordinal);
+    }
+}
 
 public static class StartupRecovery
 {
@@ -12,8 +58,63 @@ public static class StartupRecovery
 
     public static bool RequiresRepeatConfirmation(CandidateScanResult scan)
     {
+        if (scan != null && scan.FailedService == ServiceKind.ChatGPT) return false;
         return scan != null && (scan.Health == CandidateHealth.Transient ||
             QualityPolicy.SeverelySlowService(scan).HasValue);
+    }
+
+    public static string[] RankImmediateChatGptTargets(
+        System.Collections.Generic.IEnumerable<CandidateNode> candidates,
+        System.Collections.Generic.IDictionary<string, int> clashDelays,
+        System.Collections.Generic.IDictionary<string, int> chatGptDelays,
+        string current)
+    {
+        return (candidates ?? new CandidateNode[0])
+            .Where(x => x != null && x.Name != current &&
+                HasLiveDelay(clashDelays, x.Name))
+            .OrderBy(x => DelayOrMaximum(chatGptDelays, x.Name))
+            .ThenBy(x => clashDelays[x.Name])
+            .ThenBy(x => x.Name, StringComparer.Ordinal)
+            .Select(x => x.Name).ToArray();
+    }
+
+    public static string[] PreferFreshRecoveryTargets(IEnumerable<string> rankedTargets,
+        IEnumerable<AutomaticSwitchRecord> switches, ServiceKind failedService, DateTime nowUtc)
+    {
+        var recentlyFailed = new HashSet<string>((switches ?? Enumerable.Empty<AutomaticSwitchRecord>())
+            .Where(x => x != null && x.FailureService == failedService &&
+                x.Utc <= nowUtc && x.Utc > nowUtc.AddMinutes(-10) &&
+                !String.IsNullOrWhiteSpace(x.From))
+            .Select(x => x.From), StringComparer.Ordinal);
+        return (rankedTargets ?? Enumerable.Empty<string>())
+            .Where(x => !String.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => recentlyFailed.Contains(x) ? 1 : 0)
+            .ToArray();
+    }
+
+    public static double ChatGptResponseMilliseconds(CandidateScanResult scan, double fallback)
+    {
+        ProbeResult result;
+        return scan != null && scan.ServiceResults != null &&
+            scan.ServiceResults.TryGetValue(ServiceKind.ChatGPT, out result) && result != null &&
+            result.ElapsedMilliseconds >= 0 ? result.ElapsedMilliseconds : fallback;
+    }
+
+    private static bool HasLiveDelay(
+        System.Collections.Generic.IDictionary<string, int> delays, string node)
+    {
+        int value;
+        return delays != null && delays.TryGetValue(node, out value) &&
+            value > 0 && value < Int32.MaxValue;
+    }
+
+    private static int DelayOrMaximum(
+        System.Collections.Generic.IDictionary<string, int> delays, string node)
+    {
+        int value;
+        return delays != null && delays.TryGetValue(node, out value) && value > 0
+            ? value : Int32.MaxValue;
     }
 
     public static bool ConfirmsSevereLatency(CandidateScanResult confirmation, ServiceKind service)
@@ -83,7 +184,8 @@ public static class StartupRecovery
     public static ServiceKind[] FastProbeServices(System.Collections.Generic.IEnumerable<ServiceKind> required,
         ServiceKind failedService)
     {
-        return new[] { ServiceKind.ChatGPT, ServiceKind.Gemini, ServiceKind.Google, ServiceKind.GitHub }
+        return new[] { ServiceKind.ChatGPT, ServiceKind.SteamApi,
+                ServiceKind.Google, ServiceKind.GitHub }
             .Concat(new[] { failedService }).Distinct().ToArray();
     }
 
@@ -99,8 +201,9 @@ public static class StartupRecovery
     {
         return (scans ?? new CandidateScanResult[0])
             .Where(x => IsEligibleQuickScan(x, failedService))
-            .OrderBy(x => QualityMeasurement.ResponseMilliseconds(x, 5000))
-            .ThenBy(x => delays != null && delays.ContainsKey(x.Name) ? delays[x.Name] : Int32.MaxValue)
+            .OrderBy(x => WebsitePriorityLatency.Primary(x))
+            .ThenBy(x => WebsitePriorityLatency.Secondary(x))
+            .ThenBy(x => x.Name, StringComparer.Ordinal)
             .Select(x => x.Name).ToArray();
     }
 
@@ -109,15 +212,16 @@ public static class StartupRecovery
         System.Collections.Generic.IDictionary<string, int> delays)
     {
         return (scans ?? new CandidateScanResult[0])
-            .OrderBy(x => QualityMeasurement.ResponseMilliseconds(x, 5000))
-            .ThenBy(x => delays != null && delays.ContainsKey(x.Name) ? delays[x.Name] : Int32.MaxValue)
+            .OrderBy(x => WebsitePriorityLatency.Primary(x))
+            .ThenBy(x => WebsitePriorityLatency.Secondary(x))
             .ThenBy(x => x.Name, StringComparer.Ordinal)
             .Select(x => x.Name).ToArray();
     }
 
     public static bool IsEligibleQuickScan(CandidateScanResult scan, ServiceKind failedService)
     {
-        return scan != null && AiRegionPolicy.SupportsBoth(scan.ExitCountryCode) &&
+        return scan != null && CoreWebsitePolicy.AllReachable(scan) &&
+            AiRegionPolicy.SupportsChatGpt(scan.ExitCountryCode) &&
             ServiceEvidencePolicy.CanFastFailoverTarget(scan, failedService);
     }
 
@@ -129,6 +233,11 @@ public static class StartupRecovery
     public static bool ShouldStopAfterCheckedCandidates(int checkedCandidates)
     {
         return checkedCandidates >= 8;
+    }
+
+    public static bool ShouldStopImmediateChatGptBatch(int checkedCandidates)
+    {
+        return checkedCandidates >= 12;
     }
 
     public static string FastSelectionSummary(double responseMilliseconds)

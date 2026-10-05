@@ -33,16 +33,17 @@ assert.deepStrictEqual(nodeCandidates(fixture), [
   '🇺🇸 美国 I0 | ChatGPT | 1x', '🇹🇼 台湾 T1 | IPv6 | 1x', '高倍率仍需实测 | 5x'
 ]);
 const once = main(JSON.parse(JSON.stringify(fixture)));
-assert.strictEqual(once.ipv6, false);
-assert.strictEqual(once.dns.ipv6, false);
+assert.strictEqual(once.ipv6, fixture.ipv6);
+assert.deepStrictEqual(once.dns, fixture.dns);
 const shared = once['proxy-groups'].find(x => x.name === '🌐 统一稳定节点');
 const probe = once['proxy-groups'].find(x => x.name === '🧪 兼容性探测');
-assert(shared && probe);
-assert.strictEqual(shared.proxies[0], '🇯🇵 日本 V1 | IPv6 | 3x');
-assert.deepStrictEqual(shared.proxies, probe.proxies);
-for (const name of ['🔍 Google', '🤖 OpenAI', '⌨️ GitHub', '🚀 节点选择']) {
-  assert.deepStrictEqual(once['proxy-groups'].find(x => x.name === name).proxies, ['🌐 统一稳定节点']);
+assert(!shared && probe);
+assert.strictEqual(probe.hidden, true);
+assert.strictEqual(probe.proxies[0], 'Tokyo-A');
+for (const name of ['🔍 Google', '🤖 OpenAI', '⌨️ GitHub']) {
+  assert.deepStrictEqual(once['proxy-groups'].find(x => x.name === name), fixture['proxy-groups'].find(x => x.name === name));
 }
+assert.deepStrictEqual(once['proxy-groups'].find(x => x.name === '🚀 节点选择').proxies, ['Tokyo-A']);
 assert(!once.proxies.some(x => x.name.startsWith('消息:') || x.name.startsWith('剩余流量')));
 assert.deepStrictEqual(once['proxy-groups'].find(x => x.name === '其他选择').proxies, ['Tokyo-A', 'DIRECT']);
 assert.strictEqual(once.profile['store-selected'], true);
@@ -50,12 +51,12 @@ assert(!once['proxy-groups'].find(x => x.name === '🚀 节点选择').now);
 assert.deepStrictEqual(once.listeners.find(x => x.name === 'compatibility-probe'), {
   name: 'compatibility-probe', type: 'http', listen: '127.0.0.1', port: 7896, proxy: '🧪 兼容性探测'
 });
-assert.strictEqual(once.rules[0], 'DOMAIN-SUFFIX,steamcontent.com,DIRECT');
-assert(once.rules.indexOf('DOMAIN-SUFFIX,steamcontent.com,DIRECT') < once.rules.indexOf('DOMAIN-SUFFIX,steampowered.com,🌐 统一稳定节点'));
-assert(once.rules.includes('DOMAIN,gemini.google.com,🌐 统一稳定节点'));
-assert(once.rules.includes('DOMAIN-SUFFIX,chatgpt.com,🌐 统一稳定节点'));
-assert(once.rules.includes('DOMAIN-SUFFIX,github.com,🌐 统一稳定节点'));
-assert(once.rules.includes('DOMAIN-SUFFIX,18comic.vip,🌐 统一稳定节点'));
+assert.strictEqual(once.rules[0], 'DOMAIN-SUFFIX,steampowered.com,旧策略');
+assert(once.rules.indexOf('DOMAIN-SUFFIX,steamcontent.com,DIRECT') < once.rules.indexOf('MATCH,DIRECT'));
+assert(once.rules.includes('DOMAIN,gemini.google.com,🚀 节点选择'));
+assert(once.rules.includes('DOMAIN-SUFFIX,chatgpt.com,🚀 节点选择'));
+assert(once.rules.includes('DOMAIN-SUFFIX,github.com,🚀 节点选择'));
+assert(!once.rules.some(rule => rule.includes('18comic.vip')));
 assert(once.rules.includes('DOMAIN,stun.chat.bilibili.com,DIRECT'));
 const twice = main(JSON.parse(JSON.stringify(once)));
 assert.deepStrictEqual(twice, once);
@@ -74,23 +75,24 @@ assert.deepStrictEqual(providerNames(providerOnly), ['airportA', 'localNodes']);
 const providerResult = main(JSON.parse(JSON.stringify(providerOnly)));
 const providerShared = providerResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点');
 const providerProbe = providerResult['proxy-groups'].find(x => x.name === '🧪 兼容性探测');
-assert.deepStrictEqual(providerShared.use, ['airportA', 'localNodes']);
+assert.strictEqual(providerShared, undefined);
 assert.deepStrictEqual(providerProbe.use, ['airportA', 'localNodes']);
-assert.strictEqual(Object.prototype.hasOwnProperty.call(providerShared, 'proxies'), false);
-assert(providerShared['exclude-filter'].includes('消息'));
+assert.strictEqual(Object.prototype.hasOwnProperty.call(providerProbe, 'proxies'), false);
+assert.strictEqual(providerProbe.hidden, true);
 assert(providerProbe['exclude-filter'].includes('消息'));
 assert(!providerProbe['exclude-filter'].includes('\\u3400'));
-assert.deepStrictEqual(providerResult['proxy-groups'].find(x => x.name === '🚀 节点选择').proxies, ['🌐 统一稳定节点']);
+assert.strictEqual(providerResult['proxy-groups'].find(x => x.name === '🚀 节点选择'), undefined);
 
 const mixed = JSON.parse(JSON.stringify(fixture));
 mixed['proxy-providers'] = { airportA: { type: 'http', url: 'https://provider.invalid/a' } };
 const mixedResult = main(mixed);
-assert.deepStrictEqual(mixedResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').use, ['airportA']);
-assert(mixedResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').proxies.includes('Tokyo-A'));
+assert.deepStrictEqual(mixedResult['proxy-groups'].find(x => x.name === '🧪 兼容性探测').use, ['airportA']);
+assert(mixedResult['proxy-groups'].find(x => x.name === '🧪 兼容性探测').proxies.includes('Tokyo-A'));
 
 const single = { ipv6: true, dns: { ipv6: true }, proxies: [{ name: 'only-node', type: 'ss', server: 'one.invalid', port: 443 }], rules: [] };
 const singleResult = main(single);
-assert.deepStrictEqual(singleResult['proxy-groups'].find(x => x.name === '🌐 统一稳定节点').proxies, ['only-node']);
+assert.deepStrictEqual(singleResult['proxy-groups'].find(x => x.name === '🧪 兼容性探测').proxies, ['only-node']);
+assert.strictEqual(singleResult['proxy-groups'].length, 1);
 assert.deepStrictEqual(main(JSON.parse(JSON.stringify(providerResult))), providerResult);
 const metadataOnly = main({ proxies: [{ name: '消息: 1条未读', type: 'trojan', server: 'notice.invalid' }],
   'proxy-groups': [{ name: 'old', type: 'select', proxies: ['消息: 1条未读'] }] });
@@ -101,3 +103,4 @@ assert(included['proxy-groups'].find(x => x.name === 'other')['exclude-filter'].
 assert(included['proxy-groups'].find(x => x.name === 'other')['exclude-filter'].includes('消息'));
 assert.deepStrictEqual(main(JSON.parse(JSON.stringify(included))), included);
 console.log('PASS enhancement filtering, routing, listener, and idempotency');
+require('../tests/Enhancement.Tests');

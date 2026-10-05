@@ -15,7 +15,7 @@ public static class StatusReport
             "综合分：" + (score.HasValue ? score.Value.ToString("F1", CultureInfo.InvariantCulture) : "本轮未排名") + Environment.NewLine +
             "决定：" + DecisionText(decision) + Environment.NewLine +
             "说明：" + (detail ?? "无") + Environment.NewLine +
-            "AI 地区规则：ChatGPT ∩ Gemini 官方支持地区（快照 " + AiRegionPolicy.SnapshotDate + "）" + Environment.NewLine +
+            "AI 地区规则：ChatGPT 官方支持地区（快照 " + AiRegionPolicy.SnapshotDate + "）" + Environment.NewLine +
             "网络链路可用或登录链路通过，均不代表真实对话已经验证。";
     }
 
@@ -24,8 +24,44 @@ public static class StatusReport
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         string temporary = path + ".tmp";
         File.WriteAllText(temporary, content ?? "", new UTF8Encoding(false));
-        if (File.Exists(path)) File.Replace(temporary, path, null);
-        else File.Move(temporary, path);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+                return;
+            }
+            catch (IOException)
+            {
+                // Windows can report either sharing violations or "unable to remove
+                // replaced file" while an indexer briefly holds the destination.
+                // Retry only while the complete replacement file still exists.
+                if (attempt >= 4 || !File.Exists(temporary)) throw;
+                System.Threading.Thread.Sleep(50 * (attempt + 1));
+            }
+        }
+    }
+
+    public static bool TryWriteLatest(string path, string content, out Exception error)
+    {
+        try
+        {
+            WriteAtomic(path, content);
+            error = null;
+            return true;
+        }
+        catch (IOException)
+        {
+            try { WriteAtomic(path, content); error = null; return true; }
+            catch (IOException ex) { error = ex; return false; }
+            catch (UnauthorizedAccessException ex) { error = ex; return false; }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            error = ex;
+            return false;
+        }
     }
 
     private static string HealthText(CandidateHealth health)

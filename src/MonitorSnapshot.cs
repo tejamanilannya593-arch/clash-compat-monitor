@@ -53,6 +53,92 @@ public sealed class ServiceMeasurement
     public DateTime AccountVerifiedUtc { get; private set; }
 }
 
+public sealed class CandidateLatencyMeasurement
+{
+    public CandidateLatencyMeasurement(string node, string exitCountryCode, int mihomoMilliseconds,
+        IEnumerable<ServiceMeasurement> services, DateTime checkedUtc, string decisionDetail = "")
+    {
+        Node = node ?? "";
+        ExitCountryCode = exitCountryCode ?? "";
+        MihomoMilliseconds = mihomoMilliseconds;
+        Services = (services ?? Enumerable.Empty<ServiceMeasurement>()).ToList().AsReadOnly();
+        CheckedUtc = checkedUtc;
+        DecisionDetail = decisionDetail ?? "";
+    }
+
+    public string Node { get; private set; }
+    public string ExitCountryCode { get; private set; }
+    public int MihomoMilliseconds { get; private set; }
+    public IList<ServiceMeasurement> Services { get; private set; }
+    public DateTime CheckedUtc { get; private set; }
+    public string DecisionDetail { get; private set; }
+
+    public CandidateLatencyMeasurement WithDecisionDetail(string value)
+    {
+        return new CandidateLatencyMeasurement(Node, ExitCountryCode, MihomoMilliseconds,
+            Services, CheckedUtc, value);
+    }
+}
+
+internal static class CandidateDecisionText
+{
+    public static string Initial(CandidateLatencyMeasurement candidate)
+    {
+        return Initial(candidate, null);
+    }
+
+    public static string Initial(CandidateLatencyMeasurement candidate,
+        IEnumerable<ServiceMeasurement> currentServices)
+    {
+        if (candidate == null) return "等待实测";
+        string failed = FailedService(candidate.Services);
+        if (failed.Length != 0) return failed + " 未通过";
+        double baseline = WebsitePriorityLatency.Primary(currentServices);
+        double target = WebsitePriorityLatency.Primary(candidate);
+        if (baseline == Double.MaxValue || target == Double.MaxValue)
+            return "等待完整复检";
+        long improvement = (long)Math.Round(baseline - target);
+        if (improvement > 0)
+            return "快 " + improvement + " ms；后台全节点寻优会重新复检";
+        if (improvement == 0) return "与当前节点实测相同；无需切换";
+        return "比当前慢 " + (-improvement) + " ms；无需切换";
+    }
+
+    public static string FullRecheck(CandidateScanResult scan,
+        IEnumerable<ServiceKind> requiredServices)
+    {
+        if (scan == null) return "完整复检未完成";
+        if (!AiRegionPolicy.SupportsChatGpt(scan.ExitCountryCode))
+            return "出口地区不符合 ChatGPT 要求";
+        var required = (requiredServices ?? Enumerable.Empty<ServiceKind>())
+            .Concat(CoreWebsitePolicy.Required)
+            .Distinct().ToList();
+        foreach (ServiceKind service in required)
+        {
+            ProbeResult result;
+            if (!scan.ServiceResults.TryGetValue(service, out result) || result == null)
+                return MonitorPresentation.ServiceLabel(service) + " 未完成复检";
+            if (!result.Passed && result.FailureKind != ProbeFailureKind.Partial)
+                return MonitorPresentation.ServiceLabel(service) + " 完整复检未通过";
+        }
+        return "完整复检未达到切换条件";
+    }
+
+    private static string FailedService(IEnumerable<ServiceMeasurement> services)
+    {
+        IList<ServiceMeasurement> values = (services ?? Enumerable.Empty<ServiceMeasurement>()).ToList();
+        IEnumerable<ServiceKind> ordered = CoreWebsitePolicy.Required;
+        foreach (ServiceKind service in ordered)
+        {
+            ServiceMeasurement measurement = values.FirstOrDefault(x => x.Service == service);
+            if (measurement == null || !measurement.Available ||
+                measurement.Evidence == ProbeFailureKind.Unverified || measurement.Evidence == ProbeFailureKind.Partial)
+                return MonitorPresentation.ServiceLabel(service);
+        }
+        return "";
+    }
+}
+
 public sealed class MonitorSnapshot
 {
     private MonitorSnapshot() { }
@@ -65,6 +151,7 @@ public sealed class MonitorSnapshot
     public DateTime CheckedUtc { get; private set; }
     public DateTime NextCheckUtc { get; private set; }
     public IList<ServiceMeasurement> Services { get; private set; }
+    public IList<CandidateLatencyMeasurement> CandidateLatencies { get; private set; }
     public CandidateHealth Health { get; private set; }
     public string ExitFingerprint { get; private set; }
     public string ExitCountryCode { get; private set; }
@@ -75,7 +162,8 @@ public sealed class MonitorSnapshot
     {
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = nextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = nextCheckUtc, Services = Services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
             BrowserStatusDetail = BrowserStatusDetail };
     }
@@ -84,7 +172,8 @@ public sealed class MonitorSnapshot
     {
         return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = reason ?? "", CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = NextCheckUtc, Services = Services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
             BrowserStatusDetail = BrowserStatusDetail };
     }
@@ -93,7 +182,8 @@ public sealed class MonitorSnapshot
     {
         return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = Services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = NextCheckUtc, Services = Services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = status,
             BrowserStatusDetail = detail ?? "" };
     }
@@ -102,6 +192,16 @@ public sealed class MonitorSnapshot
     {
         MonitorRunState progressState = State == MonitorRunState.Running ? MonitorRunState.Running : MonitorRunState.Checking;
         return WithState(progressState, decision, DateTime.MaxValue);
+    }
+
+    public MonitorSnapshot WithCandidateLatencies(IEnumerable<CandidateLatencyMeasurement> values)
+    {
+        return new MonitorSnapshot { State = State, ActualNode = ActualNode, Score = Score,
+            Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
+            NextCheckUtc = NextCheckUtc, Services = Services,
+            CandidateLatencies = (values ?? Enumerable.Empty<CandidateLatencyMeasurement>()).ToList().AsReadOnly(),
+            ExitFingerprint = ExitFingerprint, ExitCountryCode = ExitCountryCode, Health = Health,
+            BrowserStatus = BrowserStatus, BrowserStatusDetail = BrowserStatusDetail };
     }
 
     public MonitorSnapshot WithAccountVerification(ExperienceData data, string scope, DateTime now)
@@ -120,7 +220,8 @@ public sealed class MonitorSnapshot
             ? (accountReady ? MonitorRunState.Running : MonitorRunState.Pending) : State;
         return new MonitorSnapshot { State = state, ActualNode = ActualNode, Score = Score,
             Decision = Decision, SelectionReason = SelectionReason, CheckedUtc = CheckedUtc,
-            NextCheckUtc = NextCheckUtc, Services = services, ExitFingerprint = ExitFingerprint,
+            NextCheckUtc = NextCheckUtc, Services = services, CandidateLatencies = CandidateLatencies,
+            ExitFingerprint = ExitFingerprint,
             ExitCountryCode = ExitCountryCode, Health = Health, BrowserStatus = BrowserStatus,
             BrowserStatusDetail = BrowserStatusDetail };
     }
@@ -138,7 +239,8 @@ public sealed class MonitorSnapshot
             Health = CandidateHealth.Unknown,
             BrowserStatus = BrowserVerificationStatus.None,
             BrowserStatusDetail = "",
-            Services = new List<ServiceMeasurement>().AsReadOnly()
+            Services = new List<ServiceMeasurement>().AsReadOnly(),
+            CandidateLatencies = new List<CandidateLatencyMeasurement>().AsReadOnly()
         };
     }
 
@@ -161,6 +263,7 @@ public sealed class MonitorSnapshot
             Services = scan.ServiceResults.OrderBy(pair => pair.Key)
                 .Select(pair => new ServiceMeasurement(pair.Key, pair.Value.Passed,
                     pair.Value.ElapsedMilliseconds, pair.Value.Detail, pair.Value.FailureKind)).ToList().AsReadOnly(),
+            CandidateLatencies = new List<CandidateLatencyMeasurement>().AsReadOnly(),
             ExitFingerprint = scan.ExitFingerprint ?? "",
             ExitCountryCode = scan.ExitCountryCode ?? ""
         };
@@ -193,7 +296,7 @@ public sealed class MonitorPresentation
         List<long> measured = measuredServices.Select(x => x.Milliseconds).ToList();
         if (measured.Count == 0) return "综合响应：待测";
         double p75 = QualityMeasurement.Percentile75(measured.Select(x => (double)x), Double.NaN);
-        string label = "综合响应：" + Math.Round(p75).ToString("F0") + " ms · " + QualityPolicy.LatencyBand(p75);
+        string label = "综合响应：" + Math.Round(p75).ToString("F0") + " ms · " + LatencyBand(p75);
         ServiceMeasurement slowest = measuredServices.OrderByDescending(x => x.Milliseconds).First();
         if (slowest.Milliseconds > 2000)
             label += " · " + ServiceLabel(slowest.Service) + " " + slowest.Milliseconds + " ms";
@@ -258,11 +361,20 @@ public sealed class MonitorPresentation
             case MonitorRunState.Running: return "运行正常";
             case MonitorRunState.Checking: return "正在检测";
             case MonitorRunState.Pending: return "部分服务待验证";
-            case MonitorRunState.Paused: return "自动优化已暂停";
+            case MonitorRunState.Paused: return "节点守护已暂停";
             case MonitorRunState.Degraded: return "需要注意";
             case MonitorRunState.Stuck: return "检测超时";
             case MonitorRunState.Stopped: return "已退出";
             default: return "正在启动";
         }
+    }
+
+    private static string LatencyBand(double milliseconds)
+    {
+        if (Double.IsNaN(milliseconds) || Double.IsInfinity(milliseconds) || milliseconds < 0) return "待测";
+        if (milliseconds <= 300) return "优秀";
+        if (milliseconds <= 500) return "良好";
+        if (milliseconds <= 800) return "可用但偏慢";
+        return "较慢";
     }
 }

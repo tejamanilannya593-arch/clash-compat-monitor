@@ -1,6 +1,6 @@
 # Clash Compatibility Monitor
 
-> A stability-first Clash/Mihomo node guardian for Windows
+> Continuous ChatGPT/Gemini node optimization for Clash/Mihomo on Windows
 
 [![CI](https://github.com/tejamanilannya593-arch/clash-compat-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/tejamanilannya593-arch/clash-compat-monitor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/tejamanilannya593-arch/clash-compat-monitor)](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest)
@@ -8,16 +8,33 @@
 
 [Download the latest release](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest) · [中文](README.md)
 
-Clash Compatibility Monitor keeps a working node in place, performs conservative failover after confirmed failures, and avoids blaming a node when the same service fails across the current node and two recently verified standbys.
+Clash Compatibility Monitor rechecks the current node every 60 seconds by default. When basic, ChatGPT, and Gemini website delays are measurable, the actual exit region is eligible, and both core-site delays are at most 800 ms, it keeps that node. Website timing does not verify login or conversation functions.
 
-## Why use it
+## Continuous optimization behavior
 
-- Discovers actual leaf nodes from `proxies`, `proxy-providers`, and mixed subscription layouts without relying on region names.
-- Always checks ChatGPT and Gemini together, with optional Google, GitHub, Steam, Discord, Spotify, Epic, and Z-Library web checks.
-- The local v0.7.0-preview.6 build treats ChatGPT and Gemini as a fixed core and admits candidates only when their actual exit is in the ChatGPT and Gemini official supported-region intersection. Explicit failures still use concurrent all-leaf recovery, inspecting up to eight nodes and stopping after the three lowest-latency eligible candidates. When automatic optimization is enabled and three current-node samples have a median above 800 ms, a three-minute opportunity scan ranks candidates by real-service P75, fully checks every selected service, and stores the best target for a 30-second confirmation. It switches only when the confirmed target is at most 800 ms and at least 20% faster. The five-minute objective applies when the monitor and Mihomo are available and no proxy conflict, service incident, or foreground-traffic postponement is active. Manual and scheduled checks use the same safety gates. Healthy connections are checked automatically every 60 seconds; failures and post-switch observation use 30-second intervals. This cannot guarantee account sign-in or AI generation and is not a formal GitHub release.
-- Requires five observations spanning at least 30 minutes with a success rate of 95% or higher before a performance-only switch.
-- Keeps two recent standbys, observes every automatic switch, and can safely roll back.
-- Does not modify Clash configuration files, take ownership of subscriptions, inspect browser history, or upload telemetry.
+- Rechecks the current node every 60 seconds by default. A qualified node at or below 800 ms stays selected without a full sweep.
+- When the current node is slow or website latency is unavailable, measures basic, ChatGPT, and Gemini website delays for every node, sorts by the slower core-site delay, then checks actual-exit region eligibility.
+- Requires all three delays to be measurable. The actual exit must meet the shared ChatGPT and Gemini region policy. Login-chain evidence is not an automatic-switch gate.
+- Selects the first eligible candidate with `max(ChatGPT latency, Gemini latency) ≤ 800 ms`, then verifies it. A failed verification rolls back and resumes the search.
+- When no candidate meets 800 ms, it ranks all eligible nodes by the slower core response, then by total core latency, Clash delay, and node name. Explicit force optimization always scans the full set.
+- External manual selection during a sweep cancels automatic writing. Detection and switching remain serialized.
+- A disconnected local network pauses candidate discovery. Pausing requests cancellation after in-flight requests finish; unfinished switching still receives safe rollback handling.
+
+Settings expose the recheck interval; automatic optimization when the current node exceeds 800 ms remains enabled. Old preferences, history, and statistics remain readable.
+
+## Diagnostics and operation
+
+“Recheck current node” runs detection. Reporting “ChatGPT unavailable” requests detection and does not directly switch or roll back. “Restore previous node” is an explicit manual action with precheck, immediate post-switch verification, and protection for external selection changes.
+
+The candidate table can manually refresh the top 10 candidate nodes, showing Clash delay, exit country, and per-website latency. It is read-only diagnostics: refreshing it does not switch the active group. Optional-service rankings and historical recommendations do not control recovery eligibility. The raw probe evidence remains available for diagnosis; an optional-service failure is not a core recovery gate.
+
+Logs describe failure counts, confirmation, rejected candidates, switching, verification, rollback, and cooldown transitions. Runtime statistics show resource use and limited probe-body measurements, not complete traffic bills or website availability. Closing the details window leaves the tray monitor running; use Exit to stop it. A second launch opens the existing instance.
+
+Historical records from former standby, public-incident, failure-count, and observation policies may remain on disk. They do not affect the current all-node ranking; the continuous optimization rules above describe current behavior.
+
+The built-in logon supervisor restarts abnormal exits up to three times and detects workers with no progress for three minutes. Waiting and paused states report liveness, and intentional exits are not restarted. The coordinator logs unexpected exceptions and retries after five seconds. Installation resolves the physical user directory and supports migration of older startup instances redirected into `LocalCache`.
+
+Supports `proxies`, `proxy-providers`, and mixed subscriptions without requiring region-name conventions. Does not modify Clash configuration or subscription files, inspect browser history, or upload telemetry.
 
 ## Requirements
 
@@ -28,16 +45,20 @@ Clash Compatibility Monitor keeps a working node in place, performs conservative
 ## Quick start
 
 1. Download and extract the complete package from [GitHub Releases](https://github.com/tejamanilannya593-arch/clash-compat-monitor/releases/latest).
-2. Enable `clash/enhancement.js` as a Clash Verge Rev JavaScript enhancement, apply the configuration, and run `Diagnose.cmd`.
+2. Keep your existing main selector working and run `Diagnose.cmd`. Optionally enable `clash/enhancement.js` for isolated HTTP probing.
 3. Run `Install.cmd`, choose the services you use, and leave the monitor running in the Windows tray.
 
-The installer only selects nodes in the generated proxy group. It does not edit subscription files or restart Clash. See the [Chinese quick-start guide](QUICKSTART.md) for detailed setup and troubleshooting.
+The monitor uses an existing ordinary selector, such as `🚀 节点选择`; a dedicated “unified stable node” group is not required. Leave the selector setting empty for automatic discovery or enter an existing group name. Without isolated probing, each sweep temporarily selects nodes in order to obtain fresh measurements, then writes the first-ranked verified node. Manually refreshing the candidate diagnostics does not switch the active selection. The installer does not edit subscriptions or restart Clash. See the [Chinese quick-start guide](QUICKSTART.md) for setup and troubleshooting.
+
+The optional enhancement preserves ordinary group types, candidates, providers, and filters. It prefers an existing `🚀 节点选择`, then `PROXY`/`Proxy`/`代理`, then the selector named by `MATCH`/`FINAL`, or the first non-internal selector. It adds a hidden `🧪 兼容性探测` group and a localhost-only HTTP listener on port 7896 for isolated per-website measurements. No ordinary selector is created if none exists. Old dedicated-group references are migrated without dangling references or cycles; existing explicit routing takes precedence. You do not need to select the hidden probe group.
 
 ## Evidence boundaries
 
-The monitor separates entry reachability from login-chain network evidence. For ChatGPT and Gemini it checks the application entry and official authentication infrastructure; a challenge page alone is not full compatibility. It does not operate your browser account and cannot prove actual model generation or an ongoing conversation.
+Automatic optimization uses website latency and actual exit region only. Manual candidate diagnostics can still show application-entry and authentication evidence, but a challenge page alone is not full compatibility. The monitor does not operate your browser account and cannot prove actual model generation or an ongoing conversation.
 
-Anonymous probes and displayed HTTP latency still cannot measure actual model-generation latency or guarantee future account behavior. Browser proof checks the website, not API-key calls. Sign-in prompts, CAPTCHAs, security challenges, and unsupported page layouts are reported separately and are not attributed to the node. Automatic retries after a failed conversation have a six-hour cooldown; a user-triggered retry does not. Performance optimization of an otherwise healthy node is off by default. If explicitly enabled, a performance-only AI switch requires strict probe evidence, fresh conversation proof for the selected AI services, five history observations spanning 30 minutes at 95% success or better, a five-sample median at or below 800 ms, no sample or selected-service response above 1500 ms, and jitter at or below 150 ms.
+Anonymous probes and displayed HTTP latency cannot measure model-generation latency or guarantee future account behavior. Browser proof concerns websites, not API-key calls. Sign-in prompts and challenges alone are incomplete evidence. Existing account-verification and quality history is retained for diagnostics and does not influence the fresh all-node ranking.
+
+A stable node identity uses an installation-local key, the subscription source, and material connection parameters. Renames can retain trusted history, while a same-name connection replacement starts cold. Raw servers, ports, UUIDs, passwords, and SNI are not written to monitor logs or state; a raw exit IP is never persisted, logged, or displayed. Region eligibility uses the actual exit country rather than a node-name label, checking the ChatGPT official supported-region requirement and Gemini eligibility. Unresolved identity must not inherit an unrelated node's persistent trust; recovery requires fresh measurements.
 
 Steam game traffic and downloads continue to follow the user's existing Clash direct-routing rules.
 
@@ -50,6 +71,7 @@ The application runs locally and uploads no telemetry. Do not post subscription 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 node .\clash\enhancement.test.js
+node .\tests\Enhancement.Tests.js
 node .\browser-extension\tests\run.js
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Release.Tests.ps1
 ```

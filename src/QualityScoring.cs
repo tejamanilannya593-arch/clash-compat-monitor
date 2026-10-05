@@ -10,8 +10,15 @@ public sealed class QualitySample
 {
     public QualitySample(string name, DateTime checkedUtc, bool compatible, double responseMedianMs,
         double jitterMs, double throughputBytesPerSecond, double? multiplier)
+        : this(name, "", checkedUtc, compatible, responseMedianMs, jitterMs, throughputBytesPerSecond, multiplier)
+    {
+    }
+
+    public QualitySample(string name, string nodeId, DateTime checkedUtc, bool compatible, double responseMedianMs,
+        double jitterMs, double throughputBytesPerSecond, double? multiplier)
     {
         Name = name;
+        NodeId = nodeId ?? "";
         CheckedUtc = checkedUtc;
         Compatible = compatible;
         ResponseMedianMs = responseMedianMs;
@@ -20,6 +27,7 @@ public sealed class QualitySample
         Multiplier = multiplier;
     }
     public string Name { get; private set; }
+    public string NodeId { get; private set; }
     public DateTime CheckedUtc { get; private set; }
     public bool Compatible { get; private set; }
     public double ResponseMedianMs { get; private set; }
@@ -159,16 +167,21 @@ public sealed class QualityStateStore
         try
         {
             string[] lines = File.ReadAllLines(path, Encoding.UTF8);
-            if (lines.Length == 0 || lines[0] != "CQM1") throw new InvalidDataException();
+            if (lines.Length == 0 || (lines[0] != "CQM1" && lines[0] != "CQM2")) throw new InvalidDataException();
+            bool hasIdentity = lines[0] == "CQM2";
             var result = new List<QualitySample>();
             for (int i = 1; i < lines.Length; i++)
             {
                 string[] f = lines[i].Split('\t');
-                if (f.Length != 8 || f[0] != "Q") throw new InvalidDataException();
+                if ((!hasIdentity && f.Length != 8) || (hasIdentity && f.Length != 9) || f[0] != "Q")
+                    throw new InvalidDataException();
                 string name = Encoding.UTF8.GetString(Convert.FromBase64String(f[1]));
-                double? multiplier = f[7].Length == 0 ? (double?)null : ParseDouble(f[7]);
-                result.Add(new QualitySample(name, new DateTime(ParseLong(f[2]), DateTimeKind.Utc), f[3] == "1",
-                    ParseDouble(f[4]), ParseDouble(f[5]), ParseDouble(f[6]), multiplier));
+                string nodeId = hasIdentity ? Encoding.UTF8.GetString(Convert.FromBase64String(f[2])) : "";
+                int offset = hasIdentity ? 1 : 0;
+                double? multiplier = f[7 + offset].Length == 0 ? (double?)null : ParseDouble(f[7 + offset]);
+                result.Add(new QualitySample(name, nodeId,
+                    new DateTime(ParseLong(f[2 + offset]), DateTimeKind.Utc), f[3 + offset] == "1",
+                    ParseDouble(f[4 + offset]), ParseDouble(f[5 + offset]), ParseDouble(f[6 + offset]), multiplier));
             }
             return result;
         }
@@ -189,10 +202,11 @@ public sealed class QualityStateStore
         using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
         using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
         {
-            writer.WriteLine("CQM1");
+            writer.WriteLine("CQM2");
             foreach (QualitySample sample in bounded)
             {
                 string line = "Q\t" + Convert.ToBase64String(Encoding.UTF8.GetBytes(sample.Name)) + "\t" +
+                    Convert.ToBase64String(Encoding.UTF8.GetBytes(sample.NodeId ?? "")) + "\t" +
                     sample.CheckedUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "\t" + (sample.Compatible ? "1" : "0") + "\t" +
                     Format(sample.ResponseMedianMs) + "\t" + Format(sample.JitterMs) + "\t" + Format(sample.ThroughputBytesPerSecond) + "\t" +
                     (sample.Multiplier.HasValue ? Format(sample.Multiplier.Value) : "");
@@ -208,7 +222,8 @@ public sealed class QualityStateStore
 
     public static List<QualitySample> Bound(IEnumerable<QualitySample> samples)
     {
-        return (samples ?? Enumerable.Empty<QualitySample>()).GroupBy(x => x.Name, StringComparer.Ordinal)
+        return (samples ?? Enumerable.Empty<QualitySample>()).GroupBy(
+            x => NodeIdentity.IsStrong(x.NodeId) ? x.NodeId : "legacy:" + x.Name, StringComparer.Ordinal)
             .SelectMany(g => g.OrderByDescending(x => x.CheckedUtc).Take(120)).ToList();
     }
 

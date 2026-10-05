@@ -8,8 +8,20 @@ public sealed class UserPreferences
 {
     public bool FirstRunComplete { get; set; }
     public bool AutomaticOptimization { get; set; }
+    public bool AutomaticRecovery { get; set; }
+    public int CheckIntervalSeconds { get; set; }
+    public int FailureThreshold { get; set; }
+    public int RecoveryCooldownMinutes { get; set; }
     public bool BrowserConversationVerification { get; set; }
     public List<ServiceKind> RequiredServices { get; set; }
+
+    public UserPreferences()
+    {
+        AutomaticRecovery = true;
+        CheckIntervalSeconds = 60;
+        FailureThreshold = 2;
+        RecoveryCooldownMinutes = 10;
+    }
 
     public static UserPreferences Defaults()
     {
@@ -31,13 +43,17 @@ public sealed class UserPreferences
 
 public static class UserPreferencePolicy
 {
+    public static void NormalizeRecoverySettings(UserPreferences preferences)
+    {
+        if (preferences == null) throw new ArgumentNullException("preferences");
+        preferences.CheckIntervalSeconds = Math.Max(15, Math.Min(3600, preferences.CheckIntervalSeconds));
+        preferences.FailureThreshold = Math.Max(2, Math.Min(10, preferences.FailureThreshold));
+        preferences.RecoveryCooldownMinutes = Math.Max(1, Math.Min(120, preferences.RecoveryCooldownMinutes));
+    }
+
     public static List<ServiceKind> NormalizeServices(IEnumerable<ServiceKind> services)
     {
-        var selected = (services ?? Enumerable.Empty<ServiceKind>()).Distinct().ToList();
-        var normalized = new List<ServiceKind> { ServiceKind.ChatGPT, ServiceKind.Gemini };
-        normalized.AddRange(selected.Where(service =>
-            service != ServiceKind.ChatGPT && service != ServiceKind.Gemini));
-        return normalized;
+        return CoreWebsitePolicy.Normalize(services);
     }
 }
 
@@ -68,15 +84,10 @@ public sealed class UserPreferenceStore
             string automaticValue;
             string serviceValue;
             if (!values.TryGetValue("version", out versionValue) || !Int32.TryParse(versionValue, out version) ||
-                (version != 1 && version != 2 && version != 3) ||
+                (version < 1 || version > 4) ||
                 !values.TryGetValue("firstRun", out firstRunValue) || !Boolean.TryParse(firstRunValue, out firstRun) ||
                 !values.TryGetValue("automatic", out automaticValue) || !Boolean.TryParse(automaticValue, out automatic) ||
                 !values.TryGetValue("services", out serviceValue)) throw new InvalidDataException("Preferences are incomplete.");
-            if (version == 1)
-            {
-                automatic = false;
-            }
-
             var services = new List<ServiceKind>();
             foreach (string name in serviceValue.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
             {
@@ -87,12 +98,25 @@ public sealed class UserPreferenceStore
                 if (!services.Contains(service)) services.Add(service);
             }
             services = UserPreferencePolicy.NormalizeServices(services);
-            return new UserPreferences {
+            var preferences = new UserPreferences {
                 FirstRunComplete = firstRun,
                 AutomaticOptimization = automatic,
                 BrowserConversationVerification = false,
                 RequiredServices = services
             };
+            string setting;
+            bool enabled;
+            int number;
+            if (values.TryGetValue("automaticRecovery", out setting) && Boolean.TryParse(setting, out enabled))
+                preferences.AutomaticRecovery = enabled;
+            if (values.TryGetValue("checkIntervalSeconds", out setting) && Int32.TryParse(setting, out number))
+                preferences.CheckIntervalSeconds = number;
+            if (values.TryGetValue("failureThreshold", out setting) && Int32.TryParse(setting, out number))
+                preferences.FailureThreshold = number;
+            if (values.TryGetValue("recoveryCooldownMinutes", out setting) && Int32.TryParse(setting, out number))
+                preferences.RecoveryCooldownMinutes = number;
+            UserPreferencePolicy.NormalizeRecoverySettings(preferences);
+            return preferences;
         }
         catch
         {
@@ -109,13 +133,18 @@ public sealed class UserPreferenceStore
         if (services.Any(service => !Enum.IsDefined(typeof(ServiceKind), service)))
             throw new ArgumentException("Preferences contain an unknown service.", "value");
         services = UserPreferencePolicy.NormalizeServices(services);
+        UserPreferencePolicy.NormalizeRecoverySettings(value);
 
         string directory = Path.GetDirectoryName(path);
         if (!String.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
         string temporary = path + ".tmp";
-        string text = "version=3" + Environment.NewLine +
+        string text = "version=4" + Environment.NewLine +
             "firstRun=" + value.FirstRunComplete + Environment.NewLine +
             "automatic=" + value.AutomaticOptimization + Environment.NewLine +
+            "automaticRecovery=" + value.AutomaticRecovery + Environment.NewLine +
+            "checkIntervalSeconds=" + value.CheckIntervalSeconds + Environment.NewLine +
+            "failureThreshold=" + value.FailureThreshold + Environment.NewLine +
+            "recoveryCooldownMinutes=" + value.RecoveryCooldownMinutes + Environment.NewLine +
             "services=" + String.Join(",", services.Select(service => service.ToString())) + Environment.NewLine;
         File.WriteAllText(temporary, text, Encoding.UTF8);
         if (File.Exists(path)) File.Replace(temporary, path, null);

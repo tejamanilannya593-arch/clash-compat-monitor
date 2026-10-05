@@ -39,6 +39,41 @@ public static class CandidateCatalog
         return result;
     }
 
+    public static IList<CandidateNode> Filter(IEnumerable<string> names, IDictionary<string, string> runtimeTypes,
+        IDictionary<string, ResolvedNodeIdentity> identities)
+    {
+        IList<CandidateNode> filtered = Filter(names, runtimeTypes);
+        var result = new List<CandidateNode>();
+        var strongIndexes = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (CandidateNode candidate in filtered)
+        {
+            ResolvedNodeIdentity identity = null;
+            bool strong = identities != null && identities.TryGetValue(candidate.Name, out identity) &&
+                identity != null && identity.Strength == NodeIdentityStrength.Strong &&
+                NodeIdentity.IsStrong(identity.NodeId);
+            var identified = new CandidateNode(candidate.Name, candidate.Multiplier,
+                strong ? identity.NodeId : "", strong ? NodeIdentityStrength.Strong : NodeIdentityStrength.SessionOnly);
+            if (!strong)
+            {
+                result.Add(identified);
+                continue;
+            }
+            int index;
+            if (!strongIndexes.TryGetValue(identified.NodeId, out index))
+            {
+                strongIndexes[identified.NodeId] = result.Count;
+                result.Add(identified);
+            }
+            else if (identified.Name.Length < result[index].Name.Length ||
+                (identified.Name.Length == result[index].Name.Length &&
+                StringComparer.Ordinal.Compare(identified.Name, result[index].Name) < 0))
+            {
+                result[index] = identified;
+            }
+        }
+        return result;
+    }
+
     private static bool IsNonLeaf(string kind)
     {
         switch ((kind ?? "").Trim().ToLowerInvariant())

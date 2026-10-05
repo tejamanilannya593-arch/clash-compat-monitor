@@ -8,6 +8,7 @@ public sealed class NodeExperience
 {
     public string Scope { get; set; }
     public string Node { get; set; }
+    public string NodeId { get; set; }
     public DateTime FirstUtc { get; set; }
     public DateTime LastUtc { get; set; }
     public int Samples { get; set; }
@@ -25,7 +26,8 @@ public sealed class NodeExperience
     public double Rank(DateTime now)
     {
         double speed = SpeedUtc >= now.AddDays(-1) && Throughput > 0 ? 10 * Throughput / (Throughput + 1048576) : 0;
-        return 65 * Success + 20 * 300 / (300 + Math.Max(0, ResponseMs)) +
+        double observedSuccess = OutcomeSamples > 0 ? SuccessfulSamples / (double)OutcomeSamples : Success;
+        return 65 * observedSuccess + 20 * 300 / (300 + Math.Max(0, ResponseMs)) +
             5 * 100 / (100 + Math.Max(0, JitterMs)) + speed;
     }
 }
@@ -112,11 +114,18 @@ public sealed class ExperienceData
 
     public void Observe(string scope, CandidateScanResult scan, QualitySample quality, DateTime now)
     {
+        Observe(scope, "", scan, quality, now);
+    }
+
+    public void Observe(string scope, string nodeId, CandidateScanResult scan, QualitySample quality, DateTime now)
+    {
         ActiveScope = scope;
         if (scan.Health == CandidateHealth.Unknown) return;
-        var node = Nodes.FirstOrDefault(x => x.Scope == scope && x.Node == scan.Name);
-        if (node == null) { node = new NodeExperience { Scope = scope, Node = scan.Name, FirstUtc = now, Success = 0.5,
+        var node = Nodes.FirstOrDefault(x => x.Scope == scope && MatchesNodeKey(x, nodeId, scan.Name));
+        if (node == null) { node = new NodeExperience { Scope = scope, Node = scan.Name, NodeId = nodeId,
+            FirstUtc = now, Success = 0.5,
             RecentResponseMilliseconds = new List<double>() }; Nodes.Add(node); }
+        node.Node = scan.Name;
         if (node.RecentResponseMilliseconds == null) node.RecentResponseMilliseconds = new List<double>();
         if (quality != null && quality.ThroughputBytesPerSecond > 0 && quality.CheckedUtc > node.SpeedUtc)
         { node.Throughput = quality.ThroughputBytesPerSecond; node.SpeedUtc = quality.CheckedUtc; }
@@ -131,11 +140,13 @@ public sealed class ExperienceData
         double weight = node.Samples == 0 ? 1 : 0.2;
         node.Success = (1 - weight) * node.Success + weight * (passed ? 1 : 0);
         double response = QualityMeasurement.ResponseMilliseconds(scan, 5000);
-        node.JitterMs = (1 - weight) * node.JitterMs + weight * (node.Samples == 0 ? 0 : Math.Abs(response - node.ResponseMs));
-        node.ResponseMs = (1 - weight) * node.ResponseMs + weight * response;
         node.RecentResponseMilliseconds.Add(response);
-        if (node.RecentResponseMilliseconds.Count > 20)
-            node.RecentResponseMilliseconds.RemoveRange(0, node.RecentResponseMilliseconds.Count - 20);
+        if (node.RecentResponseMilliseconds.Count > LatencyWindowStatistics.MaximumSamples)
+            node.RecentResponseMilliseconds.RemoveRange(0,
+                node.RecentResponseMilliseconds.Count - LatencyWindowStatistics.MaximumSamples);
+        LatencyWindowSummary latency = LatencyWindowStatistics.Summarize(node.RecentResponseMilliseconds);
+        node.ResponseMs = latency.MedianMilliseconds;
+        node.JitterMs = latency.JitterMilliseconds;
         node.LastUtc = now; node.Samples = Math.Min(1000000, node.Samples + 1); node.LastPassed = passed;
         if (node.OutcomeSamples == 0) node.FirstOutcomeUtc = now;
         node.LastOutcomeUtc = now;
@@ -146,14 +157,16 @@ public sealed class ExperienceData
     public IEnumerable<NodeExperience> Recommend(string scope, IEnumerable<string> eligible, DateTime now)
     {
         var allowed = new HashSet<string>(eligible, StringComparer.Ordinal);
-        return Nodes.Where(x => x.Scope == scope && allowed.Contains(x.Node) && x.Samples >= 3 &&
-            x.LastUtc - x.FirstUtc >= TimeSpan.FromMinutes(10) && x.LastUtc >= now.AddDays(-7) && x.LastPassed && x.Success >= 0.8)
+        return Nodes.Where(x => x.Scope == scope && allowed.Contains(NodeKey(x)) &&
+            x.Samples >= LatencyWindowStatistics.MinimumSamples &&
+            x.LastUtc - x.FirstUtc >= TimeSpan.FromMinutes(10) && x.LastUtc >= now.AddDays(-7) && x.LastPassed &&
+            (x.OutcomeSamples > 0 ? x.SuccessfulSamples / (double)x.OutcomeSamples : x.Success) >= 0.8)
             .OrderByDescending(x => x.Rank(now)).ToList();
     }
 
     public bool IsProvenStable(string scope, string node, DateTime now)
     {
-        NodeExperience experience = Nodes.FirstOrDefault(x => x.Scope == scope && x.Node == node);
+        NodeExperience experience = Nodes.FirstOrDefault(x => x.Scope == scope && MatchesNodeKey(x, node, node));
         return experience != null && experience.OutcomeSamples >= 5 &&
             experience.LastOutcomeUtc - experience.FirstOutcomeUtc >= TimeSpan.FromMinutes(30) &&
             experience.LastOutcomeUtc >= now.AddDays(-7) && experience.LastPassed &&
@@ -162,7 +175,7 @@ public sealed class ExperienceData
 
     public IList<double> RecentResponses(string scope, string node, int maximum)
     {
-        NodeExperience experience = Nodes.FirstOrDefault(x => x.Scope == scope && x.Node == node);
+        NodeExperience experience = Nodes.FirstOrDefault(x => x.Scope == scope && MatchesNodeKey(x, node, node));
         if (experience == null || experience.RecentResponseMilliseconds == null || maximum <= 0)
             return new List<double>();
         int skip = Math.Max(0, experience.RecentResponseMilliseconds.Count - maximum);
@@ -171,11 +184,23 @@ public sealed class ExperienceData
 
     public string StabilitySummary(string scope, string node, DateTime now)
     {
-        NodeExperience experience = Nodes.FirstOrDefault(x => x.Scope == scope && x.Node == node);
+        NodeExperience experience = Nodes.FirstOrDefault(x => x.Scope == scope && MatchesNodeKey(x, node, node));
         if (experience == null || experience.OutcomeSamples == 0) return "稳定历史：0/5 次 · 0/30 分钟 · 0%";
         int minutes = (int)Math.Max(0, Math.Floor((experience.LastOutcomeUtc - experience.FirstOutcomeUtc).TotalMinutes));
         double rate = (double)experience.SuccessfulSamples / experience.OutcomeSamples;
         return "稳定历史：" + experience.OutcomeSamples + "/5 次 · " + minutes + "/30 分钟 · " + rate.ToString("P0");
+    }
+
+    private static string NodeKey(NodeExperience item)
+    {
+        return item != null && NodeIdentity.IsStrong(item.NodeId) ? item.NodeId : item == null ? "" : item.Node;
+    }
+
+    private static bool MatchesNodeKey(NodeExperience item, string key, string legacyName)
+    {
+        if (item == null) return false;
+        if (NodeIdentity.IsStrong(key)) return String.Equals(item.NodeId, key, StringComparison.Ordinal);
+        return !NodeIdentity.IsStrong(item.NodeId) && String.Equals(item.Node, legacyName, StringComparison.Ordinal);
     }
 
     public void RecordChange(string from, string to, string reason, DateTime now)

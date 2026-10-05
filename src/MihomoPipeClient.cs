@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Text;
 using System.Web.Script.Serialization;
 
@@ -101,16 +102,52 @@ public static class PipeHttpCodec
     }
 }
 
-public sealed class MihomoPipeClient : IMihomoClient
+public sealed class MihomoPipeClient : IMihomoClient, IRecoveryConnectivityClient, IProxyTopologyClient
 {
-    private readonly string pipeName;
+    private string pipeName;
     private readonly string secret;
+    private readonly bool discoverPipe;
     private readonly JavaScriptSerializer json = new JavaScriptSerializer();
 
     public MihomoPipeClient(string pipeName, string secret)
     {
         this.pipeName = pipeName;
         this.secret = secret ?? "";
+    }
+
+    private MihomoPipeClient(string pipeName, string secret, bool discoverPipe)
+        : this(pipeName, secret)
+    {
+        this.discoverPipe = discoverPipe;
+    }
+
+    public static string SelectAvailablePipeName(IEnumerable<string> names, string preferred)
+    {
+        string[] available = (names ?? Enumerable.Empty<string>()).Where(x => x != null)
+            .Select(Path.GetFileName).ToArray();
+        if (available.Contains(preferred, StringComparer.OrdinalIgnoreCase)) return preferred;
+        if (available.Contains("verge-mihomo", StringComparer.OrdinalIgnoreCase)) return "verge-mihomo";
+        return available.Where(x => x.StartsWith("verge-mihomo-production-",
+                StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase).FirstOrDefault() ?? preferred;
+    }
+
+    private static string DiscoverPipeName(string preferred)
+    {
+        try { return SelectAvailablePipeName(Directory.GetFiles(@"\\.\pipe\"), preferred); }
+        catch (IOException) { return preferred; }
+        catch (UnauthorizedAccessException) { return preferred; }
+        catch (ArgumentException) { return preferred; }
+    }
+
+    private bool RefreshPipeName(string attempted)
+    {
+        if (!discoverPipe) return false;
+        string current = System.Threading.Volatile.Read(ref pipeName);
+        string found = DiscoverPipeName(current);
+        if (String.Equals(found, attempted, StringComparison.OrdinalIgnoreCase)) return false;
+        System.Threading.Volatile.Write(ref pipeName, found);
+        return true;
     }
 
     public static MihomoPipeClient FromConfig(string configPath)
@@ -123,7 +160,7 @@ public sealed class MihomoPipeClient : IMihomoClient
             found = line.Substring(line.IndexOf(':') + 1).Trim().Trim('\'', '"');
             break;
         }
-        return new MihomoPipeClient("verge-mihomo", found);
+        return new MihomoPipeClient(DiscoverPipeName("verge-mihomo"), found, true);
     }
 
     public string[] GetChoices(string groupName)
@@ -180,7 +217,10 @@ public sealed class MihomoPipeClient : IMihomoClient
         {
             string path = "/proxies/" + Uri.EscapeDataString(proxyName) + "/delay?timeout=" +
                 timeoutMilliseconds.ToString(CultureInfo.InvariantCulture) + "&url=" + Uri.EscapeDataString(url);
-            PipeHttpResponse response = Request("GET", path, null);
+            PipeHttpResponse response = Request("GET", path, null,
+                Math.Min(1000, Math.Max(250, timeoutMilliseconds)),
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromMilliseconds(Math.Max(1000, timeoutMilliseconds + 500)));
             if (response.StatusCode < 200 || response.StatusCode >= 300) return Int32.MaxValue;
             var value = json.DeserializeObject(response.Body) as Dictionary<string, object>;
             object delay;
@@ -189,6 +229,67 @@ public sealed class MihomoPipeClient : IMihomoClient
         }
         catch (IOException) { return Int32.MaxValue; }
         catch (TimeoutException) { return Int32.MaxValue; }
+        catch (FormatException) { return Int32.MaxValue; }
+        catch (InvalidCastException) { return Int32.MaxValue; }
+        catch (OverflowException) { return Int32.MaxValue; }
+    }
+
+    public IDictionary<string, ProxyTopologyEntry> ReadProxyTopology()
+    {
+        PipeHttpResponse response = Request("GET", "/proxies", null);
+        if (response.StatusCode != 200) throw new IOException("Cannot read proxy topology.");
+        var root = new JavaScriptSerializer().DeserializeObject(response.Body) as Dictionary<string, object>;
+        object raw;
+        var proxies = root != null && root.TryGetValue("proxies", out raw) ? raw as Dictionary<string, object> : null;
+        if (proxies == null) throw new InvalidDataException("Proxy topology is missing.");
+        var result = new Dictionary<string, ProxyTopologyEntry>(StringComparer.Ordinal);
+        foreach (var pair in proxies)
+        {
+            var item = pair.Value as Dictionary<string, object>;
+            if (item == null) continue;
+            object type, selected, choices;
+            item.TryGetValue("type", out type); item.TryGetValue("now", out selected); item.TryGetValue("all", out choices);
+            result[pair.Key] = new ProxyTopologyEntry { Type = Convert.ToString(type), Selected = Convert.ToString(selected),
+                Choices = (choices as object[] ?? new object[0]).Select(Convert.ToString).ToArray() };
+        }
+        return result;
+    }
+
+    public string GetRoutingMode()
+    {
+        PipeHttpResponse response = Request("GET", "/configs", null);
+        if (response.StatusCode != 200) throw new IOException("Cannot read routing mode.");
+        var root = new JavaScriptSerializer().DeserializeObject(response.Body) as Dictionary<string, object>;
+        object mode;
+        return root != null && root.TryGetValue("mode", out mode) ? Convert.ToString(mode) : "rule";
+    }
+
+    public RecoveryEvidence CheckConnectivity(string node, string url, int timeoutMilliseconds, out int milliseconds)
+    {
+        milliseconds = 0;
+        try
+        {
+            string path = "/proxies/" + Uri.EscapeDataString(node) + "/delay?timeout=" +
+                timeoutMilliseconds.ToString(CultureInfo.InvariantCulture) + "&url=" + Uri.EscapeDataString(url);
+            PipeHttpResponse response = Request("GET", path, null, 1000, TimeSpan.FromSeconds(1),
+                TimeSpan.FromMilliseconds(timeoutMilliseconds + 500));
+            // A transport/API error is not evidence that the selected node failed.
+            if (response.StatusCode == 504) return RecoveryEvidence.Failed;
+            if (response.StatusCode != 200) return RecoveryEvidence.Unknown;
+            var value = new JavaScriptSerializer().DeserializeObject(response.Body) as Dictionary<string, object>;
+            object delay;
+            if (value == null || !value.TryGetValue("delay", out delay)) return RecoveryEvidence.Unknown;
+            int measured = Convert.ToInt32(delay, CultureInfo.InvariantCulture);
+            if (measured < 0 || measured == Int32.MaxValue) return RecoveryEvidence.Unknown;
+            milliseconds = measured;
+            return RecoveryEvidence.Healthy;
+        }
+        catch (Exception ex)
+        {
+            if (!(ex is IOException || ex is TimeoutException || ex is ArgumentException ||
+                ex is InvalidOperationException || ex is FormatException || ex is InvalidCastException || ex is OverflowException)) throw;
+            return RecoveryEvidence.Unknown;
+        }
     }
 
     public bool IsRuntimeIpv6Enabled()
@@ -226,6 +327,30 @@ public sealed class MihomoPipeClient : IMihomoClient
 
     private PipeHttpResponse Request(string method, string path, string body)
     {
+        return Request(method, path, body, 3000, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(10));
+    }
+
+    private PipeHttpResponse Request(string method, string path, string body,
+        int connectTimeoutMilliseconds, TimeSpan writeTimeout, TimeSpan readTimeout)
+    {
+        string attempted = System.Threading.Volatile.Read(ref pipeName);
+        try { return RequestOnPipe(attempted, method, path, body,
+            connectTimeoutMilliseconds, writeTimeout, readTimeout); }
+        catch (IOException)
+        {
+            if (!RefreshPipeName(attempted)) throw;
+        }
+        catch (TimeoutException)
+        {
+            if (!RefreshPipeName(attempted)) throw;
+        }
+        return RequestOnPipe(System.Threading.Volatile.Read(ref pipeName), method, path, body,
+            connectTimeoutMilliseconds, writeTimeout, readTimeout);
+    }
+
+    private PipeHttpResponse RequestOnPipe(string selectedPipe, string method, string path, string body,
+        int connectTimeoutMilliseconds, TimeSpan writeTimeout, TimeSpan readTimeout)
+    {
         byte[] bodyBytes = body == null ? new byte[0] : Encoding.UTF8.GetBytes(body);
         var request = new StringBuilder();
         request.Append(method).Append(' ').Append(path).Append(" HTTP/1.1\r\nHost: mihomo\r\nConnection: close\r\n");
@@ -234,11 +359,11 @@ public sealed class MihomoPipeClient : IMihomoClient
         request.Append("Content-Length: ").Append(bodyBytes.Length).Append("\r\n\r\n");
         byte[] headerBytes = Encoding.ASCII.GetBytes(request.ToString());
 
-        using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+        using (var pipe = new NamedPipeClientStream(".", selectedPipe, PipeDirection.InOut, PipeOptions.Asynchronous))
         {
-            pipe.Connect(3000);
-            BoundedPipeIo.WriteAll(pipe, headerBytes, bodyBytes, TimeSpan.FromSeconds(3));
-            return PipeHttpCodec.Decode(BoundedPipeIo.ReadAll(pipe, TimeSpan.FromSeconds(10), 1024 * 1024));
+            pipe.Connect(connectTimeoutMilliseconds);
+            BoundedPipeIo.WriteAll(pipe, headerBytes, bodyBytes, writeTimeout);
+            return PipeHttpCodec.Decode(BoundedPipeIo.ReadAll(pipe, readTimeout, 1024 * 1024));
         }
     }
 }
