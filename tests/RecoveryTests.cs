@@ -491,6 +491,51 @@ internal static partial class Tests
         using (var f = new RecoveryFixture(true))
         {
             f.Client.Choices = new[] { "current", "node-01", "node-02" };
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" ? 100 : 150;
+            f.Run(MonitorCycleTrigger.Scheduled);
+            Equal("node-01", f.Client.Current, "first slow current node switches to a preferred candidate");
+            f.Client.WebsiteDelay = (node, url) => node == "node-01" ? 900 :
+                node == "current" ? 100 : 150;
+            int writes = f.Client.Writes.Count;
+            int visits = f.Client.Visits.ContainsKey("current") ? f.Client.Visits["current"] : 0;
+            f.Restart();
+            MonitorSnapshot cooling = f.Run(MonitorCycleTrigger.Scheduled);
+            Equal("node-01", f.Client.Current, "scheduled latency optimization respects the recent switch cooldown");
+            Equal(writes, f.Client.Writes.Count, "cooldown prevents another selector write");
+            Equal(visits, f.Client.Visits.ContainsKey("current") ? f.Client.Visits["current"] : 0,
+                "cooldown skips full candidate scanning");
+            Equal(true, cooling.Decision.Contains("冷却"), "cooldown is visible in the decision");
+            f.Clock.UtcNow = f.Clock.UtcNow.AddMinutes(10);
+            f.Run(MonitorCycleTrigger.Scheduled);
+            Equal("current", f.Client.Current, "scheduled optimization resumes after cooldown");
+        }
+        using (var f = new RecoveryFixture(true))
+        {
+            f.Client.Choices = new[] { "current", "node-01", "node-02" };
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" ? 100 : 150;
+            f.Run(MonitorCycleTrigger.Scheduled);
+            f.Client.WebsiteDelay = (node, url) => node == "node-01" ? 900 :
+                node == "current" ? 100 : 150;
+            f.Run(MonitorCycleTrigger.ManualOptimization);
+            Equal("current", f.Client.Current, "manual force optimization bypasses automatic cooldown");
+        }
+        using (var f = new RecoveryFixture(true))
+        {
+            f.Preferences.RecoveryCooldownMinutes = 1;
+            f.Client.Choices = new[] { "current", "node-01", "node-02" };
+            f.Client.WebsiteDelay = (node, url) => node == "current" ? 900 :
+                node == "node-01" ? 100 : 150;
+            f.Run(MonitorCycleTrigger.Scheduled);
+            f.Client.WebsiteDelay = (node, url) => node == "node-01" ? 900 :
+                node == "current" ? 100 : 150;
+            f.Run(MonitorCycleTrigger.Scheduled);
+            Equal("current", f.Client.Current, "configured one minute cooldown permits the next scheduled switch");
+        }
+        using (var f = new RecoveryFixture(true))
+        {
+            f.Client.Choices = new[] { "current", "node-01", "node-02" };
             f.Client.Delay = node => node == "current" ? 10 : node == "node-01" ? 20 : 30;
             f.Probe.Result = (node, service, visit) => ProbeResult.Success(900);
             f.Run(MonitorCycleTrigger.ManualOptimization);
@@ -530,7 +575,7 @@ internal static partial class Tests
                 "continuous optimization checks exit region in core website latency order");
             Equal("node-02", f.Client.Current,
                 "continuous optimization ranks by the slower of ChatGPT and Gemini");
-            Equal(true, File.ReadAllText(Path.Combine(f.Root, "current-status.txt")).Contains("0.7.0-preview.36"),
+            Equal(true, File.ReadAllText(Path.Combine(f.Root, "current-status.txt")).Contains("0.7.0-preview.37"),
                 "continuous optimization publishes the latest status file");
         }
         using (var f = new RecoveryFixture(true))

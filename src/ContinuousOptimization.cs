@@ -75,6 +75,21 @@ public sealed partial class MonitorWorker
                             "当前节点双核心延迟均不超过 800 ms，保持连接并暂停全节点寻优", preferences);
                     }
                 }
+
+                DateTime lastAutomaticSwitch = (experience.Assurance.AutomaticSwitches ??
+                    new List<AutomaticSwitchRecord>())
+                    .Where(x => x != null && x.Utc <= clock.UtcNow)
+                    .Select(x => x.Utc).DefaultIfEmpty(DateTime.MinValue).Max();
+                TimeSpan cooldown = TimeSpan.FromMinutes(preferences.RecoveryCooldownMinutes);
+                if (display != null && lastAutomaticSwitch > clock.UtcNow - cooldown)
+                {
+                    int remainingSeconds = (int)Math.Ceiling(
+                        (lastAutomaticSwitch + cooldown - clock.UtcNow).TotalSeconds);
+                    logger.Write("continuous optimization cooling remaining_seconds=" + remainingSeconds);
+                    SaveExperience(clock.UtcNow);
+                    return ContinuousOptimizationSnapshot(display,
+                        "延迟寻优冷却中，还需约 " + remainingSeconds + " 秒；继续检测当前节点", preferences);
+                }
             }
 
             Report("正在批量测量全部节点的基础、ChatGPT 和 Gemini 网站延迟", null);

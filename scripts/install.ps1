@@ -142,7 +142,7 @@ try {
     $workers = @($running | Where-Object { $_.CommandLine -notmatch '(?i)--startup-supervisor' })
     if ($supervisors.Count -ne 1 -or $workers.Count -ne 1) { throw 'Expected one startup supervisor and one monitor process.' }
     foreach ($record in $before) { if ((Get-FileHash -LiteralPath $record.Path).Hash -ne $record.Hash) { throw 'A protected Clash file changed.' } }
-    [pscustomobject]@{Version='0.7.0-preview.36';ProcessId=$workers[0].ProcessId;SupervisorProcessId=$supervisors[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true;LegacyBrowserCompanionRemoved=$true} | ConvertTo-Json -Compress
+    [pscustomobject]@{Version='0.7.0-preview.37';ProcessId=$workers[0].ProcessId;SupervisorProcessId=$supervisors[0].ProcessId;Backup=$backup;ClashFilesUnchanged=$true;LegacyBrowserCompanionRemoved=$true} | ConvertTo-Json -Compress
 } catch {
     Stop-InstalledLauncher
     Stop-InstalledMonitor
